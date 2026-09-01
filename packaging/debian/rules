@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_test:
+	cargo test --release --locked
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/dfdisk debian/dfdisk/usr/bin/dfdisk
+	install -D -m 0644 README.md debian/dfdisk/usr/share/doc/dfdisk/README.md

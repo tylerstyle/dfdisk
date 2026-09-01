@@ -1,0 +1,46 @@
+# Maintainer: tylerstyle <tylerstyle@users.noreply.github.com>
+
+pkgname=dfdisk-git
+pkgver=0.1.0.r0.g32630bf
+pkgrel=1
+pkgdesc="Modern forensic disk imaging, damaged media rescue and conversion CLI/TUI tool (VCS git version)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/tylerstyle/dfdisk"
+license=('GPL-3.0-or-later')
+depends=('libewf' 'ddrescue' 'smartmontools' 'util-linux' 'systemd-libs')
+makedepends=('git' 'cargo' 'rust')
+provides=('dfdisk')
+conflicts=('dfdisk')
+source=('dfdisk::git+https://github.com/tylerstyle/dfdisk.git')
+sha256sums=('SKIP')
+
+pkgver() {
+    cd dfdisk
+    git describe --long --tags --always 2>/dev/null | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g' || echo "0.1.0.r$(git rev-list --count HEAD).g$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+    cd dfdisk
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd dfdisk
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release --all-targets
+}
+
+check() {
+    cd dfdisk
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen --release
+}
+
+package() {
+    cd dfdisk
+    install -Dm755 "target/release/dfdisk" "$pkgdir/usr/bin/dfdisk"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/dfdisk/README.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/dfdisk/LICENSE"
+}

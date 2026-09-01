@@ -25,23 +25,80 @@
 
 ---
 
-## 🚀 Quick Start
+## 📦 Installation & Packaging
 
-### Nix Environment (Recommended)
+### 1. Nix / NixOS (Zero Setup & Hermetic)
 
-To launch a shell with all required forensic dependencies (`libewf`, `smartmontools`, `ddrescue`, `rustc`, `cargo`):
-
+Run directly without installing:
 ```bash
-nix-shell
+nix run github:tylerstyle/dfdisk
 ```
 
-### Build
+Or build locally:
+```bash
+nix build
+./result/bin/dfdisk
+```
+
+Add to `flake.nix` inputs:
+```nix
+inputs.dfdisk.url = "github:tylerstyle/dfdisk";
+# in NixOS modules / configuration:
+# environment.systemPackages = [ inputs.dfdisk.packages.${system}.default ];
+```
+
+---
+
+### 2. Debian / Ubuntu (`.deb`)
+
+Download the latest `.deb` from [GitHub Releases](https://github.com/tylerstyle/dfdisk/releases) or build it locally:
 
 ```bash
+# Install build tool
+cargo install cargo-deb
+
+# Generate .deb package
+cargo deb
+
+# Install generated package
+sudo dpkg -i target/debian/dfdisk_*.deb
+sudo apt-get install -f # resolve any missing runtime forensic dependencies
+```
+
+Runtime dependencies installed automatically: `libewf-tools`, `gddrescue`, `smartmontools`, `util-linux`, `udev`.
+
+---
+
+### 3. Arch Linux / Manjaro (AUR & PKGBUILD)
+
+Build from the provided `PKGBUILD`:
+
+```bash
+cd packaging/arch
+makepkg -si
+```
+
+Or install via AUR helper (e.g. `yay` or `paru` once published):
+```bash
+yay -S dfdisk
+# Or the development VCS version:
+yay -S dfdisk-git
+```
+
+---
+
+### 4. Compiling from Source
+
+#### Prerequisites:
+- **Rust Toolchain**: `rustc` & `cargo` (1.75+)
+- **System Utilities**: `libewf` (`ewfacquire`, `ewfexport`), `ddrescue`, `smartmontools`, `util-linux` (`lsblk`, `blockdev`, `umount`), `udev` (`udevadm`).
+
+```bash
+git clone https://github.com/tylerstyle/dfdisk.git
+cd dfdisk
 cargo build --release
+sudo make install
 ```
-
-The resulting binary will be located at `./target/release/dfdisk`.
 
 ---
 

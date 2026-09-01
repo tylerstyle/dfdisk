@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    name: Build Binary (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            use_cross: false
+          - target: x86_64-unknown-linux-musl
+            use_cross: true
+          - target: aarch64-unknown-linux-gnu
+            use_cross: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tool
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build release binary
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package tarball
+        run: |
+          BIN_NAME="dfdisk"
+          PKG_NAME="dfdisk-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir "$PKG_NAME"
+          cp "target/${{ matrix.target }}/release/$BIN_NAME" "$PKG_NAME/"
+          cp README.md LICENSE "$PKG_NAME/"
+          tar -czvf "$PKG_NAME.tar.gz" "$PKG_NAME"
+          sha256sum "$PKG_NAME.tar.gz" > "$PKG_NAME.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dfdisk-*.tar.gz
+            dfdisk-*.tar.gz.sha256
+
+  build-deb:
+    name: Build Debian Package (.deb)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build Debian package
+        run: cargo deb --verbose
+
+      - name: Generate deb checksum
+        run: |
+          cd target/debian
+          sha256sum *.deb > dfdisk-deb.sha256
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-deb
+          path: |
+            target/debian/*.deb
+            target/debian/dfdisk-deb.sha256
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-binaries, build-deb]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/**/*.tar.gz
+            release-assets/**/*.tar.gz.sha256
+            release-assets/**/*.deb
+            release-assets/**/dfdisk-deb.sha256
+          draft: false
+          prerelease: false
+          generate_release_notes: true

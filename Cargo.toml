@@ -2,8 +2,34 @@
 name = "dfdisk"
 version = "0.1.0"
 edition = "2021"
-authors = ["dfdisk DFIR contributors"]
-description = "Modern forensic disk imaging and conversion CLI/TUI tool"
+authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
+description = "Modern forensic disk imaging, damaged media rescue and conversion CLI/TUI tool"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/tylerstyle/dfdisk"
+homepage = "https://github.com/tylerstyle/dfdisk"
+readme = "README.md"
+keywords = ["forensics", "dfir", "e01", "disk-imaging", "tui"]
+categories = ["command-line-utilities"]
+
+[package.metadata.deb]
+name = "dfdisk"
+maintainer = "tylerstyle <tylerstyle@users.noreply.github.com>"
+copyright = "2026, tylerstyle"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+dfdisk is a high-performance terminal utility designed for DFIR examiners,\
+ law enforcement investigators, and forensic technicians. It combines\
+ hardware discovery, system safety guardrails, automated evidence naming,\
+ dual-hash verification (MD5/SHA1/SHA256), and bi-directional conversion\
+ between Expert Witness Format (E01) and RAW images with a Ratatui TUI dashboard."""
+depends = "libewf-tools, gddrescue, smartmontools, util-linux, udev"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/dfdisk", "usr/bin/dfdisk", "755"],
+    ["README.md", "usr/share/doc/dfdisk/README.md", "644"],
+    ["LICENSE", "usr/share/doc/dfdisk/copyright", "644"],
+]
 
 [dependencies]
 ratatui = "0.29"

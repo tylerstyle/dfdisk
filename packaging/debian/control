@@ -1,0 +1,19 @@
+Source: dfdisk
+Section: utils
+Priority: optional
+Maintainer: tylerstyle <tylerstyle@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/tylerstyle/dfdisk
+Vcs-Git: https://github.com/tylerstyle/dfdisk.git
+Vcs-Browser: https://github.com/tylerstyle/dfdisk
+
+Package: dfdisk
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libewf-tools, gddrescue, smartmontools, util-linux, udev
+Description: Modern forensic disk imaging and conversion CLI/TUI tool
+ dfdisk is a high-performance terminal utility designed for DFIR examiners,
+ law enforcement investigators, and forensic technicians. It combines
+ hardware discovery, system safety guardrails, automated evidence naming,
+ dual-hash verification (MD5/SHA1/SHA256), and bi-directional conversion
+ between Expert Witness Format (.E01) and RAW images with a Ratatui TUI dashboard.
