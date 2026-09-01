@@ -1,0 +1,19 @@
+pkgbase = dfdisk
+	pkgdesc = Modern forensic disk imaging, damaged media rescue and conversion CLI/TUI tool
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/tylerstyle/dfdisk
+	arch = x86_64
+	arch = aarch64
+	license = GPL-3.0-or-later
+	makedepends = cargo
+	makedepends = rust
+	depends = libewf
+	depends = ddrescue
+	depends = smartmontools
+	depends = util-linux
+	depends = systemd-libs
+	source = dfdisk-0.1.0.tar.gz::https://github.com/tylerstyle/dfdisk/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = b532e905f2ba18c496c8c04f35a2258e33de4b102a450b5f45a1bc8f20d327f9
+
+pkgname = dfdisk
