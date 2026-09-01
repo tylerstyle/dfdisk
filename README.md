@@ -1,7 +1,7 @@
 # dfdisk 🔍💾
 > **Modern Forensic Disk Imaging, Damaged Media Rescue & Format Conversion CLI/TUI for Digital Forensics and Criminal Investigations.**
 
-`dfdisk` is a high-performance terminal utility designed for DFIR examiners, law enforcement investigators, and forensic technicians. It combines rock-solid hardware discovery, safety guardrails, automated evidence naming, dual-hash integrity verification (MD5, SHA-1, SHA-256), and bi-directional conversion between **Expert Witness Format (`.E01`)** and **RAW (`.raw`/`.dd`)** images with a cyberpunk/forensic **Ratatui TUI** dashboard.
+`dfdisk` is a high-performance terminal utility designed for DFIR examiners, law enforcement investigators, and forensic technicians. It combines rock-solid hardware discovery, safety guardrails, automated evidence naming, dual-hash integrity verification (MD5, SHA-1, SHA-256), and bi-directional conversion between **Expert Witness Format (`.E01`)** and **RAW (`.raw`/`.dd`)** images with **Ratatui TUI** dashboard.
 
 ---
 
@@ -21,7 +21,7 @@
   - `RAW -> E01` (with full case headers, split sizes, and compression).
   - `E01 -> RAW` (with streaming hash verification).
 - **SIMD Multi-Hasher & Verifier**: Fast parallel calculation and verification of MD5, SHA-1, and SHA-256 hashes.
-- **Sleek Ratatui TUI**: Dark forensic cyber aesthetic with live speedometer, countdown ETA, bad sector counter, split segment monitor, and real-time engine telemetry.
+- **Sleek Ratatui TUI**: Dark console aesthetic with live speedometer, countdown ETA, bad sector counter, split segment monitor, and real-time engine telemetry.
 
 ---
 
