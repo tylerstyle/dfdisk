@@ -120,13 +120,29 @@ pub fn format_bytes(bytes: u64) -> String {
     const TIB: u64 = GIB * 1024;
 
     if bytes >= TB {
-        format!("{:.2} TB ({:.2} TiB)", bytes as f64 / TB as f64, bytes as f64 / TIB as f64)
+        format!(
+            "{:.2} TB ({:.2} TiB)",
+            bytes as f64 / TB as f64,
+            bytes as f64 / TIB as f64
+        )
     } else if bytes >= GB {
-        format!("{:.2} GB ({:.2} GiB)", bytes as f64 / GB as f64, bytes as f64 / GIB as f64)
+        format!(
+            "{:.2} GB ({:.2} GiB)",
+            bytes as f64 / GB as f64,
+            bytes as f64 / GIB as f64
+        )
     } else if bytes >= MB {
-        format!("{:.2} MB ({:.2} MiB)", bytes as f64 / MB as f64, bytes as f64 / MIB as f64)
+        format!(
+            "{:.2} MB ({:.2} MiB)",
+            bytes as f64 / MB as f64,
+            bytes as f64 / MIB as f64
+        )
     } else if bytes >= KB {
-        format!("{:.2} KB ({:.2} KiB)", bytes as f64 / KB as f64, bytes as f64 / KIB as f64)
+        format!(
+            "{:.2} KB ({:.2} KiB)",
+            bytes as f64 / KB as f64,
+            bytes as f64 / KIB as f64
+        )
     } else {
         format!("{} B", bytes)
     }

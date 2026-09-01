@@ -4,9 +4,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph, Row, Table,
-    },
+    widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph, Row, Table},
     Frame,
 };
 
@@ -45,15 +43,35 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 fn render_header(frame: &mut Frame, _app: &App, area: Rect) {
     let is_root = nix_is_root();
     let root_badge = if is_root {
-        Span::styled(" [● ROOT PRIVILEGES] ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD))
+        Span::styled(
+            " [● ROOT PRIVILEGES] ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
-        Span::styled(" [⚠ NON-ROOT USER - RUN WITH SUDO] ", Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD))
+        Span::styled(
+            " [⚠ NON-ROOT USER - RUN WITH SUDO] ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
     };
 
     let title_spans = vec![
-        Span::styled(" dfdisk ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " dfdisk ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("v0.1.0 ", Style::default().fg(Color::DarkGray)),
-        Span::styled("│ FORENSIC DISK IMAGER & CONVERTER ", Style::default().fg(Color::White)),
+        Span::styled(
+            "│ FORENSIC DISK IMAGER & CONVERTER ",
+            Style::default().fg(Color::White),
+        ),
         root_badge,
     ];
 
@@ -76,9 +94,23 @@ fn render_device_explorer(frame: &mut Frame, app: &mut App, area: Rect) {
         .split(area);
 
     // Top table: Block devices
-    let header_cells = ["Device", "Type", "Vendor / Model", "Serial Number", "Size", "Status"]
-        .into_iter()
-        .map(|h| Span::styled(h, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    let header_cells = [
+        "Device",
+        "Type",
+        "Vendor / Model",
+        "Serial Number",
+        "Size",
+        "Status",
+    ]
+    .into_iter()
+    .map(|h| {
+        Span::styled(
+            h,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    });
     let header_row = Row::new(header_cells).height(1).bottom_margin(1);
 
     let rows: Vec<Row> = app
@@ -88,9 +120,22 @@ fn render_device_explorer(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|(idx, dev)| {
             let is_selected = idx == app.selected_device_idx;
             let (status_text, status_style) = match &dev.safety {
-                DeviceSafety::Safe => ("SAFE", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                DeviceSafety::Mounted(_) => ("MOUNTED", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                DeviceSafety::SystemDisk(_) => ("SYSTEM (CRITICAL)", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                DeviceSafety::Safe => (
+                    "SAFE",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                DeviceSafety::Mounted(_) => (
+                    "MOUNTED",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                DeviceSafety::SystemDisk(_) => (
+                    "SYSTEM (CRITICAL)",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
             };
 
             let row_style = if is_selected {
@@ -100,7 +145,12 @@ fn render_device_explorer(frame: &mut Frame, app: &mut App, area: Rect) {
             };
 
             let cells = vec![
-                Span::styled(format!(" {} ", dev.path), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!(" {} ", dev.path),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(dev.bus_type.clone(), Style::default().fg(Color::Cyan)),
                 Span::styled(dev.display_name(), Style::default().fg(Color::White)),
                 Span::styled(dev.display_serial(), Style::default().fg(Color::Yellow)),
@@ -150,16 +200,26 @@ fn render_device_explorer(frame: &mut Frame, app: &mut App, area: Rect) {
                 let mp_str = p.mountpoint.as_deref().unwrap_or("unmounted");
                 let fs_str = p.fstype.as_deref().unwrap_or("raw");
                 let is_mounted = p.mountpoint.is_some();
-                let color = if is_mounted { Color::Yellow } else { Color::Green };
+                let color = if is_mounted {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                };
 
-                part_items.push(ListItem::new(vec![
-                    Line::from(vec![
-                        Span::styled(format!("  • {} ", p.path), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                        Span::styled(format!("({}) ", crate::models::device::format_bytes(p.size_bytes)), Style::default().fg(Color::DarkGray)),
-                        Span::styled(format!("[{}] ", fs_str), Style::default().fg(Color::Cyan)),
-                        Span::styled(format!("-> {}", mp_str), Style::default().fg(color)),
-                    ]),
-                ]));
+                part_items.push(ListItem::new(vec![Line::from(vec![
+                    Span::styled(
+                        format!("  • {} ", p.path),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("({}) ", crate::models::device::format_bytes(p.size_bytes)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(format!("[{}] ", fs_str), Style::default().fg(Color::Cyan)),
+                    Span::styled(format!("-> {}", mp_str), Style::default().fg(color)),
+                ])]));
             }
         }
 
@@ -176,7 +236,12 @@ fn render_device_explorer(frame: &mut Frame, app: &mut App, area: Rect) {
         let mut hw_lines = vec![
             Line::from(vec![
                 Span::styled("Device Node    : ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&dev.path, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    &dev.path,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("Media Type     : ", Style::default().fg(Color::DarkGray)),
@@ -184,18 +249,37 @@ fn render_device_explorer(frame: &mut Frame, app: &mut App, area: Rect) {
             ]),
             Line::from(vec![
                 Span::styled("Sector Size    : ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("Logical {} B | Physical {} B", dev.logical_sector_size, dev.physical_sector_size), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!(
+                        "Logical {} B | Physical {} B",
+                        dev.logical_sector_size, dev.physical_sector_size
+                    ),
+                    Style::default().fg(Color::White),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("Partition Table: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(dev.partition_table_type.as_deref().unwrap_or("None").to_uppercase(), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    dev.partition_table_type
+                        .as_deref()
+                        .unwrap_or("None")
+                        .to_uppercase(),
+                    Style::default().fg(Color::Yellow),
+                ),
             ]),
         ];
 
         if let Some(smart) = &dev.smart {
             hw_lines.push(Line::from(vec![
                 Span::styled("SMART Health   : ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&smart.assessment, if smart.passed { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Red) }),
+                Span::styled(
+                    &smart.assessment,
+                    if smart.passed {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::Red)
+                    },
+                ),
             ]));
         }
 
@@ -228,37 +312,92 @@ fn render_case_setup(frame: &mut Frame, app: &App, area: Rect) {
     // Left Column: Case details
     let mut left_lines = Vec::new();
     let fields = [
-        ("Case Number   ", &app.case_metadata.case_number, "VG12345/26", 0),
+        (
+            "Case Number   ",
+            &app.case_metadata.case_number,
+            "VG12345/26",
+            0,
+        ),
         ("Location / EA ", &app.case_metadata.location_ea, "01", 1),
-        ("Evidence Nr.  ", &app.case_metadata.evidence_number, "cf01", 2),
-        ("Authority     ", &app.case_metadata.authority, "Police Dept / CID", 3),
-        ("Examiner      ", &app.case_metadata.examiner, "J. Doe #4192", 4),
-        ("Description   ", &app.case_metadata.description, "Suspect Storage Media", 5),
-        ("Notes         ", &app.case_metadata.notes, "Optional notes", 6),
+        (
+            "Evidence Nr.  ",
+            &app.case_metadata.evidence_number,
+            "cf01",
+            2,
+        ),
+        (
+            "Authority     ",
+            &app.case_metadata.authority,
+            "Police Dept / CID",
+            3,
+        ),
+        (
+            "Examiner      ",
+            &app.case_metadata.examiner,
+            "J. Doe #4192",
+            4,
+        ),
+        (
+            "Description   ",
+            &app.case_metadata.description,
+            "Suspect Storage Media",
+            5,
+        ),
+        (
+            "Notes         ",
+            &app.case_metadata.notes,
+            "Optional notes",
+            6,
+        ),
     ];
 
     for (label, val, placeholder, idx) in fields {
         let is_active = app.active_field == idx;
         let prefix = if is_active { "▶ " } else { "  " };
 
-        let mut field_spans = vec![
-            Span::styled(format!("{}{:<15}: [ ", prefix, label), Style::default().fg(if is_active { Color::Cyan } else { Color::DarkGray })),
-        ];
+        let mut field_spans = vec![Span::styled(
+            format!("{}{:<15}: [ ", prefix, label),
+            Style::default().fg(if is_active {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        )];
 
         if val.is_empty() {
             if is_active {
                 field_spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
-                field_spans.push(Span::styled(placeholder, Style::default().fg(Color::Rgb(90, 100, 110))));
+                field_spans.push(Span::styled(
+                    placeholder,
+                    Style::default().fg(Color::Rgb(90, 100, 110)),
+                ));
             } else {
-                field_spans.push(Span::styled(placeholder, Style::default().fg(Color::Rgb(70, 75, 85))));
+                field_spans.push(Span::styled(
+                    placeholder,
+                    Style::default().fg(Color::Rgb(70, 75, 85)),
+                ));
             }
         } else if is_active {
             let cursor = app.cursor_pos.min(val.len());
             let before = &val[..cursor];
-            let after = if cursor < val.len() { &val[cursor..] } else { "" };
-            field_spans.push(Span::styled(before, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+            let after = if cursor < val.len() {
+                &val[cursor..]
+            } else {
+                ""
+            };
+            field_spans.push(Span::styled(
+                before,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
             field_spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
-            field_spans.push(Span::styled(after, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+            field_spans.push(Span::styled(
+                after,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
         } else {
             field_spans.push(Span::styled(val, Style::default().fg(Color::White)));
         }
@@ -282,18 +421,45 @@ fn render_case_setup(frame: &mut Frame, app: &App, area: Rect) {
     // Target dir
     let is_dir_active = app.active_field == 7;
     let mut dir_spans = vec![
-        Span::styled(if is_dir_active { "▶ " } else { "  " }, Style::default().fg(Color::Cyan)),
-        Span::styled("Target Dir    : [ ", Style::default().fg(if is_dir_active { Color::Cyan } else { Color::DarkGray })),
+        Span::styled(
+            if is_dir_active { "▶ " } else { "  " },
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            "Target Dir    : [ ",
+            Style::default().fg(if is_dir_active {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        ),
     ];
     if is_dir_active {
         let cursor = app.cursor_pos.min(app.target_dir_str.len());
         let before = &app.target_dir_str[..cursor];
-        let after = if cursor < app.target_dir_str.len() { &app.target_dir_str[cursor..] } else { "" };
-        dir_spans.push(Span::styled(before, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        let after = if cursor < app.target_dir_str.len() {
+            &app.target_dir_str[cursor..]
+        } else {
+            ""
+        };
+        dir_spans.push(Span::styled(
+            before,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
         dir_spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
-        dir_spans.push(Span::styled(after, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+        dir_spans.push(Span::styled(
+            after,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
     } else {
-        dir_spans.push(Span::styled(&app.target_dir_str, Style::default().fg(Color::White)));
+        dir_spans.push(Span::styled(
+            &app.target_dir_str,
+            Style::default().fg(Color::White),
+        ));
     }
     dir_spans.push(Span::styled(" ]", Style::default().fg(Color::DarkGray)));
     right_lines.push(Line::from(dir_spans));
@@ -301,34 +467,58 @@ fn render_case_setup(frame: &mut Frame, app: &App, area: Rect) {
     // Format
     let is_fmt_active = app.active_field == 8;
     right_lines.push(Line::from(vec![
-        Span::styled(if is_fmt_active { "▶ " } else { "  " }, Style::default().fg(Color::Cyan)),
+        Span::styled(
+            if is_fmt_active { "▶ " } else { "  " },
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled("Output Format : ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("[ {} ]", app.config.format.display_name()),
-            if is_fmt_active { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default().fg(Color::Yellow) },
+            if is_fmt_active {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Yellow)
+            },
         ),
-        Span::styled("  (Space/Arrows to toggle)", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "  (Space/Arrows to toggle)",
+            Style::default().fg(Color::DarkGray),
+        ),
     ]));
 
     // Split size
     let is_split_active = app.active_field == 9;
     right_lines.push(Line::from(vec![
-        Span::styled(if is_split_active { "▶ " } else { "  " }, Style::default().fg(Color::Cyan)),
+        Span::styled(
+            if is_split_active { "▶ " } else { "  " },
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled("Split Size    : ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("[ {} ]", app.config.split_size.display_name()),
-            if is_split_active { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default().fg(Color::Yellow) },
+            if is_split_active {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Yellow)
+            },
         ),
     ]));
 
     // Compression
     let is_comp_active = app.active_field == 10;
     right_lines.push(Line::from(vec![
-        Span::styled(if is_comp_active { "▶ " } else { "  " }, Style::default().fg(Color::Cyan)),
+        Span::styled(
+            if is_comp_active { "▶ " } else { "  " },
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled("Compression   : ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("[ {:?} ]", app.config.compression),
-            if is_comp_active { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default().fg(Color::Yellow) },
+            if is_comp_active {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Yellow)
+            },
         ),
     ]));
 
@@ -339,27 +529,62 @@ fn render_case_setup(frame: &mut Frame, app: &App, area: Rect) {
     right_lines.push(Line::from(vec![
         Span::styled("  Hashes        : ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            if app.config.calc_md5 { "[X] MD5 " } else { "[ ] MD5 " },
-            if hash_md5_active { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default().fg(Color::White) },
+            if app.config.calc_md5 {
+                "[X] MD5 "
+            } else {
+                "[ ] MD5 "
+            },
+            if hash_md5_active {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::White)
+            },
         ),
         Span::styled(
-            if app.config.calc_sha1 { "[X] SHA-1 " } else { "[ ] SHA-1 " },
-            if hash_sha1_active { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default().fg(Color::White) },
+            if app.config.calc_sha1 {
+                "[X] SHA-1 "
+            } else {
+                "[ ] SHA-1 "
+            },
+            if hash_sha1_active {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::White)
+            },
         ),
         Span::styled(
-            if app.config.calc_sha256 { "[X] SHA-256 " } else { "[ ] SHA-256 " },
-            if hash_sha256_active { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default().fg(Color::White) },
+            if app.config.calc_sha256 {
+                "[X] SHA-256 "
+            } else {
+                "[ ] SHA-256 "
+            },
+            if hash_sha256_active {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::White)
+            },
         ),
     ]));
 
     // Rescue mode
     let is_rescue_active = app.active_field == 14;
     right_lines.push(Line::from(vec![
-        Span::styled(if is_rescue_active { "▶ " } else { "  " }, Style::default().fg(Color::Cyan)),
+        Span::styled(
+            if is_rescue_active { "▶ " } else { "  " },
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled("Engine Mode   : ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            if app.config.rescue_mode { "[ RESCUE (ddrescue) - FOR DAMAGED DISKS ]" } else { "[ STANDARD (ewfacquire E01) ]" },
-            if is_rescue_active { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default().fg(Color::Green) },
+            if app.config.rescue_mode {
+                "[ RESCUE (ddrescue) - FOR DAMAGED DISKS ]"
+            } else {
+                "[ STANDARD (ewfacquire E01) ]"
+            },
+            if is_rescue_active {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::Green)
+            },
         ),
     ]));
 
@@ -374,17 +599,40 @@ fn render_case_setup(frame: &mut Frame, app: &App, area: Rect) {
 
     // Live Generated Preview Banner
     let preview_e01 = app.generated_preview_filename();
-    let serial = app.selected_device().map(|d| d.display_serial()).unwrap_or_else(|| "SERIAL".to_string());
+    let serial = app
+        .selected_device()
+        .map(|d| d.display_serial())
+        .unwrap_or_else(|| "SERIAL".to_string());
     let preview_info = app.case_metadata.generate_filename(&serial, "info");
 
     let preview_lines = vec![
         Line::from(vec![
-            Span::styled("  Target Image File       : ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(preview_e01, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "  Target Image File       : ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                preview_e01,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("  Forensic Certificate    : ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(preview_info, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "  Forensic Certificate    : ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                preview_info,
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
     ];
 
@@ -400,7 +648,10 @@ fn render_case_setup(frame: &mut Frame, app: &App, area: Rect) {
     // Action button
     let is_start_active = app.active_field == 15;
     let button_style = if is_start_active {
-        Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(Color::Green)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().bg(Color::DarkGray).fg(Color::White)
     };
@@ -416,9 +667,9 @@ fn render_acquisition(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),  // Gauge
-            Constraint::Length(6),  // Metrics 4-box grid
-            Constraint::Min(6),     // Live Log console
+            Constraint::Length(4), // Gauge
+            Constraint::Length(6), // Metrics 4-box grid
+            Constraint::Min(6),    // Live Log console
         ])
         .split(area);
 
@@ -456,20 +707,50 @@ fn render_acquisition(frame: &mut Frame, app: &App, area: Rect) {
 
     // 1: Speed
     let speed_para = Paragraph::new(vec![
-        Line::from(Span::styled("Current Speed", Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled(app.telemetry.human_speed(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled(format!("Avg: {}", app.telemetry.human_avg_speed()), Style::default().fg(Color::Gray))),
+        Line::from(Span::styled(
+            "Current Speed",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            app.telemetry.human_speed(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("Avg: {}", app.telemetry.human_avg_speed()),
+            Style::default().fg(Color::Gray),
+        )),
     ])
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
     frame.render_widget(speed_para, metric_chunks[0]);
 
     // 2: Elapsed / ETA
     let eta_para = Paragraph::new(vec![
-        Line::from(Span::styled("Elapsed / ETA", Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled(format!("ETA: {}", app.telemetry.human_eta()), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled(format!("Elapsed: {}", app.telemetry.human_elapsed()), Style::default().fg(Color::Gray))),
+        Line::from(Span::styled(
+            "Elapsed / ETA",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            format!("ETA: {}", app.telemetry.human_eta()),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("Elapsed: {}", app.telemetry.human_elapsed()),
+            Style::default().fg(Color::Gray),
+        )),
     ])
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
     frame.render_widget(eta_para, metric_chunks[1]);
 
     // 3: Status & Compression
@@ -478,21 +759,54 @@ fn render_acquisition(frame: &mut Frame, app: &App, area: Rect) {
         None => "Ratio: --".to_string(),
     };
     let status_para = Paragraph::new(vec![
-        Line::from(Span::styled("Phase & Compression", Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled(app.telemetry.status.display_str(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "Phase & Compression",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            app.telemetry.status.display_str(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(Span::styled(comp_str, Style::default().fg(Color::White))),
     ])
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
     frame.render_widget(status_para, metric_chunks[2]);
 
     // 4: Bad blocks / Errors
-    let bad_color = if app.telemetry.bad_sectors > 0 { Color::Red } else { Color::Green };
+    let bad_color = if app.telemetry.bad_sectors > 0 {
+        Color::Red
+    } else {
+        Color::Green
+    };
     let bad_para = Paragraph::new(vec![
-        Line::from(Span::styled("Bad Sectors", Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled(format!("{} sectors", app.telemetry.bad_sectors), Style::default().fg(bad_color).add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled(if app.telemetry.bad_sectors == 0 { "Clean stream" } else { "Wiped with zero" }, Style::default().fg(Color::Gray))),
+        Line::from(Span::styled(
+            "Bad Sectors",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            format!("{} sectors", app.telemetry.bad_sectors),
+            Style::default().fg(bad_color).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            if app.telemetry.bad_sectors == 0 {
+                "Clean stream"
+            } else {
+                "Wiped with zero"
+            },
+            Style::default().fg(Color::Gray),
+        )),
     ])
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
     frame.render_widget(bad_para, metric_chunks[3]);
 
     // Live Log Console
@@ -537,20 +851,40 @@ fn render_converter(frame: &mut Frame, app: &App, area: Rect) {
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("Source Image Path  : [ ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&app.conv_source_path, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Source Image Path  : [ ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                &app.conv_source_path,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" ]", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
-            Span::styled("Conversion Mode    : ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                if app.conv_to_e01 { "[ RAW -> E01 (Expert Witness) ]" } else { "[ E01 -> RAW (Raw Disk Image) ]" },
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                "Conversion Mode    : ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                if app.conv_to_e01 {
+                    "[ RAW -> E01 (Expert Witness) ]"
+                } else {
+                    "[ E01 -> RAW (Raw Disk Image) ]"
+                },
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  (Press Tab to switch)", Style::default().fg(Color::Gray)),
         ]),
         Line::from(vec![
-            Span::styled("Destination Dir    : [ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Destination Dir    : [ ",
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(&app.conv_target_dir, Style::default().fg(Color::White)),
             Span::styled(" ]", Style::default().fg(Color::DarkGray)),
         ]),
@@ -590,22 +924,44 @@ fn render_unmount_modal(frame: &mut Frame, app: &App, area: Rect) {
     let text = vec![
         Line::from(vec![
             Span::styled("Device ", Style::default().fg(Color::White)),
-            Span::styled(dev_name, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(" currently has active mountpoints:", Style::default().fg(Color::White)),
+            Span::styled(
+                dev_name,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " currently has active mountpoints:",
+                Style::default().fg(Color::White),
+            ),
         ]),
-        Line::from(Span::styled(format!("  {}", mount_list), Style::default().fg(Color::Red))),
+        Line::from(Span::styled(
+            format!("  {}", mount_list),
+            Style::default().fg(Color::Red),
+        )),
         Line::from(""),
         Line::from("Imaging a mounted filesystem can lead to inconsistent forensics."),
         Line::from("Do you want dfdisk to safely unmount all partitions?"),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" [Y / Enter] Safe Unmount & Proceed ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [Y / Enter] Safe Unmount & Proceed ",
+                Style::default()
+                    .bg(Color::Green)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("    ", Style::default()),
-            Span::styled(" [N / Esc] Cancel ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+            Span::styled(
+                " [N / Esc] Cancel ",
+                Style::default().bg(Color::DarkGray).fg(Color::White),
+            ),
         ]),
     ];
 
-    let para = Paragraph::new(text).block(block).alignment(Alignment::Center);
+    let para = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center);
     frame.render_widget(para, modal_area);
 }
 
@@ -640,7 +996,9 @@ fn render_system_warning_modal(frame: &mut Frame, app: &App, area: Rect) {
         ]),
     ];
 
-    let para = Paragraph::new(text).block(block).alignment(Alignment::Center);
+    let para = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center);
     frame.render_widget(para, modal_area);
 }
 
@@ -648,14 +1006,32 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let msg = match &app.notification_msg {
         Some((text, is_err)) => {
             let color = if *is_err { Color::Red } else { Color::Green };
-            Span::styled(format!(" ℹ {} ", text), Style::default().fg(color).add_modifier(Modifier::BOLD))
+            Span::styled(
+                format!(" ℹ {} ", text),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
         }
         None => match app.current_screen {
-            Screen::DeviceExplorer => Span::styled(" [Enter/A] Setup  [U] Unmount  [R] Refresh  [C] Converter  [Q] Quit ", Style::default().fg(Color::Gray)),
-            Screen::CaseSetup => Span::styled(" [Tab] Next Field  [Ctrl+U] Clear  [F5/Enter] Start Acquisition  [Esc] Back ", Style::default().fg(Color::Gray)),
-            Screen::AcquisitionRunning => Span::styled(" [Ctrl+C / Esc] Abort Acquisition ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            Screen::ReportSummary => Span::styled(" [Enter / Esc] Return to Explorer ", Style::default().fg(Color::Green)),
-            Screen::Converter => Span::styled(" [Tab] Toggle Mode  [Enter] Start Convert  [Esc] Back ", Style::default().fg(Color::Gray)),
+            Screen::DeviceExplorer => Span::styled(
+                " [Enter/A] Setup  [U] Unmount  [R] Refresh  [C] Converter  [Q] Quit ",
+                Style::default().fg(Color::Gray),
+            ),
+            Screen::CaseSetup => Span::styled(
+                " [Tab] Next Field  [Ctrl+U] Clear  [F5/Enter] Start Acquisition  [Esc] Back ",
+                Style::default().fg(Color::Gray),
+            ),
+            Screen::AcquisitionRunning => Span::styled(
+                " [Ctrl+C / Esc] Abort Acquisition ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Screen::ReportSummary => Span::styled(
+                " [Enter / Esc] Return to Explorer ",
+                Style::default().fg(Color::Green),
+            ),
+            Screen::Converter => Span::styled(
+                " [Tab] Toggle Mode  [Enter] Start Convert  [Esc] Back ",
+                Style::default().fg(Color::Gray),
+            ),
             _ => Span::styled("", Style::default()),
         },
     };
@@ -694,5 +1070,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 fn nix_is_root() -> bool {
     std::env::var("USER").map(|u| u == "root").unwrap_or(false)
-        || std::fs::read_to_string("/proc/self/loginuid").map(|s| s.trim() == "0").unwrap_or(false)
+        || std::fs::read_to_string("/proc/self/loginuid")
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false)
 }

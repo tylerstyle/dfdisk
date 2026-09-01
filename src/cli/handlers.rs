@@ -52,13 +52,20 @@ pub async fn handle_list(args: ListArgs) -> Result<(), Box<dyn std::error::Error
 
 pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error::Error>> {
     let devices = DeviceScanner::scan_devices().unwrap_or_default();
-    let target_dev = if let Some(d) = devices.into_iter().find(|d| d.path == args.device || d.name == args.device) {
+    let target_dev = if let Some(d) = devices
+        .into_iter()
+        .find(|d| d.path == args.device || d.name == args.device)
+    {
         d
     } else if Path::new(&args.device).exists() {
         let path = Path::new(&args.device);
         let meta = std::fs::metadata(path)?;
         let size_bytes = meta.len();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("target").to_string();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("target")
+            .to_string();
 
         BlockDevice {
             name: name.clone(),
@@ -94,7 +101,10 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
     // Safety checks
     match &target_dev.safety {
         DeviceSafety::SystemDisk(mounts) => {
-            eprintln!("\n[!] CRITICAL SAFETY WARNING: {} is a SYSTEM DISK!", target_dev.path);
+            eprintln!(
+                "\n[!] CRITICAL SAFETY WARNING: {} is a SYSTEM DISK!",
+                target_dev.path
+            );
             eprintln!("    Active system mountpoints: {}", mounts.join(", "));
             eprintln!("    Acquiring live system disks can cause evidence corruption. Refusing in CLI mode.");
             return Err("Safety check failed: System disk detected.".into());
@@ -106,7 +116,11 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
                     .map_err(|e| format!("Unmount failed: {}", e))?;
                 println!("[+] Successfully unmounted all partitions.");
             } else {
-                eprintln!("\n[!] WARNING: Device {} has mounted partitions: {}", target_dev.path, mounts.join(", "));
+                eprintln!(
+                    "\n[!] WARNING: Device {} has mounted partitions: {}",
+                    target_dev.path,
+                    mounts.join(", ")
+                );
                 eprintln!("    Pass --auto-unmount or use the TUI interface to safely unmount.");
                 return Err("Safety check failed: Partitions are mounted.".into());
             }
@@ -172,9 +186,17 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
 
     let join_handle = tokio::spawn(async move {
         if cfg_clone.rescue_mode {
-            RescueAcquireEngine::run_rescue(dev_clone, case_clone, cfg_clone, prog_tx, abort_clone).await
+            RescueAcquireEngine::run_rescue(dev_clone, case_clone, cfg_clone, prog_tx, abort_clone)
+                .await
         } else {
-            EwfAcquireEngine::run_acquisition(dev_clone, case_clone, cfg_clone, prog_tx, abort_clone).await
+            EwfAcquireEngine::run_acquisition(
+                dev_clone,
+                case_clone,
+                cfg_clone,
+                prog_tx,
+                abort_clone,
+            )
+            .await
         }
     });
 
@@ -189,7 +211,9 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
         );
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
-        if prog.status == AcquisitionStatus::Completed || matches!(prog.status, AcquisitionStatus::Failed(_)) {
+        if prog.status == AcquisitionStatus::Completed
+            || matches!(prog.status, AcquisitionStatus::Failed(_))
+        {
             break;
         }
     }

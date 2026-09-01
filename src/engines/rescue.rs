@@ -40,7 +40,8 @@ impl RescueAcquireEngine {
         let mut cmd = Command::new("ddrescue");
         cmd.arg("-d"); // Direct I/O
         cmd.arg("-r").arg(config.error_retries.to_string());
-        cmd.arg("-b").arg(device.logical_sector_size.max(512).to_string());
+        cmd.arg("-b")
+            .arg(device.logical_sector_size.max(512).to_string());
         cmd.arg(&device.path);
         cmd.arg(&raw_path);
         cmd.arg(&map_path);
@@ -160,9 +161,13 @@ impl RescueAcquireEngine {
             .map_err(|e| format!("Failed to wait on ddrescue: {}", e))?;
 
         if !status.success() {
-            telemetry.status = AcquisitionStatus::Failed(format!("ddrescue exited with code {:?}", status.code()));
+            telemetry.status =
+                AcquisitionStatus::Failed(format!("ddrescue exited with code {:?}", status.code()));
             let _ = progress_tx.send(telemetry).await;
-            return Err(format!("ddrescue failed with exit code {:?}", status.code()));
+            return Err(format!(
+                "ddrescue failed with exit code {:?}",
+                status.code()
+            ));
         }
 
         // Post-acquisition verification hashing

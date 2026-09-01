@@ -22,7 +22,7 @@ jobs:
       - name: Install forensic system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libewf-tools gddrescue smartmontools util-linux udev
+          sudo apt-get install -y ewf-tools gddrescue smartmontools util-linux udev || sudo apt-get install -y libewf-tools gddrescue smartmontools util-linux udev
 
       - name: Check formatting
         run: cargo fmt --check

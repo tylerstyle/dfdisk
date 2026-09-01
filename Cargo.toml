@@ -22,7 +22,7 @@ dfdisk is a high-performance terminal utility designed for DFIR examiners,\
  hardware discovery, system safety guardrails, automated evidence naming,\
  dual-hash verification (MD5/SHA1/SHA256), and bi-directional conversion\
  between Expert Witness Format (E01) and RAW images with a Ratatui TUI dashboard."""
-depends = "libewf-tools, gddrescue, smartmontools, util-linux, udev"
+depends = "ewf-tools | libewf-tools, gddrescue, smartmontools, util-linux, udev"
 section = "utils"
 priority = "optional"
 assets = [

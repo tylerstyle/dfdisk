@@ -41,7 +41,11 @@ impl DeviceScanner {
                 continue;
             }
 
-            let name = dev_val.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = dev_val
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if name.is_empty() {
                 continue;
             }
@@ -53,11 +57,26 @@ impl DeviceScanner {
                 .unwrap_or_else(|| format!("/dev/{}", name));
 
             let size_bytes = parse_u64(dev_val.get("size"));
-            let model = dev_val.get("model").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
-            let vendor = dev_val.get("vendor").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
-            let serial_lsblk = dev_val.get("serial").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
-            let wwn = dev_val.get("wwn").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
-            let revision = dev_val.get("rev").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+            let model = dev_val
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            let vendor = dev_val
+                .get("vendor")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            let serial_lsblk = dev_val
+                .get("serial")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            let wwn = dev_val
+                .get("wwn")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
+            let revision = dev_val
+                .get("rev")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string());
             let tran = dev_val.get("tran").and_then(|v| v.as_str()).unwrap_or("");
 
             let bus_type = if !tran.is_empty() {
@@ -73,7 +92,10 @@ impl DeviceScanner {
             };
 
             let is_removable = dev_val.get("rm").and_then(|v| v.as_bool()).unwrap_or(false)
-                || dev_val.get("hotplug").and_then(|v| v.as_bool()).unwrap_or(false);
+                || dev_val
+                    .get("hotplug")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
 
             let is_read_only = dev_val.get("ro").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -95,13 +117,13 @@ impl DeviceScanner {
             let is_rotational = dev_val.get("rota").and_then(|v| v.as_bool()).or_else(|| {
                 // Fallback to /sys/block/<name>/queue/rotational
                 let sys_path = format!("/sys/block/{}/queue/rotational", name);
-                fs::read_to_string(sys_path).ok().and_then(|content| {
-                    match content.trim() {
+                fs::read_to_string(sys_path)
+                    .ok()
+                    .and_then(|content| match content.trim() {
                         "1" => Some(true),
                         "0" => Some(false),
                         _ => None,
-                    }
-                })
+                    })
             });
 
             // Parse partitions and mountpoints
@@ -127,19 +149,35 @@ impl DeviceScanner {
 
             if let Some(children) = dev_val.get("children").and_then(|v| v.as_array()) {
                 for child in children {
-                    let part_name = child.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let part_name = child
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let part_path = child
                         .get("path")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| format!("/dev/{}", part_name));
                     let part_size = parse_u64(child.get("size"));
-                    let fstype = child.get("fstype").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let label = child.get("label").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let uuid = child.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let fstype = child
+                        .get("fstype")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let label = child
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let uuid = child
+                        .get("uuid")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     let part_ro = child.get("ro").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                    let mut part_mp = child.get("mountpoint").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let mut part_mp = child
+                        .get("mountpoint")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     if let Some(mps) = child.get("mountpoints").and_then(|v| v.as_array()) {
                         for m in mps {
                             if let Some(s) = m.as_str() {

@@ -101,7 +101,10 @@ impl FormatConverter {
         if status.success() {
             Ok(output_dir.join(format!("{}.E01", clean_stem)))
         } else {
-            Err(format!("Conversion failed with exit code {:?}", status.code()))
+            Err(format!(
+                "Conversion failed with exit code {:?}",
+                status.code()
+            ))
         }
     }
 
@@ -174,14 +177,21 @@ impl FormatConverter {
         if status.success() {
             Ok(output_dir.join(format!("{}.raw", clean_stem)))
         } else {
-            Err(format!("E01 to RAW export failed with exit code {:?}", status.code()))
+            Err(format!(
+                "E01 to RAW export failed with exit code {:?}",
+                status.code()
+            ))
         }
     }
 }
 
 fn strip_known_extensions(name: &str) -> String {
     let lower = name.to_lowercase();
-    if lower.ends_with(".raw") || lower.ends_with(".dd") || lower.ends_with(".img") || lower.ends_with(".e01") {
+    if lower.ends_with(".raw")
+        || lower.ends_with(".dd")
+        || lower.ends_with(".img")
+        || lower.ends_with(".e01")
+    {
         let (stem, _) = name.rsplit_once('.').unwrap_or((name, ""));
         stem.to_string()
     } else {
