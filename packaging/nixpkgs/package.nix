@@ -1,18 +1,21 @@
-{ lib
-, rustPlatform
-, fetchFromGitHub
-, makeWrapper
-, pkg-config
-, libewf
-, smartmontools
-, ddrescue
-, util-linux
-, systemd
+{
+  lib,
+  rustPlatform,
+  fetchFromGitHub,
+  makeWrapper,
+  pkg-config,
+  libewf,
+  smartmontools,
+  ddrescue,
+  util-linux,
+  systemd,
 }:
 
 rustPlatform.buildRustPackage rec {
   pname = "dfdisk";
   version = "0.1.0";
+
+  __structuredAttrs = true;
 
   src = fetchFromGitHub {
     owner = "tylerstyle";
@@ -38,18 +41,21 @@ rustPlatform.buildRustPackage rec {
 
   postInstall = ''
     wrapProgram $out/bin/dfdisk \
-      --prefix PATH : ${lib.makeBinPath [
-        libewf
-        smartmontools
-        ddrescue
-        util-linux
-        systemd
-      ]}
+      --prefix PATH : ${
+        lib.makeBinPath [
+          libewf
+          smartmontools
+          ddrescue
+          util-linux
+          systemd
+        ]
+      }
   '';
 
   meta = with lib; {
     description = "Modern forensic disk imaging, damaged media rescue and conversion CLI/TUI tool";
     homepage = "https://github.com/tylerstyle/dfdisk";
+    changelog = "https://github.com/tylerstyle/dfdisk/releases/tag/v${version}";
     license = licenses.gpl3Plus;
     maintainers = with maintainers; [ tylerstyle ];
     mainProgram = "dfdisk";
