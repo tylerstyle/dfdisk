@@ -14,7 +14,12 @@ pub enum AcquisitionStatus {
 impl AcquisitionStatus {
     #[allow(dead_code)]
     pub fn is_running(&self) -> bool {
-        matches!(self, AcquisitionStatus::Preparing | AcquisitionStatus::Imaging | AcquisitionStatus::Verifying)
+        matches!(
+            self,
+            AcquisitionStatus::Preparing
+                | AcquisitionStatus::Imaging
+                | AcquisitionStatus::Verifying
+        )
     }
 
     pub fn display_str(&self) -> &'static str {

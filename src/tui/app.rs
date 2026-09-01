@@ -189,7 +189,8 @@ impl App {
                     if dev.safety.is_mounted() {
                         self.current_screen = Screen::UnmountPrompt;
                     } else {
-                        self.notification_msg = Some(("Device is already unmounted.".to_string(), false));
+                        self.notification_msg =
+                            Some(("Device is already unmounted.".to_string(), false));
                     }
                 }
             }
@@ -235,7 +236,8 @@ impl App {
                 if let Some(dev) = self.selected_device() {
                     match SafetyChecker::unmount_all(&dev.mountpoints) {
                         Ok(()) => {
-                            self.notification_msg = Some(("Device successfully unmounted.".to_string(), false));
+                            self.notification_msg =
+                                Some(("Device successfully unmounted.".to_string(), false));
                             self.refresh_devices();
                             self.current_screen = Screen::CaseSetup;
                             self.reset_cursor_to_current_field();
@@ -306,19 +308,42 @@ impl App {
 
     fn handle_field_input(&mut self, field: &FormField, key: KeyEvent) {
         match field {
-            FormField::CaseNumber => edit_text(&mut self.case_metadata.case_number, &mut self.cursor_pos, key),
-            FormField::LocationEa => edit_text(&mut self.case_metadata.location_ea, &mut self.cursor_pos, key),
-            FormField::EvidenceNumber => edit_text(&mut self.case_metadata.evidence_number, &mut self.cursor_pos, key),
-            FormField::Authority => edit_text(&mut self.case_metadata.authority, &mut self.cursor_pos, key),
-            FormField::Examiner => edit_text(&mut self.case_metadata.examiner, &mut self.cursor_pos, key),
-            FormField::Description => edit_text(&mut self.case_metadata.description, &mut self.cursor_pos, key),
+            FormField::CaseNumber => edit_text(
+                &mut self.case_metadata.case_number,
+                &mut self.cursor_pos,
+                key,
+            ),
+            FormField::LocationEa => edit_text(
+                &mut self.case_metadata.location_ea,
+                &mut self.cursor_pos,
+                key,
+            ),
+            FormField::EvidenceNumber => edit_text(
+                &mut self.case_metadata.evidence_number,
+                &mut self.cursor_pos,
+                key,
+            ),
+            FormField::Authority => {
+                edit_text(&mut self.case_metadata.authority, &mut self.cursor_pos, key)
+            }
+            FormField::Examiner => {
+                edit_text(&mut self.case_metadata.examiner, &mut self.cursor_pos, key)
+            }
+            FormField::Description => edit_text(
+                &mut self.case_metadata.description,
+                &mut self.cursor_pos,
+                key,
+            ),
             FormField::Notes => edit_text(&mut self.case_metadata.notes, &mut self.cursor_pos, key),
             FormField::TargetDir => {
                 edit_text(&mut self.target_dir_str, &mut self.cursor_pos, key);
                 self.config.output_dir = PathBuf::from(&self.target_dir_str);
             }
             FormField::Format => {
-                if key.code == KeyCode::Left || key.code == KeyCode::Right || key.code == KeyCode::Char(' ') {
+                if key.code == KeyCode::Left
+                    || key.code == KeyCode::Right
+                    || key.code == KeyCode::Char(' ')
+                {
                     self.config.format = match self.config.format {
                         ImageFormat::E01 => ImageFormat::Raw,
                         ImageFormat::Raw => ImageFormat::E01,
@@ -326,7 +351,10 @@ impl App {
                 }
             }
             FormField::SplitSize => {
-                if key.code == KeyCode::Left || key.code == KeyCode::Right || key.code == KeyCode::Char(' ') {
+                if key.code == KeyCode::Left
+                    || key.code == KeyCode::Right
+                    || key.code == KeyCode::Char(' ')
+                {
                     self.config.split_size = match self.config.split_size {
                         SplitSize::TwoGb => SplitSize::FourGb,
                         SplitSize::FourGb => SplitSize::None,
@@ -336,7 +364,10 @@ impl App {
                 }
             }
             FormField::Compression => {
-                if key.code == KeyCode::Left || key.code == KeyCode::Right || key.code == KeyCode::Char(' ') {
+                if key.code == KeyCode::Left
+                    || key.code == KeyCode::Right
+                    || key.code == KeyCode::Char(' ')
+                {
                     self.config.compression = match self.config.compression {
                         CompressionLevel::Fast => CompressionLevel::Best,
                         CompressionLevel::Best => CompressionLevel::None,
@@ -345,22 +376,34 @@ impl App {
                 }
             }
             FormField::HashMd5 => {
-                if key.code == KeyCode::Char(' ') || key.code == KeyCode::Left || key.code == KeyCode::Right {
+                if key.code == KeyCode::Char(' ')
+                    || key.code == KeyCode::Left
+                    || key.code == KeyCode::Right
+                {
                     self.config.calc_md5 = !self.config.calc_md5;
                 }
             }
             FormField::HashSha1 => {
-                if key.code == KeyCode::Char(' ') || key.code == KeyCode::Left || key.code == KeyCode::Right {
+                if key.code == KeyCode::Char(' ')
+                    || key.code == KeyCode::Left
+                    || key.code == KeyCode::Right
+                {
                     self.config.calc_sha1 = !self.config.calc_sha1;
                 }
             }
             FormField::HashSha256 => {
-                if key.code == KeyCode::Char(' ') || key.code == KeyCode::Left || key.code == KeyCode::Right {
+                if key.code == KeyCode::Char(' ')
+                    || key.code == KeyCode::Left
+                    || key.code == KeyCode::Right
+                {
                     self.config.calc_sha256 = !self.config.calc_sha256;
                 }
             }
             FormField::RescueMode => {
-                if key.code == KeyCode::Char(' ') || key.code == KeyCode::Left || key.code == KeyCode::Right {
+                if key.code == KeyCode::Char(' ')
+                    || key.code == KeyCode::Left
+                    || key.code == KeyCode::Right
+                {
                     self.config.rescue_mode = !self.config.rescue_mode;
                 }
             }
@@ -401,9 +444,23 @@ impl App {
 
         tokio::spawn(async move {
             let res = if cfg_clone.rescue_mode {
-                RescueAcquireEngine::run_rescue(dev_clone, case_clone, cfg_clone, prog_tx, abort_flag_clone).await
+                RescueAcquireEngine::run_rescue(
+                    dev_clone,
+                    case_clone,
+                    cfg_clone,
+                    prog_tx,
+                    abort_flag_clone,
+                )
+                .await
             } else {
-                EwfAcquireEngine::run_acquisition(dev_clone, case_clone, cfg_clone, prog_tx, abort_flag_clone).await
+                EwfAcquireEngine::run_acquisition(
+                    dev_clone,
+                    case_clone,
+                    cfg_clone,
+                    prog_tx,
+                    abort_flag_clone,
+                )
+                .await
             };
 
             let _ = rep_tx.send(res).await;
@@ -413,14 +470,17 @@ impl App {
     }
 
     fn handle_key_acquisition(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
+        if key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
             self.abort_flag.store(true, Ordering::Relaxed);
             self.notification_msg = Some(("Aborting acquisition...".to_string(), true));
         }
     }
 
     fn handle_key_report(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Enter || key.code == KeyCode::Esc || key.code == KeyCode::Char('q') {
+        if key.code == KeyCode::Enter || key.code == KeyCode::Esc || key.code == KeyCode::Char('q')
+        {
             self.current_screen = Screen::DeviceExplorer;
             self.refresh_devices();
         }
@@ -511,7 +571,10 @@ pub fn edit_text(target: &mut String, cursor: &mut usize, key: KeyEvent) {
                 if *cursor > 0 {
                     let before = &target[..*cursor];
                     let trimmed = before.trim_end();
-                    let new_len = trimmed.rfind(|c: char| c.is_whitespace() || c == '/' || c == '_').map(|i| i + 1).unwrap_or(0);
+                    let new_len = trimmed
+                        .rfind(|c: char| c.is_whitespace() || c == '/' || c == '_')
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
                     target.replace_range(new_len..*cursor, "");
                     *cursor = new_len;
                 }

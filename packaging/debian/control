@@ -10,7 +10,7 @@ Vcs-Browser: https://github.com/tylerstyle/dfdisk
 
 Package: dfdisk
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libewf-tools, gddrescue, smartmontools, util-linux, udev
+Depends: ${shlibs:Depends}, ${misc:Depends}, ewf-tools | libewf-tools, gddrescue, smartmontools, util-linux, udev
 Description: Modern forensic disk imaging and conversion CLI/TUI tool
  dfdisk is a high-performance terminal utility designed for DFIR examiners,
  law enforcement investigators, and forensic technicians. It combines

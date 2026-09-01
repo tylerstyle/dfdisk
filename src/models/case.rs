@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CaseMetadata {
     pub case_number: String,
     pub location_ea: String,
@@ -9,20 +9,6 @@ pub struct CaseMetadata {
     pub examiner: String,
     pub description: String,
     pub notes: String,
-}
-
-impl Default for CaseMetadata {
-    fn default() -> Self {
-        Self {
-            case_number: String::new(),
-            location_ea: String::new(),
-            evidence_number: String::new(),
-            authority: String::new(),
-            examiner: String::new(),
-            description: String::new(),
-            notes: String::new(),
-        }
-    }
 }
 
 impl CaseMetadata {
@@ -131,10 +117,10 @@ fn sanitize_token(input: &str) -> String {
     for c in input.chars() {
         if c.is_alphanumeric() {
             out.push(c);
-        } else if c == '/' || c == '-' || c == '_' || c == '.' || c == ' ' {
-            if !out.ends_with('_') && !out.is_empty() {
-                out.push('_');
-            }
+        } else if (c == '/' || c == '-' || c == '_' || c == '.' || c == ' ')
+            && (!out.ends_with('_') && !out.is_empty())
+        {
+            out.push('_');
         }
     }
     let trimmed = out.trim_matches('_');
@@ -151,7 +137,13 @@ fn sanitize_serial(serial: &str) -> String {
         "NOSERIAL".to_string()
     } else {
         s.chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>()
             .trim_matches('_')
             .to_uppercase()

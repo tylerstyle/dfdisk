@@ -41,7 +41,8 @@ impl EwfAcquireEngine {
         cmd.arg("-C").arg(case.effective_case());
         cmd.arg("-E").arg(case.effective_evidence());
         cmd.arg("-e").arg(case.effective_examiner());
-        cmd.arg("-D").arg(case.effective_description(&device.display_name()));
+        cmd.arg("-D")
+            .arg(case.effective_description(&device.display_name()));
         if !case.notes.trim().is_empty() {
             cmd.arg("-N").arg(&case.notes);
         }
@@ -231,9 +232,15 @@ impl EwfAcquireEngine {
         };
 
         if !status.success() {
-            telemetry.status = AcquisitionStatus::Failed(format!("ewfacquire exited with code {:?}", status.code()));
+            telemetry.status = AcquisitionStatus::Failed(format!(
+                "ewfacquire exited with code {:?}",
+                status.code()
+            ));
             let _ = progress_tx.send(telemetry).await;
-            return Err(format!("ewfacquire acquisition failed with exit code {:?}", status.code()));
+            return Err(format!(
+                "ewfacquire acquisition failed with exit code {:?}",
+                status.code()
+            ));
         }
 
         // Identify generated segment files
@@ -289,13 +296,17 @@ impl EwfAcquireEngine {
         if let Err(e) = std::fs::write(&info_path, info_text) {
             telemetry.push_log(format!("Warning: Failed to write .info file: {}", e));
         } else {
-            telemetry.push_log(format!("Forensic certificate saved to: {}", info_path.display()));
+            telemetry.push_log(format!(
+                "Forensic certificate saved to: {}",
+                info_path.display()
+            ));
         }
 
         telemetry.status = AcquisitionStatus::Completed;
         telemetry.percentage = 100.0;
         telemetry.bytes_processed = device.size_bytes;
-        telemetry.status_message = "Acquisition and verification successfully completed.".to_string();
+        telemetry.status_message =
+            "Acquisition and verification successfully completed.".to_string();
         let _ = progress_tx.send(telemetry).await;
 
         Ok(report)

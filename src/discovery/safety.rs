@@ -51,7 +51,10 @@ impl SafetyChecker {
 
         for mp in mountpoints {
             if mp == "/" || mp.starts_with("/boot") || mp == "/nix" {
-                return Err(format!("REFUSING to unmount critical OS mountpoint: {}", mp));
+                return Err(format!(
+                    "REFUSING to unmount critical OS mountpoint: {}",
+                    mp
+                ));
             }
 
             let output = Command::new("umount")

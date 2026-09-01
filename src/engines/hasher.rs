@@ -39,7 +39,11 @@ impl MultiHasher {
 
             let mut md5_hasher = if calc_md5 { Some(Md5::new()) } else { None };
             let mut sha1_hasher = if calc_sha1 { Some(Sha1::new()) } else { None };
-            let mut sha256_hasher = if calc_sha256 { Some(Sha256::new()) } else { None };
+            let mut sha256_hasher = if calc_sha256 {
+                Some(Sha256::new())
+            } else {
+                None
+            };
 
             let mut buffer = vec![0u8; 1024 * 1024]; // 1 MB chunk
             let mut bytes_hashed: u64 = 0;
@@ -47,9 +51,9 @@ impl MultiHasher {
             let mut last_report = Instant::now();
 
             loop {
-                let n = reader
-                    .read(&mut buffer)
-                    .map_err(|e| format!("Read error while hashing {}: {}", path_buf.display(), e))?;
+                let n = reader.read(&mut buffer).map_err(|e| {
+                    format!("Read error while hashing {}: {}", path_buf.display(), e)
+                })?;
 
                 if n == 0 {
                     break;

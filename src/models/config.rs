@@ -1,16 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ImageFormat {
+    #[default]
     E01,
     Raw,
-}
-
-impl Default for ImageFormat {
-    fn default() -> Self {
-        ImageFormat::E01
-    }
 }
 
 impl ImageFormat {
@@ -29,17 +24,12 @@ impl ImageFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CompressionLevel {
     None,
+    #[default]
     Fast,
     Best,
-}
-
-impl Default for CompressionLevel {
-    fn default() -> Self {
-        CompressionLevel::Fast
-    }
 }
 
 impl CompressionLevel {
@@ -52,18 +42,13 @@ impl CompressionLevel {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SplitSize {
     None,
+    #[default]
     TwoGb,
     FourGb,
     Custom(u64),
-}
-
-impl Default for SplitSize {
-    fn default() -> Self {
-        SplitSize::TwoGb
-    }
 }
 
 impl SplitSize {
