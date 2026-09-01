@@ -1,3 +1,12 @@
+dfdisk (0.1.1-1) unstable; urgency=medium
+
+  * Upgrade dependencies across the entire stack:
+    - ratatui 0.30.2, crossterm 0.29.0
+    - thiserror 2.0.20, tokio 1.44
+    - md-5 0.11, sha1 0.11, sha2 0.11, digest 0.11, regex 1.11
+
+ -- tylerstyle <tylerstyle@users.noreply.github.com>  Tue, 01 Sep 2026 11:22:00 +0200
+
 dfdisk (0.1.0-1) unstable; urgency=medium
 
   * Initial release (v0.1.0).
