@@ -19,14 +19,35 @@ impl SmartChecker {
         }
 
         let val: Value = serde_json::from_str(&json_str).ok()?;
+        Some(Self::parse_smart_json(&val))
+    }
 
-        // Check if device opened successfully
-        let passed = val
+    pub fn parse_smart_json(val: &Value) -> SmartInfo {
+        let smart_status = val
             .pointer("/smart_status/passed")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+            .and_then(|v| v.as_bool());
+        let smartctl_exit = val
+            .pointer("/smartctl/exit_status")
+            .and_then(|v| v.as_i64());
+
+        // Bit 1 (value 2) indicates device open failed / permission denied
+        let is_inaccessible = if let Some(exit) = smartctl_exit {
+            (exit & 2 != 0) || (exit != 0 && smart_status.is_none())
+        } else {
+            false
+        };
+
+        let (passed, assessment) = match smart_status {
+            Some(true) if !is_inaccessible => (true, "PASSED (Healthy)".to_string()),
+            Some(false) => (false, "WARNING / FAILED".to_string()),
+            _ => (
+                false,
+                "UNKNOWN (Inaccessible / Permission Denied)".to_string(),
+            ),
+        };
+
         let power_on_hours = val.pointer("/power_on_time/hours").and_then(|v| v.as_u64());
-        let temperature_celsius = val
+        let mut temperature_celsius = val
             .pointer("/temperature/current")
             .and_then(|v| v.as_i64())
             .map(|t| t as i32);
@@ -66,33 +87,19 @@ impl SmartChecker {
             {
                 uncorrectable = Some(errs);
             }
-            if let Some(temp) = nvme.get("temperature").and_then(|v| v.as_i64()) {
-                if temperature_celsius.is_none() {
-                    // NVMe temperature in kelvin or celsius depending on format
+            if temperature_celsius.is_none() {
+                if let Some(temp) = nvme.get("temperature").and_then(|v| v.as_i64()) {
                     let temp_c = if temp > 200 {
                         (temp - 273) as i32
                     } else {
                         temp as i32
                     };
-                    return Some(SmartInfo {
-                        passed,
-                        power_on_hours,
-                        temperature_celsius: Some(temp_c),
-                        reallocated_sectors: reallocated,
-                        pending_sectors: pending,
-                        uncorrectable_errors: uncorrectable,
-                        wear_percentage: wear,
-                        assessment: if passed {
-                            "PASSED (Healthy)".to_string()
-                        } else {
-                            "WARNING / FAILED".to_string()
-                        },
-                    });
+                    temperature_celsius = Some(temp_c);
                 }
             }
         }
 
-        Some(SmartInfo {
+        SmartInfo {
             passed,
             power_on_hours,
             temperature_celsius,
@@ -100,11 +107,94 @@ impl SmartChecker {
             pending_sectors: pending,
             uncorrectable_errors: uncorrectable,
             wear_percentage: wear,
-            assessment: if passed {
-                "PASSED (Healthy)".to_string()
-            } else {
-                "WARNING / FAILED".to_string()
-            },
-        })
+            assessment,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_smart_passed_healthy() {
+        let val = json!({
+            "smartctl": { "exit_status": 0 },
+            "smart_status": { "passed": true },
+            "power_on_time": { "hours": 1234 },
+            "temperature": { "current": 35 }
+        });
+        let info = SmartChecker::parse_smart_json(&val);
+        assert!(info.passed);
+        assert_eq!(info.assessment, "PASSED (Healthy)");
+        assert_eq!(info.power_on_hours, Some(1234));
+        assert_eq!(info.temperature_celsius, Some(35));
+    }
+
+    #[test]
+    fn test_parse_smart_failed() {
+        let val = json!({
+            "smartctl": { "exit_status": 8 },
+            "smart_status": { "passed": false },
+            "ata_smart_attributes": {
+                "table": [
+                    { "id": 5, "raw": { "value": 42 } },
+                    { "id": 197, "raw": { "value": 10 } }
+                ]
+            }
+        });
+        let info = SmartChecker::parse_smart_json(&val);
+        assert!(!info.passed);
+        assert_eq!(info.assessment, "WARNING / FAILED");
+        assert_eq!(info.reallocated_sectors, Some(42));
+        assert_eq!(info.pending_sectors, Some(10));
+    }
+
+    #[test]
+    fn test_parse_smart_permission_denied() {
+        let val = json!({
+            "smartctl": {
+                "exit_status": 2,
+                "messages": [{ "severity": "error", "string": "Permission denied" }]
+            }
+        });
+        let info = SmartChecker::parse_smart_json(&val);
+        assert!(!info.passed);
+        assert_eq!(
+            info.assessment,
+            "UNKNOWN (Inaccessible / Permission Denied)"
+        );
+    }
+
+    #[test]
+    fn test_parse_smart_missing_status() {
+        let val = json!({
+            "device": { "name": "/dev/sda" }
+        });
+        let info = SmartChecker::parse_smart_json(&val);
+        assert!(!info.passed);
+        assert_eq!(
+            info.assessment,
+            "UNKNOWN (Inaccessible / Permission Denied)"
+        );
+    }
+
+    #[test]
+    fn test_parse_smart_nvme_kelvin() {
+        let val = json!({
+            "smartctl": { "exit_status": 0 },
+            "smart_status": { "passed": true },
+            "nvme_smart_health_information_log": {
+                "available_spare": 95,
+                "media_and_data_integrity_errors": 0,
+                "temperature": 310
+            }
+        });
+        let info = SmartChecker::parse_smart_json(&val);
+        assert!(info.passed);
+        assert_eq!(info.temperature_celsius, Some(37)); // 310 - 273 = 37
+        assert_eq!(info.wear_percentage, Some(5)); // 100 - 95 = 5
+        assert_eq!(info.uncorrectable_errors, Some(0));
     }
 }

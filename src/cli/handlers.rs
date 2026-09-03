@@ -321,6 +321,7 @@ pub async fn handle_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::E
     println!("  SHA-256: {}", hashes.sha256.as_deref().unwrap_or("N/A"));
     println!("================================================================================");
 
+    let any_checked = args.md5.is_some() || args.sha1.is_some() || args.sha256.is_some();
     let mut all_match = true;
     if let (Some(exp), Some(calc)) = (&args.md5, &hashes.md5) {
         if exp.eq_ignore_ascii_case(calc) {
@@ -347,19 +348,113 @@ pub async fn handle_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::E
         }
     }
 
-    if all_match {
+    if !any_checked {
+        println!("\n[*] HASH COMPUTATION COMPLETE (No verification hashes supplied)");
+        Ok(())
+    } else if all_match {
         println!("\n[+] VERIFICATION RESULT: PASSED");
+        Ok(())
     } else {
         println!("\n[!] VERIFICATION RESULT: FAILED (INTEGRITY ERROR)");
+        Err("Cryptographic hash mismatch".into())
     }
-
-    Ok(())
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
+pub(crate) fn truncate(s: &str, max_len: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count > max_len {
+        if max_len <= 3 {
+            s.chars().take(max_len).collect()
+        } else {
+            let keep = max_len.saturating_sub(3);
+            let prefix: String = s.chars().take(keep).collect();
+            format!("{}...", prefix)
+        }
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_ascii() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world", 8), "hello...");
+        assert_eq!(truncate("test", 4), "test");
+        assert_eq!(truncate("test", 3), "tes");
+        assert_eq!(truncate("test", 1), "t");
+        assert_eq!(truncate("test", 0), "");
+    }
+
+    #[test]
+    fn test_truncate_utf8_multibyte() {
+        // German umlauts (2 bytes each)
+        let s = "äöüäöüäöü";
+        assert_eq!(truncate(s, 6), "äöü...");
+        assert_eq!(truncate(s, 9), "äöüäöüäöü");
+
+        // Cyrillic (2 bytes each)
+        let cyr = "Привет мир";
+        assert_eq!(truncate(cyr, 8), "Приве...");
+
+        // Japanese / Chinese (3 bytes each)
+        let cjk = "こんにちは世界";
+        assert_eq!(truncate(cjk, 5), "こん...");
+
+        // Emoji (4 bytes each)
+        let emoji = "🚀🔒🛡️⚡🎯";
+        let truncated = truncate(emoji, 4);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_stress_adversarial_utf8() {
+        let samples = [
+            "",
+            "a",
+            "ab",
+            "abc",
+            "abcd",
+            "ä",
+            "äöü",
+            "äöüäöü",
+            "こんにちは世界",
+            "Привет, мир! Как дела?",
+            "🚀🔒🛡️⚡🎯🎉",
+            "👨‍👩‍👧‍👦",
+            "e\u{0301}a\u{0301}o\u{0301}",
+            "العربية",
+            "עִבְרִית",
+            "Mix 🚀 ä 世 test 123",
+            "   spaces   ",
+            "...",
+            "......",
+        ];
+
+        for s in &samples {
+            for max_len in 0..=30 {
+                let res = truncate(s, max_len);
+                let res_chars = res.chars().count();
+                let orig_chars = s.chars().count();
+
+                if orig_chars <= max_len {
+                    assert_eq!(&res, *s, "Expected full string when orig_chars <= max_len");
+                } else {
+                    assert_eq!(
+                        res_chars, max_len,
+                        "Truncated string char count must equal max_len"
+                    );
+                    if max_len > 3 {
+                        assert!(
+                            res.ends_with("..."),
+                            "Must end with ellipsis when max_len > 3"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

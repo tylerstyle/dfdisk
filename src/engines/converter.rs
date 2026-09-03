@@ -45,12 +45,11 @@ impl FormatConverter {
         cmd.arg("-f").arg("encase6");
         cmd.arg("-c").arg(compression.as_ewf_arg());
         cmd.arg("-S").arg(split_size.as_ewf_arg());
-        cmd.arg("-d").arg("sha1");
         cmd.arg("-d").arg("sha256");
         cmd.arg("-t").arg(&target_str);
         cmd.arg(source_raw_path);
 
-        cmd.stdout(Stdio::piped());
+        cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
 
         let mut child = cmd
@@ -132,7 +131,7 @@ impl FormatConverter {
         cmd.arg("-t").arg(&target_str);
         cmd.arg(source_e01_path);
 
-        cmd.stdout(Stdio::piped());
+        cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::piped());
 
         let mut child = cmd
@@ -185,7 +184,7 @@ impl FormatConverter {
     }
 }
 
-fn strip_known_extensions(name: &str) -> String {
+pub(crate) fn strip_known_extensions(name: &str) -> String {
     let lower = name.to_lowercase();
     if lower.ends_with(".raw")
         || lower.ends_with(".dd")
@@ -196,5 +195,24 @@ fn strip_known_extensions(name: &str) -> String {
         stem.to_string()
     } else {
         name.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_known_extensions() {
+        assert_eq!(strip_known_extensions("disk.raw"), "disk");
+        assert_eq!(strip_known_extensions("disk.dd"), "disk");
+        assert_eq!(strip_known_extensions("disk.img"), "disk");
+        assert_eq!(strip_known_extensions("disk.E01"), "disk");
+        assert_eq!(strip_known_extensions("disk.e01"), "disk");
+        assert_eq!(
+            strip_known_extensions("evidence_01.tar.gz"),
+            "evidence_01.tar.gz"
+        );
+        assert_eq!(strip_known_extensions("disk"), "disk");
     }
 }

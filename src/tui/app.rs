@@ -559,6 +559,14 @@ impl App {
 }
 
 pub fn edit_text(target: &mut String, cursor: &mut usize, key: KeyEvent) {
+    // Clamp cursor and align to valid character boundary
+    if *cursor > target.len() {
+        *cursor = target.len();
+    }
+    while *cursor > 0 && !target.is_char_boundary(*cursor) {
+        *cursor -= 1;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('u') | KeyCode::Char('k') => {
@@ -570,13 +578,26 @@ pub fn edit_text(target: &mut String, cursor: &mut usize, key: KeyEvent) {
                 // Delete backward word
                 if *cursor > 0 {
                     let before = &target[..*cursor];
-                    let trimmed = before.trim_end();
-                    let new_len = trimmed
-                        .rfind(|c: char| c.is_whitespace() || c == '/' || c == '_')
-                        .map(|i| i + 1)
-                        .unwrap_or(0);
-                    target.replace_range(new_len..*cursor, "");
-                    *cursor = new_len;
+                    // Skip any trailing delimiters
+                    let last_non_delim = before
+                        .char_indices()
+                        .rfind(|&(_, c)| !c.is_whitespace() && c != '/' && c != '_');
+
+                    if let Some((idx, c)) = last_non_delim {
+                        let word_end = idx + c.len_utf8();
+                        let before_word = &before[..word_end];
+                        let new_len = before_word
+                            .char_indices()
+                            .filter(|&(_, ch)| ch.is_whitespace() || ch == '/' || ch == '_')
+                            .map(|(i, ch)| i + ch.len_utf8())
+                            .next_back()
+                            .unwrap_or(0);
+                        target.replace_range(new_len..*cursor, "");
+                        *cursor = new_len;
+                    } else {
+                        target.replace_range(0..*cursor, "");
+                        *cursor = 0;
+                    }
                 }
                 return;
             }
@@ -599,15 +620,14 @@ pub fn edit_text(target: &mut String, cursor: &mut usize, key: KeyEvent) {
                 *cursor = target.len();
             } else {
                 target.insert(*cursor, c);
-                *cursor += 1;
+                *cursor += c.len_utf8();
             }
         }
         KeyCode::Backspace => {
             if *cursor > 0 && !target.is_empty() {
-                let remove_idx = *cursor - 1;
-                if remove_idx < target.len() {
-                    target.remove(remove_idx);
-                    *cursor -= 1;
+                if let Some((prev_idx, _)) = target[..*cursor].char_indices().next_back() {
+                    target.remove(prev_idx);
+                    *cursor = prev_idx;
                 }
             }
         }
@@ -617,11 +637,21 @@ pub fn edit_text(target: &mut String, cursor: &mut usize, key: KeyEvent) {
             }
         }
         KeyCode::Left => {
-            *cursor = cursor.saturating_sub(1);
+            if *cursor > 0 {
+                if let Some((prev_idx, _)) = target[..*cursor].char_indices().next_back() {
+                    *cursor = prev_idx;
+                } else {
+                    *cursor = 0;
+                }
+            }
         }
         KeyCode::Right => {
             if *cursor < target.len() {
-                *cursor += 1;
+                if let Some((next_offset, _)) = target[*cursor..].char_indices().nth(1) {
+                    *cursor += next_offset;
+                } else {
+                    *cursor = target.len();
+                }
             }
         }
         KeyCode::Home => {
@@ -631,5 +661,212 @@ pub fn edit_text(target: &mut String, cursor: &mut usize, key: KeyEvent) {
             *cursor = target.len();
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn test_edit_text_multibyte_insert_and_cursor() {
+        let mut s = String::new();
+        let mut cursor = 0;
+
+        // Insert 'ä' (2 bytes)
+        edit_text(&mut s, &mut cursor, key(KeyCode::Char('ä')));
+        assert_eq!(s, "ä");
+        assert_eq!(cursor, 2);
+
+        // Insert '世' (3 bytes)
+        edit_text(&mut s, &mut cursor, key(KeyCode::Char('世')));
+        assert_eq!(s, "ä世");
+        assert_eq!(cursor, 5);
+
+        // Insert '🚀' (4 bytes)
+        edit_text(&mut s, &mut cursor, key(KeyCode::Char('🚀')));
+        assert_eq!(s, "ä世🚀");
+        assert_eq!(cursor, 9);
+    }
+
+    #[test]
+    fn test_edit_text_multibyte_navigation_and_deletion() {
+        let mut s = "ä世🚀".to_string(); // lengths: 2, 3, 4 -> byte offsets: 0, 2, 5, 9
+        let mut cursor = 9;
+
+        // Move Left over 🚀
+        edit_text(&mut s, &mut cursor, key(KeyCode::Left));
+        assert_eq!(cursor, 5);
+
+        // Move Left over 世
+        edit_text(&mut s, &mut cursor, key(KeyCode::Left));
+        assert_eq!(cursor, 2);
+
+        // Move Left over ä
+        edit_text(&mut s, &mut cursor, key(KeyCode::Left));
+        assert_eq!(cursor, 0);
+
+        // Move Left at 0 does not underflow
+        edit_text(&mut s, &mut cursor, key(KeyCode::Left));
+        assert_eq!(cursor, 0);
+
+        // Move Right over ä
+        edit_text(&mut s, &mut cursor, key(KeyCode::Right));
+        assert_eq!(cursor, 2);
+
+        // Backspace over ä
+        edit_text(&mut s, &mut cursor, key(KeyCode::Backspace));
+        assert_eq!(s, "世🚀");
+        assert_eq!(cursor, 0);
+
+        // Delete 世
+        edit_text(&mut s, &mut cursor, key(KeyCode::Delete));
+        assert_eq!(s, "🚀");
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn test_edit_text_ctrl_w_multibyte() {
+        let mut s = "case_01/prüf_daten/e01".to_string();
+        let mut cursor = s.len();
+
+        edit_text(&mut s, &mut cursor, ctrl_key(KeyCode::Char('w')));
+        assert_eq!(s, "case_01/prüf_daten/");
+        assert_eq!(cursor, s.len());
+
+        edit_text(&mut s, &mut cursor, ctrl_key(KeyCode::Char('w')));
+        assert_eq!(s, "case_01/prüf_");
+        assert_eq!(cursor, s.len());
+
+        edit_text(&mut s, &mut cursor, ctrl_key(KeyCode::Char('w')));
+        assert_eq!(s, "case_01/");
+        assert_eq!(cursor, s.len());
+    }
+
+    #[test]
+    fn test_edit_text_stress_adversarial() {
+        let s = "ä世🚀".to_string(); // byte length: 2 + 3 + 4 = 9 bytes
+
+        // Test cursor alignment and navigation from EVERY byte index (including interior invalid indices)
+        for invalid_cursor in 0..=s.len() + 3 {
+            let mut cur = invalid_cursor;
+            let mut s_copy = s.clone();
+            edit_text(&mut s_copy, &mut cur, key(KeyCode::Left));
+            assert!(
+                s_copy.is_char_boundary(cur),
+                "Cursor must be on char boundary after Left from {}",
+                invalid_cursor
+            );
+
+            let mut cur = invalid_cursor;
+            let mut s_copy = s.clone();
+            edit_text(&mut s_copy, &mut cur, key(KeyCode::Right));
+            assert!(
+                s_copy.is_char_boundary(cur),
+                "Cursor must be on char boundary after Right from {}",
+                invalid_cursor
+            );
+
+            let mut cur = invalid_cursor;
+            let mut s_copy = s.clone();
+            edit_text(&mut s_copy, &mut cur, key(KeyCode::Backspace));
+            assert!(
+                s_copy.is_char_boundary(cur),
+                "Cursor must be on char boundary after Backspace from {}",
+                invalid_cursor
+            );
+
+            let mut cur = invalid_cursor;
+            let mut s_copy = s.clone();
+            edit_text(&mut s_copy, &mut cur, key(KeyCode::Delete));
+            assert!(
+                s_copy.is_char_boundary(cur),
+                "Cursor must be on char boundary after Delete from {}",
+                invalid_cursor
+            );
+
+            let mut cur = invalid_cursor;
+            let mut s_copy = s.clone();
+            edit_text(&mut s_copy, &mut cur, ctrl_key(KeyCode::Char('w')));
+            assert!(
+                s_copy.is_char_boundary(cur),
+                "Cursor must be on char boundary after Ctrl+W from {}",
+                invalid_cursor
+            );
+        }
+    }
+
+    #[test]
+    fn test_edit_text_insert_at_all_positions() {
+        let chars_to_insert = ['a', 'ß', '€', '🔥', '世'];
+        for &c in &chars_to_insert {
+            let mut s = "123".to_string();
+            let mut cur = 0;
+            edit_text(&mut s, &mut cur, key(KeyCode::Char(c)));
+            assert_eq!(cur, c.len_utf8());
+            assert!(s.starts_with(c));
+
+            // Insert in middle
+            edit_text(&mut s, &mut cur, key(KeyCode::Char('X')));
+            assert!(s.is_char_boundary(cur));
+
+            // Insert at end
+            cur = s.len();
+            edit_text(&mut s, &mut cur, key(KeyCode::Char(c)));
+            assert_eq!(cur, s.len());
+            assert!(s.ends_with(c));
+        }
+    }
+
+    #[test]
+    fn test_edit_text_ctrl_w_deep() {
+        // Path with mixed unicode and multiple delimiters
+        let mut s = "/var/log/ケース_01/データ/image.raw".to_string();
+        let mut cursor = s.len();
+
+        edit_text(&mut s, &mut cursor, ctrl_key(KeyCode::Char('w')));
+        assert_eq!(s, "/var/log/ケース_01/データ/");
+        assert_eq!(cursor, s.len());
+
+        edit_text(&mut s, &mut cursor, ctrl_key(KeyCode::Char('w')));
+        assert_eq!(s, "/var/log/ケース_01/");
+        assert_eq!(cursor, s.len());
+
+        // Underscore is a delimiter, so next Ctrl+W deletes "01/" leaving "/var/log/ケース_"
+        edit_text(&mut s, &mut cursor, ctrl_key(KeyCode::Char('w')));
+        assert_eq!(s, "/var/log/ケース_");
+        assert_eq!(cursor, s.len());
+
+        // Next Ctrl+W deletes "ケース_" leaving "/var/log/"
+        edit_text(&mut s, &mut cursor, ctrl_key(KeyCode::Char('w')));
+        assert_eq!(s, "/var/log/");
+        assert_eq!(cursor, s.len());
+
+        edit_text(&mut s, &mut cursor, ctrl_key(KeyCode::Char('w')));
+        assert_eq!(s, "/var/");
+        assert_eq!(cursor, s.len());
+
+        edit_text(&mut s, &mut cursor, ctrl_key(KeyCode::Char('w')));
+        assert_eq!(s, "/");
+        assert_eq!(cursor, s.len());
+
+        edit_text(&mut s, &mut cursor, ctrl_key(KeyCode::Char('w')));
+        assert_eq!(s, "");
+        assert_eq!(cursor, 0);
+
+        // Edge case: string of only delimiters
+        let mut s_delim = "/// ___   ///".to_string();
+        let mut cur_delim = s_delim.len();
+        edit_text(&mut s_delim, &mut cur_delim, ctrl_key(KeyCode::Char('w')));
+        assert_eq!(s_delim, "");
+        assert_eq!(cur_delim, 0);
     }
 }

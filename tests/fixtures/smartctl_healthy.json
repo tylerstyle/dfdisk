@@ -1,0 +1,31 @@
+{
+  "json_format_version": [1, 0],
+  "smartctl": {
+    "version": [7, 4],
+    "exit_status": 0
+  },
+  "device": {
+    "name": "/dev/nvme0n1",
+    "info_name": "/dev/nvme0n1",
+    "type": "nvme",
+    "protocol": "NVMe"
+  },
+  "smart_status": {
+    "passed": true
+  },
+  "power_on_time": {
+    "hours": 3450
+  },
+  "temperature": {
+    "current": 38
+  },
+  "nvme_smart_health_information_log": {
+    "critical_warning": 0,
+    "temperature": 311,
+    "available_spare": 100,
+    "available_spare_threshold": 10,
+    "percentage_used": 0,
+    "media_and_data_integrity_errors": 0,
+    "error_information_log_entries": 0
+  }
+}

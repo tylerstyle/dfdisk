@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-09-03
+
+### Added
+- **Integration Test Suite**: Added 6 comprehensive integration test suites (`cli_test.rs`, `hashing_test.rs`, `discovery_test.rs`, `safety_test.rs`, `case_naming_test.rs`, `engine_robustness_test.rs`) and mock test fixtures, bringing total test coverage to 151 passing tests.
+- **Terminal State Recovery**: Added global panic hook to reliably restore terminal state (raw mode and mouse capture) upon abnormal exit.
+
+### Changed
+- **Dependencies Upgrade**: Upgraded crate dependencies to latest compatible versions:
+  - `tokio` upgraded to `1.53`
+  - `clap` upgraded to `4.6`
+  - `regex` upgraded to `1.13`
+  - Updated transitive dependencies (`lru`, `mio`, `smallvec`, `unicode-width`).
+- **Nix Packaging**: Expanded `package.nix` fileset to include `tests/` for hermetic Nix sandbox test execution.
+
+### Fixed
+- **Asynchronous Child Process Draining**: Resolved pipe buffer deadlocks in E01 (`ewfacquire`) and rescue (`ddrescue`) engines by asynchronously draining process output streams.
+- **Block Device Capacity Probing**: Enhanced `MultiHasher` capacity determination via seek/ioctl inspection, ensuring accurate progress calculation and hash verification on raw physical disks.
+- **System Disk Guardrails**: Hardened recursive device inspection to detect nested LVM logical volumes, LUKS containers, and active swap volumes (with `/proc/swaps` fallbacks).
+- **TUI UTF-8 Safety**: Prevented multi-byte UTF-8 boundary slicing panics across text input and status line renders in the Ratatui interface.
+
+---
+
 ## [0.1.1] - 2026-09-01
 
 ### Changed

@@ -4,12 +4,13 @@ use md5::Md5;
 use sha1::Sha1;
 use sha2::Sha256;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
 #[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub struct HashProgress {
     pub bytes_hashed: u64,
     pub total_bytes: u64,
@@ -31,10 +32,19 @@ impl MultiHasher {
         let path_buf = path.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
-            let file = File::open(&path_buf)
+            let mut file = File::open(&path_buf)
                 .map_err(|e| format!("Failed to open {}: {}", path_buf.display(), e))?;
 
-            let total_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let mut total_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if total_bytes == 0 {
+                // For Linux block devices, metadata().len() returns 0.
+                // Seek to the end of the block device to determine true capacity.
+                if let Ok(end_pos) = file.seek(SeekFrom::End(0)) {
+                    total_bytes = end_pos;
+                    let _ = file.seek(SeekFrom::Start(0));
+                }
+            }
+
             let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file); // 2 MB buffer
 
             let mut md5_hasher = if calc_md5 { Some(Md5::new()) } else { None };
@@ -97,6 +107,27 @@ impl MultiHasher {
                 }
             }
 
+            // Ensure final progress report reaches 100.0%
+            if let Some(ref tx) = progress_tx {
+                let elapsed_secs = start_time.elapsed().as_secs_f64();
+                let speed_bps = if elapsed_secs > 0.0 {
+                    bytes_hashed as f64 / elapsed_secs
+                } else {
+                    0.0
+                };
+                let final_total = if total_bytes == 0 {
+                    bytes_hashed
+                } else {
+                    total_bytes
+                };
+                let _ = tx.blocking_send(HashProgress {
+                    bytes_hashed,
+                    total_bytes: final_total,
+                    speed_bps,
+                    percentage: 100.0,
+                });
+            }
+
             let md5_str = md5_hasher.map(|h| hex::encode(h.finalize()));
             let sha1_str = sha1_hasher.map(|h| hex::encode(h.finalize()));
             let sha256_str = sha256_hasher.map(|h| hex::encode(h.finalize()));
@@ -109,5 +140,75 @@ impl MultiHasher {
         })
         .await
         .map_err(|e| format!("Hasher task failed: {}", e))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn test_hash_stream_known_vector() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("dfdisk_test_known_vector.txt");
+        {
+            let mut f = File::create(&test_file).unwrap();
+            f.write_all(b"hello world").unwrap();
+        }
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let res = MultiHasher::hash_stream(&test_file, true, true, true, Some(tx))
+            .await
+            .expect("Hashing should succeed");
+
+        assert_eq!(res.md5.as_deref(), Some("5eb63bbbe01eeed093cb22bb8f5acdc3"));
+        assert_eq!(
+            res.sha1.as_deref(),
+            Some("2aae6c35c94fcfb415dbe95f408b9ce91ee846ed")
+        );
+        assert_eq!(
+            res.sha256.as_deref(),
+            Some("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
+        );
+
+        // Verify final progress reaches 100%
+        let mut last_progress = None;
+        while let Some(prog) = rx.recv().await {
+            last_progress = Some(prog);
+        }
+        let final_prog = last_progress.expect("Should have received progress");
+        assert_eq!(final_prog.percentage, 100.0);
+        assert_eq!(final_prog.bytes_hashed, 11);
+
+        let _ = std::fs::remove_file(test_file);
+    }
+
+    #[tokio::test]
+    async fn test_hash_stream_empty_file() {
+        let temp_dir = std::env::temp_dir();
+        let test_file = temp_dir.join("dfdisk_test_empty.txt");
+        {
+            let _ = File::create(&test_file).unwrap();
+        }
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let res = MultiHasher::hash_stream(&test_file, true, false, false, Some(tx))
+            .await
+            .expect("Hashing should succeed");
+
+        assert_eq!(res.md5.as_deref(), Some("d41d8cd98f00b204e9800998ecf8427e"));
+        assert!(res.sha1.is_none());
+        assert!(res.sha256.is_none());
+
+        let mut last_progress = None;
+        while let Some(prog) = rx.recv().await {
+            last_progress = Some(prog);
+        }
+        let final_prog = last_progress.expect("Should have received progress");
+        assert_eq!(final_prog.percentage, 100.0);
+        assert_eq!(final_prog.bytes_hashed, 0);
+
+        let _ = std::fs::remove_file(test_file);
     }
 }

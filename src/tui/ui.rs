@@ -67,7 +67,10 @@ fn render_header(frame: &mut Frame, _app: &App, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("v0.1.0 ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("v{} ", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled(
             "│ FORENSIC DISK IMAGER & CONVERTER ",
             Style::default().fg(Color::White),
@@ -378,13 +381,7 @@ fn render_case_setup(frame: &mut Frame, app: &App, area: Rect) {
                 ));
             }
         } else if is_active {
-            let cursor = app.cursor_pos.min(val.len());
-            let before = &val[..cursor];
-            let after = if cursor < val.len() {
-                &val[cursor..]
-            } else {
-                ""
-            };
+            let (before, after) = safe_split_at(val, app.cursor_pos);
             field_spans.push(Span::styled(
                 before,
                 Style::default()
@@ -435,13 +432,7 @@ fn render_case_setup(frame: &mut Frame, app: &App, area: Rect) {
         ),
     ];
     if is_dir_active {
-        let cursor = app.cursor_pos.min(app.target_dir_str.len());
-        let before = &app.target_dir_str[..cursor];
-        let after = if cursor < app.target_dir_str.len() {
-            &app.target_dir_str[cursor..]
-        } else {
-            ""
-        };
+        let (before, after) = safe_split_at(&app.target_dir_str, app.cursor_pos);
         dir_spans.push(Span::styled(
             before,
             Style::default()
@@ -1068,9 +1059,111 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn nix_is_root() -> bool {
-    std::env::var("USER").map(|u| u == "root").unwrap_or(false)
-        || std::fs::read_to_string("/proc/self/loginuid")
-            .map(|s| s.trim() == "0")
-            .unwrap_or(false)
+pub(crate) fn safe_split_at(s: &str, mut idx: usize) -> (&str, &str) {
+    if idx > s.len() {
+        idx = s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    (&s[..idx], &s[idx..])
+}
+
+pub(crate) fn nix_is_root() -> bool {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        unsafe { geteuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_safe_split_at_ascii() {
+        let (before, after) = safe_split_at("hello world", 5);
+        assert_eq!(before, "hello");
+        assert_eq!(after, " world");
+
+        let (b_zero, a_zero) = safe_split_at("hello", 0);
+        assert_eq!(b_zero, "");
+        assert_eq!(a_zero, "hello");
+
+        let (b_past, a_past) = safe_split_at("hello", 100);
+        assert_eq!(b_past, "hello");
+        assert_eq!(a_past, "");
+    }
+
+    #[test]
+    fn test_safe_split_at_multibyte_boundary() {
+        // "ä" is 2 bytes (indices 0..2), "世" is 3 bytes (indices 2..5)
+        let s = "ä世";
+        assert_eq!(s.len(), 5);
+
+        // Splitting right at index 1 (inside 'ä') must not panic and adjust backward to 0
+        let (before, after) = safe_split_at(s, 1);
+        assert_eq!(before, "");
+        assert_eq!(after, "ä世");
+
+        // Splitting at index 2 (exact boundary between 'ä' and '世')
+        let (before, after) = safe_split_at(s, 2);
+        assert_eq!(before, "ä");
+        assert_eq!(after, "世");
+
+        // Splitting at index 3 or 4 (inside '世') adjusts backward to 2
+        let (before, after) = safe_split_at(s, 3);
+        assert_eq!(before, "ä");
+        assert_eq!(after, "世");
+
+        let (before, after) = safe_split_at(s, 4);
+        assert_eq!(before, "ä");
+        assert_eq!(after, "世");
+
+        // Splitting at index 5 (end)
+        let (before, after) = safe_split_at(s, 5);
+        assert_eq!(before, "ä世");
+        assert_eq!(after, "");
+    }
+
+    #[test]
+    fn test_nix_is_root_execution() {
+        // Ensure nix_is_root executes cleanly without crashing
+        let _ = nix_is_root();
+    }
+
+    #[test]
+    fn test_safe_split_at_stress_adversarial() {
+        let test_strings = [
+            "",
+            "a",
+            "hello world",
+            "äöü",
+            "こんにちは世界",
+            "Привет мир",
+            "🚀🔒🛡️⚡🎯🎉",
+            "👨‍👩‍👧‍👦",
+            "Mix ä 世 🚀 123",
+        ];
+
+        for s in &test_strings {
+            // Test indices from 0 up to well beyond the byte length
+            for idx in 0..=s.len() + 10 {
+                let (before, after) = safe_split_at(s, idx);
+                assert_eq!(
+                    format!("{}{}", before, after),
+                    *s,
+                    "Split pieces must reconstruct original string at idx {}",
+                    idx
+                );
+            }
+        }
+    }
 }

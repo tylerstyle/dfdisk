@@ -1,0 +1,108 @@
+{
+  "blockdevices": [
+    {
+      "name": "nvme0n1",
+      "path": "/dev/nvme0n1",
+      "type": "disk",
+      "size": 1000204886016,
+      "model": "Samsung SSD 980 PRO 1TB",
+      "vendor": "Samsung",
+      "serial": "S5GXNF0R123456",
+      "tran": "nvme",
+      "children": [
+        {
+          "name": "nvme0n1p1",
+          "path": "/dev/nvme0n1p1",
+          "size": 1073741824,
+          "fstype": "vfat",
+          "mountpoint": "/boot/efi",
+          "mountpoints": ["/boot/efi"]
+        },
+        {
+          "name": "nvme0n1p2",
+          "path": "/dev/nvme0n1p2",
+          "size": 2147483648,
+          "fstype": "ext4",
+          "mountpoint": "/boot",
+          "mountpoints": ["/boot"]
+        },
+        {
+          "name": "nvme0n1p3",
+          "path": "/dev/nvme0n1p3",
+          "size": 996983660544,
+          "fstype": "crypto_LUKS",
+          "children": [
+            {
+              "name": "luks-system",
+              "path": "/dev/mapper/luks-system",
+              "size": 996966883328,
+              "fstype": "LVM2_member",
+              "children": [
+                {
+                  "name": "vg_sys-root",
+                  "path": "/dev/mapper/vg_sys-root",
+                  "size": 107374182400,
+                  "fstype": "ext4",
+                  "mountpoint": "/",
+                  "mountpoints": ["/"]
+                },
+                {
+                  "name": "vg_sys-home",
+                  "path": "/dev/mapper/vg_sys-home",
+                  "size": 536870912000,
+                  "fstype": "ext4",
+                  "mountpoint": "/home",
+                  "mountpoints": ["/home"]
+                },
+                {
+                  "name": "vg_sys-var",
+                  "path": "/dev/mapper/vg_sys-var",
+                  "size": 53687091200,
+                  "fstype": "ext4",
+                  "mountpoint": "/var",
+                  "mountpoints": ["/var"]
+                },
+                {
+                  "name": "vg_sys-swap",
+                  "path": "/dev/mapper/vg_sys-swap",
+                  "size": 34359738368,
+                  "fstype": "swap",
+                  "mountpoint": null,
+                  "mountpoints": []
+                },
+                {
+                  "name": "vg_sys-data",
+                  "path": "/dev/mapper/vg_sys-data",
+                  "size": 264674955776,
+                  "fstype": "btrfs",
+                  "mountpoint": "/mnt/storage",
+                  "mountpoints": ["/mnt/storage"]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "sdb",
+      "path": "/dev/sdb",
+      "type": "disk",
+      "size": 64000000000,
+      "model": "Ultra USB 3.0",
+      "vendor": "SanDisk",
+      "serial": "4C530001230415123456",
+      "tran": "usb",
+      "children": [
+        {
+          "name": "sdb1",
+          "path": "/dev/sdb1",
+          "size": 63998951424,
+          "fstype": "exfat",
+          "mountpoint": "/run/media/user/FORENSIC_USB",
+          "mountpoints": ["/run/media/user/FORENSIC_USB"]
+        }
+      ]
+    }
+  ]
+}
