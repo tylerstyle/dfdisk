@@ -11,7 +11,7 @@
 
 rustPlatform.buildRustPackage rec {
   pname = "dfdisk";
-  version = "0.1.1";
+  version = "0.1.2";
 
   src = lib.fileset.toSource {
     root = ./.;
@@ -19,6 +19,7 @@ rustPlatform.buildRustPackage rec {
       ./Cargo.toml
       ./Cargo.lock
       ./src
+      ./tests
       ./README.md
       ./LICENSE
     ];
@@ -31,6 +32,7 @@ rustPlatform.buildRustPackage rec {
   nativeBuildInputs = [
     pkg-config
     makeWrapper
+    util-linux
   ];
 
   buildInputs = [

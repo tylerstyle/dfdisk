@@ -1,3 +1,11 @@
+dfdisk (0.1.2-1) unstable; urgency=medium
+
+  * Forensic engine hardening, async process stream draining, and UTF-8 safe text handling.
+  * Comprehensive block device size detection and nested LVM/LUKS partition safety.
+  * Upgrade dependencies (tokio 1.53, clap 4.6, regex 1.13) and add integration test suite.
+
+ -- tylerstyle <tylerstyle@users.noreply.github.com>  Thu, 03 Sep 2026 17:50:00 +0200
+
 dfdisk (0.1.1-1) unstable; urgency=medium
 
   * Upgrade dependencies across the entire stack:

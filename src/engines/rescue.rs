@@ -47,7 +47,7 @@ impl RescueAcquireEngine {
         cmd.arg(&map_path);
 
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        cmd.stderr(Stdio::null());
 
         let mut child = cmd
             .spawn()
@@ -208,9 +208,12 @@ impl RescueAcquireEngine {
             elapsed_seconds,
             average_speed_bytes_sec: avg_speed,
             bad_sectors_count: bad_sectors,
-            source_hashes: hashes.clone(),
+            // Source hashes cannot be computed over damaged media containing bad/unreadable sectors.
+            // Truthful forensic practice reports source_hashes as uncomputed (None) and destination_hashes
+            // as the integrity hashes of the resulting image file.
+            source_hashes: crate::models::info_report::HashResults::default(),
             destination_hashes: hashes,
-            verification_passed: true,
+            verification_passed: false,
             generated_files,
         };
 
@@ -227,9 +230,7 @@ impl RescueAcquireEngine {
     }
 }
 
-fn read_proc_rchar(pid: u32) -> Option<u64> {
-    let path = format!("/proc/{}/io", pid);
-    let content = fs::read_to_string(path).ok()?;
+pub(crate) fn parse_rchar(content: &str) -> Option<u64> {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("rchar:") {
             if let Ok(bytes) = rest.trim().parse::<u64>() {
@@ -238,4 +239,86 @@ fn read_proc_rchar(pid: u32) -> Option<u64> {
         }
     }
     None
+}
+
+fn read_proc_rchar(pid: u32) -> Option<u64> {
+    let path = format!("/proc/{}/io", pid);
+    let content = fs::read_to_string(path).ok()?;
+    parse_rchar(&content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_rchar() {
+        let sample_io = "rchar: 104857600\nwchar: 52428800\nsyscr: 100\nsyscw: 50\n";
+        assert_eq!(parse_rchar(sample_io), Some(104857600));
+
+        let invalid_io = "wchar: 1000\nsyscr: 20\n";
+        assert_eq!(parse_rchar(invalid_io), None);
+    }
+
+    #[test]
+    fn test_rescue_report_hash_truthfulness() {
+        let hashes = crate::models::info_report::HashResults {
+            md5: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+            sha1: None,
+            sha256: Some(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            ),
+        };
+
+        let report = ForensicInfoReport {
+            tool_name: "dfdisk (ddrescue engine)".to_string(),
+            tool_version: "0.1.1".to_string(),
+            case_metadata: CaseMetadata::default(),
+            device: BlockDevice {
+                name: "sdc".to_string(),
+                path: "/dev/sdc".to_string(),
+                devlinks: vec![],
+                size_bytes: 1000,
+                model: None,
+                vendor: None,
+                serial: None,
+                wwn: None,
+                revision: None,
+                bus_type: "USB".to_string(),
+                is_rotational: Some(true),
+                is_removable: true,
+                is_read_only: false,
+                logical_sector_size: 512,
+                physical_sector_size: 512,
+                partition_table_type: None,
+                partitions: vec![],
+                mountpoints: vec![],
+                safety: crate::models::device::DeviceSafety::Safe,
+                smart: None,
+            },
+            config: AcquisitionConfig::default(),
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+            elapsed_seconds: 10,
+            average_speed_bytes_sec: 100.0,
+            bad_sectors_count: 5,
+            source_hashes: crate::models::info_report::HashResults::default(),
+            destination_hashes: hashes,
+            verification_passed: false,
+            generated_files: vec!["test.raw".to_string()],
+        };
+
+        // Source hashes must be empty (cannot be computed over damaged media)
+        assert!(report.source_hashes.md5.is_none());
+        assert!(report.source_hashes.sha1.is_none());
+        assert!(report.source_hashes.sha256.is_none());
+
+        // Destination hashes are present
+        assert!(report.destination_hashes.md5.is_some());
+        assert!(!report.verification_passed);
+
+        // Rendered text must state warning / verification incomplete
+        let text = report.render_text();
+        assert!(text.contains("WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE"));
+    }
 }

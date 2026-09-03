@@ -136,7 +136,8 @@ fn sanitize_serial(serial: &str) -> String {
     if s.is_empty() || s.eq_ignore_ascii_case("unknown") || s.eq_ignore_ascii_case("no_serial") {
         "NOSERIAL".to_string()
     } else {
-        s.chars()
+        let cleaned = s
+            .chars()
             .map(|c| {
                 if c.is_alphanumeric() || c == '-' || c == '_' {
                     c
@@ -146,7 +147,13 @@ fn sanitize_serial(serial: &str) -> String {
             })
             .collect::<String>()
             .trim_matches('_')
-            .to_uppercase()
+            .to_uppercase();
+
+        if cleaned.is_empty() {
+            "NOSERIAL".to_string()
+        } else {
+            cleaned
+        }
     }
 }
 
@@ -174,5 +181,96 @@ mod tests {
             meta.generate_filename("S4GFNX0T501075", "info"),
             "vg12345_26_ea01_cf01_S4GFNX0T501075.info"
         );
+    }
+
+    #[test]
+    fn test_sanitize_serial_fallbacks() {
+        assert_eq!(sanitize_serial(""), "NOSERIAL");
+        assert_eq!(sanitize_serial("   "), "NOSERIAL");
+        assert_eq!(sanitize_serial("###"), "NOSERIAL");
+        assert_eq!(sanitize_serial("___"), "NOSERIAL");
+        assert_eq!(sanitize_serial("!@#$%^&*()"), "NOSERIAL");
+        assert_eq!(sanitize_serial("unknown"), "NOSERIAL");
+        assert_eq!(sanitize_serial("UNKNOWN"), "NOSERIAL");
+        assert_eq!(sanitize_serial("no_serial"), "NOSERIAL");
+        assert_eq!(sanitize_serial("NO_SERIAL"), "NOSERIAL");
+        assert_eq!(sanitize_serial("S4GFNX0T501075"), "S4GFNX0T501075");
+        assert_eq!(sanitize_serial("wd-wcc 4m/123"), "WD-WCC_4M_123");
+    }
+
+    #[test]
+    fn test_case_metadata_defaults() {
+        let meta = CaseMetadata::default();
+        assert_eq!(meta.effective_case(), "CASE001");
+        assert_eq!(meta.effective_ea(), "01");
+        assert_eq!(meta.effective_evidence(), "cf01");
+        assert_eq!(meta.formatted_ea(), "ea01");
+        assert_eq!(meta.formatted_evidence(), "cf01");
+        assert_eq!(
+            meta.generate_base_filename("###"),
+            "case001_ea01_cf01_NOSERIAL"
+        );
+    }
+
+    #[test]
+    fn test_case_naming_and_serial_adversarial_stress() {
+        let edge_serials = [
+            "",
+            "   ",
+            "unknown",
+            "UNKNOWN",
+            "no_serial",
+            "NO_SERIAL",
+            "!!!",
+            "---",
+            "___",
+            "/dev/sda",
+            "🚀🔒🛡️",
+            "SN#123-456_789.abc",
+            "München_Festplatte_01",
+            "硬盘_9999",
+            "   ___---___   ",
+        ];
+
+        for serial in edge_serials {
+            let meta = CaseMetadata {
+                case_number: "2026/CRIME/01".to_string(),
+                location_ea: "EA-1".to_string(),
+                evidence_number: "EVD#99".to_string(),
+                authority: "BKA".to_string(),
+                examiner: "Müller".to_string(),
+                description: "Forensic image".to_string(),
+                notes: "".to_string(),
+            };
+
+            let base = meta.generate_base_filename(serial);
+            assert!(!base.is_empty(), "Base filename must never be empty");
+            assert!(!base.contains(' '), "Base filename must not contain spaces");
+            assert!(
+                !base.contains('/'),
+                "Base filename must not contain slashes"
+            );
+
+            let full = meta.generate_filename(serial, "e01");
+            assert!(
+                full.ends_with(".e01"),
+                "Full filename must have correct extension"
+            );
+        }
+
+        // Adversarial case metadata fields (all pure punctuation or whitespace)
+        let meta_adversarial = CaseMetadata {
+            case_number: "///...---___".to_string(),
+            location_ea: "???!!!".to_string(),
+            evidence_number: "   ".to_string(),
+            authority: "".to_string(),
+            examiner: "".to_string(),
+            description: "".to_string(),
+            notes: "".to_string(),
+        };
+        let base_adv = meta_adversarial.generate_base_filename("___");
+        assert_eq!(base_adv, "unknown_eaunknown_cf01_NOSERIAL");
+        let full_adv = meta_adversarial.generate_filename("___", ".raw");
+        assert_eq!(full_adv, "unknown_eaunknown_cf01_NOSERIAL.raw");
     }
 }

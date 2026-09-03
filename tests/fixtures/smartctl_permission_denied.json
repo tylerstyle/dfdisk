@@ -1,0 +1,13 @@
+{
+  "json_format_version": [1, 0],
+  "smartctl": {
+    "version": [7, 4],
+    "exit_status": 2,
+    "messages": [
+      {
+        "severity": "error",
+        "string": "/dev/nvme0n1: Permission denied"
+      }
+    ]
+  }
+}

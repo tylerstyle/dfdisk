@@ -1,0 +1,59 @@
+{
+  "json_format_version": [1, 0],
+  "smartctl": {
+    "version": [7, 4],
+    "exit_status": 8
+  },
+  "device": {
+    "name": "/dev/sda",
+    "info_name": "/dev/sda",
+    "type": "ata",
+    "protocol": "ATA"
+  },
+  "smart_status": {
+    "passed": false
+  },
+  "power_on_time": {
+    "hours": 45210
+  },
+  "temperature": {
+    "current": 54
+  },
+  "ata_smart_attributes": {
+    "table": [
+      {
+        "id": 5,
+        "name": "Reallocated_Sector_Ct",
+        "value": 12,
+        "worst": 12,
+        "thresh": 36,
+        "raw": {
+          "value": 1584,
+          "string": "1584"
+        }
+      },
+      {
+        "id": 197,
+        "name": "Current_Pending_Sector",
+        "value": 25,
+        "worst": 25,
+        "thresh": 0,
+        "raw": {
+          "value": 320,
+          "string": "320"
+        }
+      },
+      {
+        "id": 198,
+        "name": "Offline_Uncorrectable",
+        "value": 30,
+        "worst": 30,
+        "thresh": 0,
+        "raw": {
+          "value": 112,
+          "string": "112"
+        }
+      }
+    ]
+  }
+}
