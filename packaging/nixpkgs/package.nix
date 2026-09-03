@@ -13,7 +13,7 @@
 
 rustPlatform.buildRustPackage rec {
   pname = "dfdisk";
-  version = "0.1.1";
+  version = "0.1.2";
 
   __structuredAttrs = true;
 
@@ -21,10 +21,10 @@ rustPlatform.buildRustPackage rec {
     owner = "tylerstyle";
     repo = "dfdisk";
     rev = "v${version}";
-    hash = "sha256-7OwxjFEJBddi0cc0zyp+Ad8SSEQNNvO16zIJDojcfDI=";
+    hash = "sha256-dvcRwTGB0UsHlv7pUc3GXeYoUXrE49HtRUWs4tJyKX0=";
   };
 
-  cargoHash = "sha256-1Lx3bNTES1WkdqPjDPFLXO3AKEDfirkqJDxCY0OB30E=";
+  cargoHash = "sha256-sfJxgqm9MHZOC/xpE/8GcMBGKKFQRiWgYWZkN466OyI=";
 
   nativeBuildInputs = [
     pkg-config
