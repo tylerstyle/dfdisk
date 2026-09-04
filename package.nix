@@ -9,7 +9,7 @@
 , systemd
 }:
 
-rustPlatform.buildRustPackage rec {
+rustPlatform.buildRustPackage (finalAttrs: {
   pname = "dfdisk";
   version = "0.1.2";
 
@@ -22,6 +22,8 @@ rustPlatform.buildRustPackage rec {
       ./tests
       ./README.md
       ./LICENSE
+      ./LICENSE-MIT
+      ./LICENSE-APACHE
     ];
   };
 
@@ -54,12 +56,12 @@ rustPlatform.buildRustPackage rec {
       ]}
   '';
 
-  meta = with lib; {
+  meta = {
     description = "Modern forensic disk imaging, damaged media rescue and conversion CLI/TUI tool";
     homepage = "https://github.com/tylerstyle/dfdisk";
-    license = licenses.gpl3Plus;
+    license = with lib.licenses; [ mit asl20 ];
     maintainers = [ ];
     mainProgram = "dfdisk";
-    platforms = platforms.linux;
+    platforms = lib.platforms.linux;
   };
-}
+})

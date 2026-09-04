@@ -4,7 +4,7 @@ version = "0.1.2"
 edition = "2021"
 authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
 description = "Modern forensic disk imaging, damaged media rescue and conversion CLI/TUI tool"
-license = "GPL-3.0-or-later"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/tylerstyle/dfdisk"
 homepage = "https://github.com/tylerstyle/dfdisk"
 readme = "README.md"
@@ -15,7 +15,7 @@ categories = ["command-line-utilities"]
 name = "dfdisk"
 maintainer = "tylerstyle <tylerstyle@users.noreply.github.com>"
 copyright = "2026, tylerstyle"
-license-file = ["LICENSE", "4"]
+license-file = ["LICENSE-MIT", "4"]
 extended-description = """\
 dfdisk is a high-performance terminal utility designed for DFIR examiners,\
  law enforcement investigators, and forensic technicians. It combines\
@@ -28,7 +28,8 @@ priority = "optional"
 assets = [
     ["target/release/dfdisk", "usr/bin/dfdisk", "755"],
     ["README.md", "usr/share/doc/dfdisk/README.md", "644"],
-    ["LICENSE", "usr/share/doc/dfdisk/copyright", "644"],
+    ["LICENSE-MIT", "usr/share/doc/dfdisk/LICENSE-MIT", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/dfdisk/LICENSE-APACHE", "644"],
 ]
 
 [dependencies]
