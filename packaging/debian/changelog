@@ -1,3 +1,11 @@
+dfdisk (0.1.3-1) unstable; urgency=medium
+
+  * Relicense dfdisk to dual MIT OR Apache-2.0 across all codebase and documentation.
+  * Modernize Nix derivations and packaging definitions with finalAttrs and explicit tags.
+  * Initialize Nix User Repository (NUR) package distribution.
+
+ -- tylerstyle <tylerstyle@users.noreply.github.com>  Fri, 04 Sep 2026 09:00:00 +0200
+
 dfdisk (0.1.2-1) unstable; urgency=medium
 
   * Forensic engine hardening, async process stream draining, and UTF-8 safe text handling.

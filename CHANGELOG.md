@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-09-04
+
+### Changed
+- **Permissive Dual-Licensing (`MIT OR Apache-2.0`)**: Relicensed `dfdisk` from GPL-3.0-or-later to dual `MIT OR Apache-2.0` (standard Rust open-source licensing) to maximize adoption across incident response, DFIR laboratories, enterprise, and community ecosystems.
+- **Nixpkgs & NUR Integration**:
+  - Modernized Nix derivations to use the `(finalAttrs: { ... })` fixpoint pattern.
+  - Replaced commit revision references with explicit release `tag` pinning in `fetchFromGitHub`.
+  - Qualified `lib.maintainers` and `lib.platforms` attribute scopes and updated `meta.license` to dual `[ mit asl20 ]`.
+  - Added official support for the Nix User Repository (NUR) under `nur.repos.tylerstyle.dfdisk`.
+- **Packaging Metadata**: Synchronized dual-licensing definitions across Arch Linux (`PKGBUILD`), Debian (`copyright`, `changelog`), and Nix Flakes.
+
+---
+
 ## [0.1.2] - 2026-09-03
 
 ### Added
