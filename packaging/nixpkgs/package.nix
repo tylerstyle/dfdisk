@@ -11,7 +11,7 @@
   systemd,
 }:
 
-rustPlatform.buildRustPackage rec {
+rustPlatform.buildRustPackage (finalAttrs: {
   pname = "dfdisk";
   version = "0.1.2";
 
@@ -20,7 +20,7 @@ rustPlatform.buildRustPackage rec {
   src = fetchFromGitHub {
     owner = "tylerstyle";
     repo = "dfdisk";
-    rev = "v${version}";
+    tag = "v${finalAttrs.version}";
     hash = "sha256-dvcRwTGB0UsHlv7pUc3GXeYoUXrE49HtRUWs4tJyKX0=";
   };
 
@@ -52,13 +52,13 @@ rustPlatform.buildRustPackage rec {
       }
   '';
 
-  meta = with lib; {
+  meta = {
     description = "Modern forensic disk imaging, damaged media rescue and conversion CLI/TUI tool";
     homepage = "https://github.com/tylerstyle/dfdisk";
-    changelog = "https://github.com/tylerstyle/dfdisk/releases/tag/v${version}";
-    license = licenses.gpl3Plus;
-    maintainers = with maintainers; [ tylerstyle ];
+    changelog = "https://github.com/tylerstyle/dfdisk/releases/tag/${finalAttrs.src.tag}";
+    license = with lib.licenses; [ mit asl20 ];
+    maintainers = with lib.maintainers; [ ] ++ lib.optionals (lib.maintainers ? tylerstyle) [ lib.maintainers.tylerstyle ];
     mainProgram = "dfdisk";
-    platforms = platforms.linux;
+    platforms = lib.platforms.linux;
   };
-}
+})

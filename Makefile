@@ -33,6 +33,8 @@ install: release
 	install -d $(DESTDIR)$(DOCDIR)
 	install -m 644 README.md $(DESTDIR)$(DOCDIR)/README.md
 	install -m 644 LICENSE $(DESTDIR)$(DOCDIR)/LICENSE
+	install -m 644 LICENSE-MIT $(DESTDIR)$(DOCDIR)/LICENSE-MIT
+	install -m 644 LICENSE-APACHE $(DESTDIR)$(DOCDIR)/LICENSE-APACHE
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/dfdisk

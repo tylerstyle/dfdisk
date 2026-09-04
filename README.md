@@ -234,4 +234,10 @@ Verification Result : VERIFIED - ALL HASHES MATCH (Acquisition Integrity Confirm
 ---
 
 ## ⚖️ License
-GPLv3 or MIT (DFIR Open Source).
+
+`dfdisk` is dual-licensed under either:
+
+- **MIT License** ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+- **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+
+at your option.
