@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-09-04
+
+### Added
+- **Interactive Destination Directory in Converter**: Made the Destination Dir field fully selectable and editable in the Forensic Image Format Converter screen, supporting arrow/Tab navigation, text editing, and cursor rendering.
+- **Tab Path Autocompletion**: Integrated an intelligent filesystem path completion engine for path fields (`Target Dir` in Case Setup, `Source Image Path` and `Destination Dir` in Converter):
+  - Expands tilde (`~` and `~/`) to user home directory.
+  - Contextual directory-only filtering for target directories and dual file/directory matching for source images.
+  - Common prefix expansion and cyclic candidate navigation on repeated <kbd>Tab</kbd> presses.
+  - Case-insensitive matching fallback and hidden file protection.
+- **Converter Guidance & Shortcuts**: Added an in-dashboard instruction panel explaining RAW/E01 conversion modes and navigation shortcuts, plus auto-detection of conversion modes based on source file extensions (`.raw`, `.dd`, `.img`, `.E01`).
+
+---
+
 ## [0.1.3] - 2026-09-04
 
 ### Changed

@@ -837,54 +837,164 @@ fn render_report_summary(frame: &mut Frame, app: &App, area: Rect) {
 fn render_converter(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(4)])
+        .constraints([Constraint::Length(12), Constraint::Min(6)])
         .split(area);
 
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "Source Image Path  : [ ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                &app.conv_source_path,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" ]", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Conversion Mode    : ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                if app.conv_to_e01 {
-                    "[ RAW -> E01 (Expert Witness) ]"
-                } else {
-                    "[ E01 -> RAW (Raw Disk Image) ]"
-                },
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  (Press Tab to switch)", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Destination Dir    : [ ",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(&app.conv_target_dir, Style::default().fg(Color::White)),
-            Span::styled(" ]", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&app.conv_status_msg, Style::default().fg(Color::Yellow)),
-        ]),
+    let mut lines = Vec::new();
+
+    // Source Image Path (active_field == 0)
+    let is_src_active = app.conv_active_field == 0;
+    let mut src_spans = vec![
+        Span::styled(
+            if is_src_active { "▶ " } else { "  " },
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            "Source Image Path  : [ ",
+            Style::default().fg(if is_src_active {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        ),
     ];
+    if is_src_active {
+        let (before, after) = safe_split_at(&app.conv_source_path, app.conv_cursor_pos);
+        src_spans.push(Span::styled(
+            before,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+        src_spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
+        src_spans.push(Span::styled(
+            after,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if app.conv_source_path.is_empty() {
+        src_spans.push(Span::styled(
+            "/path/to/evidence.raw or .E01",
+            Style::default().fg(Color::Rgb(70, 75, 85)),
+        ));
+    } else {
+        src_spans.push(Span::styled(
+            &app.conv_source_path,
+            Style::default().fg(Color::White),
+        ));
+    }
+    src_spans.push(Span::styled(" ]", Style::default().fg(Color::DarkGray)));
+    lines.push(Line::from(src_spans));
+
+    // Conversion Mode (active_field == 1)
+    let is_mode_active = app.conv_active_field == 1;
+    lines.push(Line::from(vec![
+        Span::styled(
+            if is_mode_active { "▶ " } else { "  " },
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            "Conversion Mode    : ",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            if app.conv_to_e01 {
+                "[ RAW -> E01 (Expert Witness) ]"
+            } else {
+                "[ E01 -> RAW (Raw Disk Image) ]"
+            },
+            if is_mode_active {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Yellow)
+            },
+        ),
+        Span::styled(
+            "  (Space/Arrows to toggle)",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+
+    // Destination Dir (active_field == 2)
+    let is_dst_active = app.conv_active_field == 2;
+    let mut dst_spans = vec![
+        Span::styled(
+            if is_dst_active { "▶ " } else { "  " },
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            "Destination Dir    : [ ",
+            Style::default().fg(if is_dst_active {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        ),
+    ];
+    if is_dst_active {
+        let (before, after) = safe_split_at(&app.conv_target_dir, app.conv_cursor_pos);
+        dst_spans.push(Span::styled(
+            before,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+        dst_spans.push(Span::styled("█", Style::default().fg(Color::Cyan)));
+        dst_spans.push(Span::styled(
+            after,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if app.conv_target_dir.is_empty() {
+        dst_spans.push(Span::styled(
+            "/path/to/destination/dir",
+            Style::default().fg(Color::Rgb(70, 75, 85)),
+        ));
+    } else {
+        dst_spans.push(Span::styled(
+            &app.conv_target_dir,
+            Style::default().fg(Color::White),
+        ));
+    }
+    dst_spans.push(Span::styled(" ]", Style::default().fg(Color::DarkGray)));
+    lines.push(Line::from(dst_spans));
+
+    // Spacer
+    lines.push(Line::from(""));
+
+    // Start Button (active_field == 3)
+    let is_btn_active = app.conv_active_field == 3;
+    lines.push(Line::from(vec![
+        Span::styled(
+            if is_btn_active { "▶ " } else { "  " },
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            "  [ START CONVERSION (F5 / Enter) ]  ",
+            if is_btn_active {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White).bg(Color::DarkGray)
+            },
+        ),
+    ]));
+
+    // Spacer
+    lines.push(Line::from(""));
+
+    // Status message
+    lines.push(Line::from(vec![
+        Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(&app.conv_status_msg, Style::default().fg(Color::Yellow)),
+    ]));
 
     let para = Paragraph::new(lines).block(
         Block::default()
@@ -894,6 +1004,63 @@ fn render_converter(frame: &mut Frame, app: &App, area: Rect) {
             .title(" Forensic Image Format Converter (RAW <-> E01) "),
     );
     frame.render_widget(para, chunks[0]);
+
+    // Converter Instructions in chunk[1]
+    let help_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "• RAW -> E01: ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Encapsulates raw image (.raw, .dd, .img) into Expert Witness Format with SHA-256 integrity hash.",
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "• E01 -> RAW: ",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Extracts and decompresses E01 evidence container to raw byte stream.",
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "• TAB Autocomplete: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Press Tab on Path fields to autocomplete paths. Repeated Tab cycles candidates.",
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "• Field Navigation: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Use ↑ / ↓ arrow keys or Enter to switch fields. Press F5 to start conversion.",
+                Style::default().fg(Color::White),
+            ),
+        ]),
+    ];
+    let help_para = Paragraph::new(help_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" Converter Help & Instructions "),
+    );
+    frame.render_widget(help_para, chunks[1]);
 }
 
 fn render_unmount_modal(frame: &mut Frame, app: &App, area: Rect) {
@@ -1007,10 +1174,21 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 " [Enter/A] Setup  [U] Unmount  [R] Refresh  [C] Converter  [Q] Quit ",
                 Style::default().fg(Color::Gray),
             ),
-            Screen::CaseSetup => Span::styled(
-                " [Tab] Next Field  [Ctrl+U] Clear  [F5/Enter] Start Acquisition  [Esc] Back ",
-                Style::default().fg(Color::Gray),
-            ),
+            Screen::CaseSetup => {
+                let fields = crate::tui::app::FormField::all();
+                let cur = &fields[app.active_field % fields.len()];
+                if *cur == crate::tui::app::FormField::TargetDir {
+                    Span::styled(
+                        " [Tab] Autocomplete  [↓/Enter] Next Field  [Ctrl+U] Clear  [F5] Start  [Esc] Back ",
+                        Style::default().fg(Color::Gray),
+                    )
+                } else {
+                    Span::styled(
+                        " [Tab/↓] Next Field  [Ctrl+U] Clear  [F5/Enter] Start Acquisition  [Esc] Back ",
+                        Style::default().fg(Color::Gray),
+                    )
+                }
+            }
             Screen::AcquisitionRunning => Span::styled(
                 " [Ctrl+C / Esc] Abort Acquisition ",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -1019,10 +1197,20 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 " [Enter / Esc] Return to Explorer ",
                 Style::default().fg(Color::Green),
             ),
-            Screen::Converter => Span::styled(
-                " [Tab] Toggle Mode  [Enter] Start Convert  [Esc] Back ",
-                Style::default().fg(Color::Gray),
-            ),
+            Screen::Converter => match app.conv_active_field {
+                0 | 2 => Span::styled(
+                    " [Tab] Autocomplete  [↓/Enter] Next Field  [Ctrl+U] Clear  [F5] Start  [Esc] Back ",
+                    Style::default().fg(Color::Gray),
+                ),
+                1 => Span::styled(
+                    " [Space/Arrows] Toggle Mode  [Tab/↓/Enter] Next Field  [F5] Start  [Esc] Back ",
+                    Style::default().fg(Color::Gray),
+                ),
+                _ => Span::styled(
+                    " [Enter/Space/F5] Start Conversion  [Tab/↓] Next Field  [Esc] Back ",
+                    Style::default().fg(Color::Gray),
+                ),
+            },
             _ => Span::styled("", Style::default()),
         },
     };

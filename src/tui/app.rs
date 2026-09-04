@@ -67,6 +67,25 @@ impl FormField {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConverterField {
+    SourcePath,
+    Mode,
+    TargetDir,
+    StartButton,
+}
+
+impl ConverterField {
+    pub fn all() -> &'static [ConverterField] {
+        &[
+            ConverterField::SourcePath,
+            ConverterField::Mode,
+            ConverterField::TargetDir,
+            ConverterField::StartButton,
+        ]
+    }
+}
+
 pub struct App {
     pub current_screen: Screen,
     pub devices: Vec<BlockDevice>,
@@ -88,11 +107,16 @@ pub struct App {
     pub abort_flag: Arc<AtomicBool>,
 
     // Converter Screen State
+    pub conv_active_field: usize,
     pub conv_source_path: String,
     pub conv_cursor_pos: usize,
     pub conv_target_dir: String,
     pub conv_to_e01: bool,
     pub conv_status_msg: String,
+    pub conv_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+
+    // Autocomplete State
+    pub autocomplete_state: Option<crate::tui::autocomplete::PathAutocompleteState>,
 
     pub should_quit: bool,
 }
@@ -121,11 +145,14 @@ impl App {
             progress_rx: None,
             report_rx: None,
             abort_flag: Arc::new(AtomicBool::new(false)),
+            conv_active_field: 0,
             conv_source_path: "".to_string(),
             conv_cursor_pos: 0,
             conv_target_dir: target_dir.to_string_lossy().to_string(),
             conv_to_e01: true,
             conv_status_msg: "Ready to convert images.".to_string(),
+            conv_rx: None,
+            autocomplete_state: None,
             should_quit: false,
         }
     }
@@ -196,6 +223,9 @@ impl App {
             }
             KeyCode::Char('c') | KeyCode::F(7) => {
                 self.current_screen = Screen::Converter;
+                self.conv_active_field = 0;
+                self.conv_cursor_pos = self.conv_source_path.len();
+                self.autocomplete_state = None;
             }
             KeyCode::Enter | KeyCode::Char('a') | KeyCode::F(5) => {
                 if let Some(dev) = self.selected_device() {
@@ -228,6 +258,19 @@ impl App {
             _ => 0,
         };
         self.cursor_pos = len;
+        self.autocomplete_state = None;
+    }
+
+    fn reset_converter_cursor(&mut self) {
+        let fields = ConverterField::all();
+        let cur_field = fields[self.conv_active_field % fields.len()];
+        let len = match cur_field {
+            ConverterField::SourcePath => self.conv_source_path.len(),
+            ConverterField::TargetDir => self.conv_target_dir.len(),
+            _ => 0,
+        };
+        self.conv_cursor_pos = len;
+        self.autocomplete_state = None;
     }
 
     fn handle_key_unmount_prompt(&mut self, key: KeyEvent) {
@@ -273,11 +316,23 @@ impl App {
         let fields = FormField::all();
         let cur_field = &fields[self.active_field % fields.len()];
 
+        if key.code != KeyCode::Tab {
+            self.autocomplete_state = None;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.current_screen = Screen::DeviceExplorer;
             }
-            KeyCode::Tab | KeyCode::Down => {
+            KeyCode::Tab => {
+                if *cur_field == FormField::TargetDir {
+                    self.autocomplete_case_target_dir();
+                } else {
+                    self.active_field = (self.active_field + 1) % fields.len();
+                    self.reset_cursor_to_current_field();
+                }
+            }
+            KeyCode::Down => {
                 self.active_field = (self.active_field + 1) % fields.len();
                 self.reset_cursor_to_current_field();
             }
@@ -417,7 +472,7 @@ impl App {
             None => return,
         };
 
-        self.config.output_dir = PathBuf::from(&self.target_dir_str);
+        self.config.output_dir = crate::tui::autocomplete::expand_tilde(std::path::Path::new(self.target_dir_str.trim()));
         if let Err(e) = std::fs::create_dir_all(&self.config.output_dir) {
             self.notification_msg = Some((format!("Cannot create target dir: {}", e), true));
             return;
@@ -487,47 +542,304 @@ impl App {
     }
 
     fn handle_key_converter(&mut self, key: KeyEvent) {
+        let fields = ConverterField::all();
+        let cur_field = fields[self.conv_active_field % fields.len()];
+
+        if key.code != KeyCode::Tab {
+            self.autocomplete_state = None;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.current_screen = Screen::DeviceExplorer;
             }
+            KeyCode::F(5) => {
+                self.start_conversion();
+            }
+            KeyCode::Down => {
+                self.conv_active_field = (self.conv_active_field + 1) % fields.len();
+                self.reset_converter_cursor();
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                if self.conv_active_field == 0 {
+                    self.conv_active_field = fields.len() - 1;
+                } else {
+                    self.conv_active_field -= 1;
+                }
+                self.reset_converter_cursor();
+            }
             KeyCode::Tab => {
-                self.conv_to_e01 = !self.conv_to_e01;
+                match cur_field {
+                    ConverterField::SourcePath => {
+                        self.autocomplete_conv_source();
+                    }
+                    ConverterField::TargetDir => {
+                        self.autocomplete_conv_target();
+                    }
+                    ConverterField::Mode => {
+                        self.conv_active_field = (self.conv_active_field + 1) % fields.len();
+                        self.reset_converter_cursor();
+                    }
+                    ConverterField::StartButton => {
+                        self.conv_active_field = (self.conv_active_field + 1) % fields.len();
+                        self.reset_converter_cursor();
+                    }
+                }
             }
             KeyCode::Enter => {
-                let src = PathBuf::from(&self.conv_source_path);
-                let out = PathBuf::from(&self.conv_target_dir);
-                let to_e01 = self.conv_to_e01;
-
-                if !src.exists() {
-                    self.conv_status_msg = format!("File not found: {}", src.display());
-                    return;
-                }
-
-                self.conv_status_msg = "Converting in background...".to_string();
-                let abort = Arc::new(AtomicBool::new(false));
-
-                tokio::spawn(async move {
-                    if to_e01 {
-                        let _ = FormatConverter::raw_to_e01(
-                            &src,
-                            &out,
-                            None,
-                            CompressionLevel::Fast,
-                            SplitSize::TwoGb,
-                            None,
-                            Some(abort),
-                        )
-                        .await;
-                    } else {
-                        let _ = FormatConverter::e01_to_raw(&src, &out, None, Some(abort)).await;
+                match cur_field {
+                    ConverterField::StartButton => {
+                        self.start_conversion();
                     }
-                });
+                    ConverterField::Mode => {
+                        self.conv_to_e01 = !self.conv_to_e01;
+                    }
+                    _ => {
+                        self.conv_active_field = (self.conv_active_field + 1) % fields.len();
+                        self.reset_converter_cursor();
+                    }
+                }
             }
             _ => {
-                edit_text(&mut self.conv_source_path, &mut self.conv_cursor_pos, key);
+                match cur_field {
+                    ConverterField::SourcePath => {
+                        edit_text(&mut self.conv_source_path, &mut self.conv_cursor_pos, key);
+                        self.auto_detect_converter_mode();
+                    }
+                    ConverterField::Mode => {
+                        if key.code == KeyCode::Left
+                            || key.code == KeyCode::Right
+                            || key.code == KeyCode::Char(' ')
+                        {
+                            self.conv_to_e01 = !self.conv_to_e01;
+                        }
+                    }
+                    ConverterField::TargetDir => {
+                        edit_text(&mut self.conv_target_dir, &mut self.conv_cursor_pos, key);
+                    }
+                    ConverterField::StartButton => {
+                        if key.code == KeyCode::Char(' ') {
+                            self.start_conversion();
+                        }
+                    }
+                }
             }
         }
+    }
+
+    pub fn auto_detect_converter_mode(&mut self) {
+        let lower = self.conv_source_path.trim().to_lowercase();
+        if lower.ends_with(".e01") {
+            self.conv_to_e01 = false;
+        } else if lower.ends_with(".raw")
+            || lower.ends_with(".dd")
+            || lower.ends_with(".img")
+            || lower.ends_with(".bin")
+        {
+            self.conv_to_e01 = true;
+        }
+    }
+
+    pub fn autocomplete_conv_source(&mut self) {
+        use crate::tui::autocomplete::{complete_path, AutocompleteOutcome};
+        if let Some(outcome) = complete_path(
+            &self.conv_source_path,
+            self.conv_cursor_pos,
+            false,
+            &mut self.autocomplete_state,
+        ) {
+            match outcome {
+                AutocompleteOutcome::SingleMatch { completed, suffix } => {
+                    self.conv_source_path = format!("{}{}", completed, suffix);
+                    self.conv_cursor_pos = completed.len();
+                    self.conv_status_msg = format!("Completed: {}", completed);
+                }
+                AutocompleteOutcome::PrefixExtended {
+                    common_prefix,
+                    suffix,
+                    total,
+                } => {
+                    self.conv_source_path = format!("{}{}", common_prefix, suffix);
+                    self.conv_cursor_pos = common_prefix.len();
+                    self.conv_status_msg =
+                        format!("[{} matches] {} (Tab to cycle)", total, common_prefix);
+                }
+                AutocompleteOutcome::Cycled {
+                    candidate,
+                    suffix,
+                    index,
+                    total,
+                } => {
+                    self.conv_source_path = format!("{}{}", candidate, suffix);
+                    self.conv_cursor_pos = candidate.len();
+                    self.conv_status_msg =
+                        format!("[{}/{}] {} (Tab for next)", index, total, candidate);
+                }
+                AutocompleteOutcome::NoMatches => {
+                    self.conv_status_msg =
+                        "No matching files or directories found.".to_string();
+                }
+            }
+            self.auto_detect_converter_mode();
+        }
+    }
+
+    pub fn autocomplete_conv_target(&mut self) {
+        use crate::tui::autocomplete::{complete_path, AutocompleteOutcome};
+        if let Some(outcome) = complete_path(
+            &self.conv_target_dir,
+            self.conv_cursor_pos,
+            true,
+            &mut self.autocomplete_state,
+        ) {
+            match outcome {
+                AutocompleteOutcome::SingleMatch { completed, suffix } => {
+                    self.conv_target_dir = format!("{}{}", completed, suffix);
+                    self.conv_cursor_pos = completed.len();
+                    self.conv_status_msg = format!("Completed: {}", completed);
+                }
+                AutocompleteOutcome::PrefixExtended {
+                    common_prefix,
+                    suffix,
+                    total,
+                } => {
+                    self.conv_target_dir = format!("{}{}", common_prefix, suffix);
+                    self.conv_cursor_pos = common_prefix.len();
+                    self.conv_status_msg =
+                        format!("[{} matches] {} (Tab to cycle)", total, common_prefix);
+                }
+                AutocompleteOutcome::Cycled {
+                    candidate,
+                    suffix,
+                    index,
+                    total,
+                } => {
+                    self.conv_target_dir = format!("{}{}", candidate, suffix);
+                    self.conv_cursor_pos = candidate.len();
+                    self.conv_status_msg =
+                        format!("[{}/{}] {} (Tab for next)", index, total, candidate);
+                }
+                AutocompleteOutcome::NoMatches => {
+                    self.conv_status_msg = "No matching directories found.".to_string();
+                }
+            }
+        }
+    }
+
+    pub fn autocomplete_case_target_dir(&mut self) {
+        use crate::tui::autocomplete::{complete_path, AutocompleteOutcome};
+        if let Some(outcome) = complete_path(
+            &self.target_dir_str,
+            self.cursor_pos,
+            true,
+            &mut self.autocomplete_state,
+        ) {
+            let (msg, is_err) = match outcome {
+                AutocompleteOutcome::SingleMatch { completed, suffix } => {
+                    self.target_dir_str = format!("{}{}", completed, suffix);
+                    self.cursor_pos = completed.len();
+                    self.config.output_dir = crate::tui::autocomplete::expand_tilde(
+                        std::path::Path::new(&self.target_dir_str),
+                    );
+                    (format!("Path completed: {}", completed), false)
+                }
+                AutocompleteOutcome::PrefixExtended {
+                    common_prefix,
+                    suffix,
+                    total,
+                } => {
+                    self.target_dir_str = format!("{}{}", common_prefix, suffix);
+                    self.cursor_pos = common_prefix.len();
+                    self.config.output_dir = crate::tui::autocomplete::expand_tilde(
+                        std::path::Path::new(&self.target_dir_str),
+                    );
+                    (
+                        format!("[{} matches] {} (Tab to cycle)", total, common_prefix),
+                        false,
+                    )
+                }
+                AutocompleteOutcome::Cycled {
+                    candidate,
+                    suffix,
+                    index,
+                    total,
+                } => {
+                    self.target_dir_str = format!("{}{}", candidate, suffix);
+                    self.cursor_pos = candidate.len();
+                    self.config.output_dir = crate::tui::autocomplete::expand_tilde(
+                        std::path::Path::new(&self.target_dir_str),
+                    );
+                    (
+                        format!("[{}/{}] {} (Tab for next)", index, total, candidate),
+                        false,
+                    )
+                }
+                AutocompleteOutcome::NoMatches => {
+                    ("No matching directories found.".to_string(), true)
+                }
+            };
+            self.notification_msg = Some((msg, is_err));
+        }
+    }
+
+    pub fn start_conversion(&mut self) {
+        let src_trimmed = self.conv_source_path.trim();
+        let out_trimmed = self.conv_target_dir.trim();
+
+        if src_trimmed.is_empty() {
+            self.conv_status_msg = "Please specify a source image path.".to_string();
+            return;
+        }
+
+        let src = crate::tui::autocomplete::expand_tilde(std::path::Path::new(src_trimmed));
+        let out = crate::tui::autocomplete::expand_tilde(std::path::Path::new(out_trimmed));
+        let to_e01 = self.conv_to_e01;
+
+        if !src.exists() {
+            self.conv_status_msg = format!("File not found: {}", src.display());
+            return;
+        }
+
+        if !out.exists() {
+            if let Err(e) = std::fs::create_dir_all(&out) {
+                self.conv_status_msg = format!("Failed to create destination dir: {}", e);
+                return;
+            }
+        } else if !out.is_dir() {
+            self.conv_status_msg = format!(
+                "Destination path is a file, not a directory: {}",
+                out.display()
+            );
+            return;
+        }
+
+        if self.conv_rx.is_some() {
+            self.conv_status_msg = "A conversion is already in progress...".to_string();
+            return;
+        }
+
+        self.conv_status_msg = "Converting in background...".to_string();
+        let abort = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel(1);
+        self.conv_rx = Some(rx);
+
+        tokio::spawn(async move {
+            let res = if to_e01 {
+                FormatConverter::raw_to_e01(
+                    &src,
+                    &out,
+                    None,
+                    CompressionLevel::Fast,
+                    SplitSize::TwoGb,
+                    None,
+                    Some(abort),
+                )
+                .await
+            } else {
+                FormatConverter::e01_to_raw(&src, &out, None, Some(abort)).await
+            };
+            let _ = tx.send(res).await;
+        });
     }
 
     pub fn tick(&mut self) {
@@ -553,6 +865,21 @@ impl App {
                 }
                 self.report_rx = None;
                 self.progress_rx = None;
+            }
+        }
+
+        // Poll for conversion completion
+        if let Some(ref mut rx) = self.conv_rx {
+            if let Ok(res) = rx.try_recv() {
+                match res {
+                    Ok(path) => {
+                        self.conv_status_msg = format!("Conversion complete: {}", path.display());
+                    }
+                    Err(e) => {
+                        self.conv_status_msg = format!("Conversion failed: {}", e);
+                    }
+                }
+                self.conv_rx = None;
             }
         }
     }
@@ -868,5 +1195,119 @@ mod tests {
         edit_text(&mut s_delim, &mut cur_delim, ctrl_key(KeyCode::Char('w')));
         assert_eq!(s_delim, "");
         assert_eq!(cur_delim, 0);
+    }
+
+    #[test]
+    fn test_converter_navigation_and_editing() {
+        let mut app = App::new();
+        // Switch to Converter screen
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.current_screen, Screen::Converter);
+        assert_eq!(app.conv_active_field, 0); // SourcePath
+
+        // Type source path
+        for c in "image.raw".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.conv_source_path, "image.raw");
+        assert_eq!(app.conv_to_e01, true); // Auto-detected RAW -> E01
+
+        // Move to Conversion Mode
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.conv_active_field, 1);
+
+        // Toggle mode using Space
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.conv_to_e01, false);
+        // Toggle mode using Enter
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.conv_to_e01, true);
+
+        // Move to Destination Dir
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.conv_active_field, 2);
+
+        // Clear Destination Dir with Ctrl+U
+        app.handle_key(ctrl_key(KeyCode::Char('u')));
+        assert_eq!(app.conv_target_dir, "");
+
+        // Type a new Destination Dir
+        for c in "/cases/output_dir".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.conv_target_dir, "/cases/output_dir");
+
+        // Move to StartButton
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.conv_active_field, 3);
+
+        // Up arrow moves back to Destination Dir
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.conv_active_field, 2);
+
+        // BackTab moves back to Mode
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.conv_active_field, 1);
+
+        // BackTab moves back to SourcePath
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.conv_active_field, 0);
+    }
+
+    #[test]
+    fn test_converter_mode_auto_detection() {
+        let mut app = App::new();
+        app.conv_source_path = "/tmp/suspect.E01".to_string();
+        app.auto_detect_converter_mode();
+        assert_eq!(app.conv_to_e01, false);
+
+        app.conv_source_path = "/tmp/suspect.dd".to_string();
+        app.auto_detect_converter_mode();
+        assert_eq!(app.conv_to_e01, true);
+
+        app.conv_source_path = "/tmp/suspect.img".to_string();
+        app.auto_detect_converter_mode();
+        assert_eq!(app.conv_to_e01, true);
+    }
+
+    #[test]
+    fn test_path_autocomplete_in_app() {
+        let temp = std::env::temp_dir().join(format!("dfdisk_app_ac_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join("subdir1")).unwrap();
+        std::fs::create_dir_all(temp.join("subdir2")).unwrap();
+        std::fs::File::create(temp.join("file.raw")).unwrap();
+
+        let temp_str = temp.to_string_lossy().to_string();
+
+        let mut app = App::new();
+        app.current_screen = Screen::Converter;
+
+        // 1. Autocomplete Destination Dir (dirs only)
+        app.conv_active_field = 2; // TargetDir
+        app.conv_target_dir = format!("{}/sub", temp_str);
+        app.conv_cursor_pos = app.conv_target_dir.len();
+
+        // First Tab expands prefix to common prefix
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.conv_target_dir, format!("{}/subdir", temp_str));
+
+        // Next Tab cycles to subdir1/
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.conv_target_dir, format!("{}/subdir1/", temp_str));
+
+        // Next Tab cycles to subdir2/
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.conv_target_dir, format!("{}/subdir2/", temp_str));
+
+        // 2. Autocomplete Source Image Path (files + dirs)
+        app.conv_active_field = 0; // SourcePath
+        app.conv_source_path = format!("{}/fi", temp_str);
+        app.conv_cursor_pos = app.conv_source_path.len();
+
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.conv_source_path, format!("{}/file.raw", temp_str));
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }
