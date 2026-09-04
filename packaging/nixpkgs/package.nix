@@ -21,10 +21,10 @@ rustPlatform.buildRustPackage (finalAttrs: {
     owner = "tylerstyle";
     repo = "dfdisk";
     tag = "v${finalAttrs.version}";
-    hash = "sha256-dvcRwTGB0UsHlv7pUc3GXeYoUXrE49HtRUWs4tJyKX0=";
+    hash = "sha256-7qEadxtyjeGKigCr3oEgh75xLe0pyh9Xy2jSc7sh1B8=";
   };
 
-  cargoHash = "sha256-sfJxgqm9MHZOC/xpE/8GcMBGKKFQRiWgYWZkN466OyI=";
+  cargoHash = "sha256-g6o3ijj5cl3bClJYctxOwHSNcNOsHijBht88fDmnkSg=";
 
   nativeBuildInputs = [
     pkg-config
