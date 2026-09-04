@@ -13,10 +13,7 @@ pub struct PathAutocompleteState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutocompleteOutcome {
     /// Exactly one match was found and applied
-    SingleMatch {
-        completed: String,
-        suffix: String,
-    },
+    SingleMatch { completed: String, suffix: String },
     /// Multiple matches found; input was extended to their longest common prefix
     PrefixExtended {
         common_prefix: String,
@@ -78,13 +75,21 @@ pub fn longest_common_prefix(strings: &[String]) -> String {
 /// - If exact case matching yields no results, falls back to case-insensitive matching.
 pub fn find_path_completions(prefix: &str, dirs_only: bool) -> Vec<String> {
     let (search_dir, dir_display, file_prefix) = if prefix == "~" {
-        (expand_tilde(Path::new("~")), "~/".to_string(), "".to_string())
+        (
+            expand_tilde(Path::new("~")),
+            "~/".to_string(),
+            "".to_string(),
+        )
     } else if let Some(rest) = prefix.strip_prefix("~/") {
         let home = expand_tilde(Path::new("~"));
         if let Some(slash_idx) = rest.rfind('/') {
             let rel_dir = &rest[..=slash_idx];
             let file_pfx = &rest[slash_idx + 1..];
-            (home.join(rel_dir), format!("~/{}", rel_dir), file_pfx.to_string())
+            (
+                home.join(rel_dir),
+                format!("~/{}", rel_dir),
+                file_pfx.to_string(),
+            )
         } else {
             (home, "~/".to_string(), rest.to_string())
         }
@@ -93,7 +98,11 @@ pub fn find_path_completions(prefix: &str, dirs_only: bool) -> Vec<String> {
     } else if let Some(slash_idx) = prefix.rfind('/') {
         let dir_part = &prefix[..=slash_idx];
         let file_pfx = &prefix[slash_idx + 1..];
-        (PathBuf::from(dir_part), dir_part.to_string(), file_pfx.to_string())
+        (
+            PathBuf::from(dir_part),
+            dir_part.to_string(),
+            file_pfx.to_string(),
+        )
     } else {
         (PathBuf::from("."), "".to_string(), prefix.to_string())
     };
@@ -270,10 +279,7 @@ mod tests {
         );
         // Multibyte unicode
         assert_eq!(
-            longest_common_prefix(&[
-                "/データ/ケース1".to_string(),
-                "/データ/ケース2".to_string(),
-            ]),
+            longest_common_prefix(&["/データ/ケース1".to_string(), "/データ/ケース2".to_string(),]),
             "/データ/ケース"
         );
     }
@@ -362,7 +368,11 @@ mod tests {
         let input = format!("{}/c", temp_str);
         let outcome1 = complete_path(&input, input.len(), true, &mut state);
         match outcome1 {
-            Some(AutocompleteOutcome::PrefixExtended { common_prefix, total, .. }) => {
+            Some(AutocompleteOutcome::PrefixExtended {
+                common_prefix,
+                total,
+                ..
+            }) => {
                 assert_eq!(common_prefix, format!("{}/case_", temp_str));
                 assert_eq!(total, 2);
             }
@@ -371,9 +381,19 @@ mod tests {
         assert!(state.is_some());
 
         // Second Tab -> cycles to first match (case_alpha/)
-        let outcome2 = complete_path(&format!("{}/case_", temp_str), format!("{}/case_", temp_str).len(), true, &mut state);
+        let outcome2 = complete_path(
+            &format!("{}/case_", temp_str),
+            format!("{}/case_", temp_str).len(),
+            true,
+            &mut state,
+        );
         match outcome2 {
-            Some(AutocompleteOutcome::Cycled { candidate, index, total, .. }) => {
+            Some(AutocompleteOutcome::Cycled {
+                candidate,
+                index,
+                total,
+                ..
+            }) => {
                 assert_eq!(candidate, format!("{}/case_alpha/", temp_str));
                 assert_eq!(index, 1);
                 assert_eq!(total, 2);
@@ -382,9 +402,19 @@ mod tests {
         }
 
         // Third Tab -> cycles to second match (case_beta/)
-        let outcome3 = complete_path(&format!("{}/case_alpha/", temp_str), format!("{}/case_alpha/", temp_str).len(), true, &mut state);
+        let outcome3 = complete_path(
+            &format!("{}/case_alpha/", temp_str),
+            format!("{}/case_alpha/", temp_str).len(),
+            true,
+            &mut state,
+        );
         match outcome3 {
-            Some(AutocompleteOutcome::Cycled { candidate, index, total, .. }) => {
+            Some(AutocompleteOutcome::Cycled {
+                candidate,
+                index,
+                total,
+                ..
+            }) => {
                 assert_eq!(candidate, format!("{}/case_beta/", temp_str));
                 assert_eq!(index, 2);
                 assert_eq!(total, 2);
@@ -393,9 +423,16 @@ mod tests {
         }
 
         // Fourth Tab -> wraps back to first match (case_alpha/)
-        let outcome4 = complete_path(&format!("{}/case_beta/", temp_str), format!("{}/case_beta/", temp_str).len(), true, &mut state);
+        let outcome4 = complete_path(
+            &format!("{}/case_beta/", temp_str),
+            format!("{}/case_beta/", temp_str).len(),
+            true,
+            &mut state,
+        );
         match outcome4 {
-            Some(AutocompleteOutcome::Cycled { candidate, index, .. }) => {
+            Some(AutocompleteOutcome::Cycled {
+                candidate, index, ..
+            }) => {
                 assert_eq!(candidate, format!("{}/case_alpha/", temp_str));
                 assert_eq!(index, 1);
             }
