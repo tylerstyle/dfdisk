@@ -1,4 +1,5 @@
 pub mod app;
+pub mod autocomplete;
 pub mod events;
 pub mod ui;
 
