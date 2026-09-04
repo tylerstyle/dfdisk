@@ -472,7 +472,9 @@ impl App {
             None => return,
         };
 
-        self.config.output_dir = crate::tui::autocomplete::expand_tilde(std::path::Path::new(self.target_dir_str.trim()));
+        self.config.output_dir = crate::tui::autocomplete::expand_tilde(std::path::Path::new(
+            self.target_dir_str.trim(),
+        ));
         if let Err(e) = std::fs::create_dir_all(&self.config.output_dir) {
             self.notification_msg = Some((format!("Cannot create target dir: {}", e), true));
             return;
@@ -568,62 +570,56 @@ impl App {
                 }
                 self.reset_converter_cursor();
             }
-            KeyCode::Tab => {
-                match cur_field {
-                    ConverterField::SourcePath => {
-                        self.autocomplete_conv_source();
-                    }
-                    ConverterField::TargetDir => {
-                        self.autocomplete_conv_target();
-                    }
-                    ConverterField::Mode => {
-                        self.conv_active_field = (self.conv_active_field + 1) % fields.len();
-                        self.reset_converter_cursor();
-                    }
-                    ConverterField::StartButton => {
-                        self.conv_active_field = (self.conv_active_field + 1) % fields.len();
-                        self.reset_converter_cursor();
-                    }
+            KeyCode::Tab => match cur_field {
+                ConverterField::SourcePath => {
+                    self.autocomplete_conv_source();
                 }
-            }
-            KeyCode::Enter => {
-                match cur_field {
-                    ConverterField::StartButton => {
-                        self.start_conversion();
-                    }
-                    ConverterField::Mode => {
+                ConverterField::TargetDir => {
+                    self.autocomplete_conv_target();
+                }
+                ConverterField::Mode => {
+                    self.conv_active_field = (self.conv_active_field + 1) % fields.len();
+                    self.reset_converter_cursor();
+                }
+                ConverterField::StartButton => {
+                    self.conv_active_field = (self.conv_active_field + 1) % fields.len();
+                    self.reset_converter_cursor();
+                }
+            },
+            KeyCode::Enter => match cur_field {
+                ConverterField::StartButton => {
+                    self.start_conversion();
+                }
+                ConverterField::Mode => {
+                    self.conv_to_e01 = !self.conv_to_e01;
+                }
+                _ => {
+                    self.conv_active_field = (self.conv_active_field + 1) % fields.len();
+                    self.reset_converter_cursor();
+                }
+            },
+            _ => match cur_field {
+                ConverterField::SourcePath => {
+                    edit_text(&mut self.conv_source_path, &mut self.conv_cursor_pos, key);
+                    self.auto_detect_converter_mode();
+                }
+                ConverterField::Mode => {
+                    if key.code == KeyCode::Left
+                        || key.code == KeyCode::Right
+                        || key.code == KeyCode::Char(' ')
+                    {
                         self.conv_to_e01 = !self.conv_to_e01;
                     }
-                    _ => {
-                        self.conv_active_field = (self.conv_active_field + 1) % fields.len();
-                        self.reset_converter_cursor();
+                }
+                ConverterField::TargetDir => {
+                    edit_text(&mut self.conv_target_dir, &mut self.conv_cursor_pos, key);
+                }
+                ConverterField::StartButton => {
+                    if key.code == KeyCode::Char(' ') {
+                        self.start_conversion();
                     }
                 }
-            }
-            _ => {
-                match cur_field {
-                    ConverterField::SourcePath => {
-                        edit_text(&mut self.conv_source_path, &mut self.conv_cursor_pos, key);
-                        self.auto_detect_converter_mode();
-                    }
-                    ConverterField::Mode => {
-                        if key.code == KeyCode::Left
-                            || key.code == KeyCode::Right
-                            || key.code == KeyCode::Char(' ')
-                        {
-                            self.conv_to_e01 = !self.conv_to_e01;
-                        }
-                    }
-                    ConverterField::TargetDir => {
-                        edit_text(&mut self.conv_target_dir, &mut self.conv_cursor_pos, key);
-                    }
-                    ConverterField::StartButton => {
-                        if key.code == KeyCode::Char(' ') {
-                            self.start_conversion();
-                        }
-                    }
-                }
-            }
+            },
         }
     }
 
@@ -676,8 +672,7 @@ impl App {
                         format!("[{}/{}] {} (Tab for next)", index, total, candidate);
                 }
                 AutocompleteOutcome::NoMatches => {
-                    self.conv_status_msg =
-                        "No matching files or directories found.".to_string();
+                    self.conv_status_msg = "No matching files or directories found.".to_string();
                 }
             }
             self.auto_detect_converter_mode();
@@ -1210,7 +1205,7 @@ mod tests {
             app.handle_key(key(KeyCode::Char(c)));
         }
         assert_eq!(app.conv_source_path, "image.raw");
-        assert_eq!(app.conv_to_e01, true); // Auto-detected RAW -> E01
+        assert!(app.conv_to_e01); // Auto-detected RAW -> E01
 
         // Move to Conversion Mode
         app.handle_key(key(KeyCode::Down));
@@ -1218,10 +1213,10 @@ mod tests {
 
         // Toggle mode using Space
         app.handle_key(key(KeyCode::Char(' ')));
-        assert_eq!(app.conv_to_e01, false);
+        assert!(!app.conv_to_e01);
         // Toggle mode using Enter
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.conv_to_e01, true);
+        assert!(app.conv_to_e01);
 
         // Move to Destination Dir
         app.handle_key(key(KeyCode::Down));
@@ -1259,15 +1254,15 @@ mod tests {
         let mut app = App::new();
         app.conv_source_path = "/tmp/suspect.E01".to_string();
         app.auto_detect_converter_mode();
-        assert_eq!(app.conv_to_e01, false);
+        assert!(!app.conv_to_e01);
 
         app.conv_source_path = "/tmp/suspect.dd".to_string();
         app.auto_detect_converter_mode();
-        assert_eq!(app.conv_to_e01, true);
+        assert!(app.conv_to_e01);
 
         app.conv_source_path = "/tmp/suspect.img".to_string();
         app.auto_detect_converter_mode();
-        assert_eq!(app.conv_to_e01, true);
+        assert!(app.conv_to_e01);
     }
 
     #[test]
