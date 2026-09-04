@@ -13,7 +13,7 @@
 
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "dfdisk";
-  version = "0.1.2";
+  version = "0.1.3";
 
   __structuredAttrs = true;
 
