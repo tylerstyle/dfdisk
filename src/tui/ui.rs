@@ -1462,11 +1462,7 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        let rendered_text: String = buffer
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
+        let rendered_text: String = buffer.content().iter().map(|c| c.symbol()).collect();
 
         // Header must contain notification text
         assert!(rendered_text.contains("Device list refreshed."));
