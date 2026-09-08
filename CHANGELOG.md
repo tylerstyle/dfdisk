@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-09-08
+
+### Changed
+- **Persistent Bottom Shortcut Hints**: Completely decoupled keybind hints from notification messages across all views (`DeviceExplorer`, `CaseSetup`, `AcquisitionRunning`, `ReportSummary`, `Converter`, `UnmountPrompt`, `SystemDiskWarning`). Shortcut hints remain permanently visible on every frame and are never obscured or replaced by status or refresh feedback.
+- **Header Status & Telemetry Bar**: Re-engineered the top header bar to host transient status, error, and engine telemetry feedback right-aligned:
+  - Informational and refresh notices rendered in light blue (`Color::Cyan`) with bold styling and auto-expiry after 4 seconds.
+  - Error and abort alerts rendered in bold red (`Color::Red`).
+  - Responsive title abbreviation on compact terminals to prevent message truncation.
+- **Shortcut Nomenclature & Usability**:
+  - Renamed Device Explorer action from `[Enter/A] Setup` to `[Enter/A] Select Disk`.
+  - Renamed quit hint from `[Q] Quit` to `[Esc/Q] Quit`.
+  - Renamed summary return hint to `[Enter / Esc / Q] Return to Explorer`.
+  - Added <kbd>A</kbd> / <kbd>a</kbd> abort shortcut handler alongside <kbd>Esc</kbd> and <kbd>Ctrl+C</kbd>, with `[Ctrl+C / Esc / A] Abort Acquisition` permanently displayed during active disk imaging.
+
+---
+
 ## [0.1.4] - 2026-09-04
 
 ### Added

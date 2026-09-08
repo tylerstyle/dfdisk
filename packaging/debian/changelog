@@ -1,3 +1,11 @@
+dfdisk (0.1.5-1) unstable; urgency=medium
+
+  * Keep bottom keyboard shortcuts permanently visible across all screens.
+  * Move notification and live telemetry messages to the top header bar right-aligned.
+  * Update shortcut hints: "Select Disk" for Enter/A, "Esc/Q" for Quit, and persistent abort hint.
+
+ -- tylerstyle <tylerstyle@users.noreply.github.com>  Tue, 08 Sep 2026 09:05:00 +0200
+
 dfdisk (0.1.4-1) unstable; urgency=medium
 
   * Add interactive editing and field navigation for Destination Dir in Converter.

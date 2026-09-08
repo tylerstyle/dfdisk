@@ -1,5 +1,8 @@
 /target
 /scratch
 /dist
-/result
+/result*
 /.agents/
+.direnv/
+*.swp
+*~

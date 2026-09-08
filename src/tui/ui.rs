@@ -40,7 +40,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_footer(frame, app, chunks[2]);
 }
 
-fn render_header(frame: &mut Frame, _app: &App, area: Rect) {
+fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let is_root = nix_is_root();
     let root_badge = if is_root {
         Span::styled(
@@ -75,19 +75,76 @@ fn render_header(frame: &mut Frame, _app: &App, area: Rect) {
             "│ FORENSIC DISK IMAGER & CONVERTER ",
             Style::default().fg(Color::White),
         ),
-        root_badge,
+        root_badge.clone(),
     ];
 
-    let header = Paragraph::new(Line::from(title_spans))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .alignment(Alignment::Left);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    frame.render_widget(header, area);
+    let info_opt: Option<(String, bool)> = if let Some((text, is_err)) = &app.notification_msg {
+        Some((text.clone(), *is_err))
+    } else if app.current_screen == Screen::AcquisitionRunning {
+        if app.abort_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            Some(("Aborting acquisition...".to_string(), true))
+        } else if !app.telemetry.status_message.is_empty() {
+            Some((app.telemetry.status_message.clone(), false))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((text, is_err)) = info_opt {
+        let (icon, color) = if is_err {
+            ("⚠ ", Color::Red)
+        } else {
+            ("ℹ ", Color::Cyan)
+        };
+        let info_span = Span::styled(
+            format!("{}{}", icon, text),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        );
+        let info_width = (text.chars().count().saturating_add(3)).min(u16::MAX as usize) as u16;
+
+        let left_spans = if inner.width.saturating_sub(72) < info_width {
+            vec![
+                Span::styled(
+                    " dfdisk ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("v{} ", env!("CARGO_PKG_VERSION")),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                root_badge,
+            ]
+        } else {
+            title_spans
+        };
+
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(info_width.min(inner.width)),
+            ])
+            .split(inner);
+
+        frame.render_widget(Paragraph::new(Line::from(left_spans)), chunks[0]);
+        frame.render_widget(
+            Paragraph::new(Line::from(info_span)).alignment(Alignment::Right),
+            chunks[1],
+        );
+    } else {
+        frame.render_widget(Paragraph::new(Line::from(title_spans)), inner);
+    }
 }
 
 fn render_device_explorer(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1160,60 +1217,62 @@ fn render_system_warning_modal(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, modal_area);
 }
 
-fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let msg = match &app.notification_msg {
-        Some((text, is_err)) => {
-            let color = if *is_err { Color::Red } else { Color::Green };
-            Span::styled(
-                format!(" ℹ {} ", text),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )
-        }
-        None => match app.current_screen {
-            Screen::DeviceExplorer => Span::styled(
-                " [Enter/A] Setup  [U] Unmount  [R] Refresh  [C] Converter  [Q] Quit ",
-                Style::default().fg(Color::Gray),
-            ),
-            Screen::CaseSetup => {
-                let fields = crate::tui::app::FormField::all();
-                let cur = &fields[app.active_field % fields.len()];
-                if *cur == crate::tui::app::FormField::TargetDir {
-                    Span::styled(
-                        " [Tab] Autocomplete  [↓/Enter] Next Field  [Ctrl+U] Clear  [F5] Start  [Esc] Back ",
-                        Style::default().fg(Color::Gray),
-                    )
-                } else {
-                    Span::styled(
-                        " [Tab/↓] Next Field  [Ctrl+U] Clear  [F5/Enter] Start Acquisition  [Esc] Back ",
-                        Style::default().fg(Color::Gray),
-                    )
-                }
-            }
-            Screen::AcquisitionRunning => Span::styled(
-                " [Ctrl+C / Esc] Abort Acquisition ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Screen::ReportSummary => Span::styled(
-                " [Enter / Esc] Return to Explorer ",
-                Style::default().fg(Color::Green),
-            ),
-            Screen::Converter => match app.conv_active_field {
-                0 | 2 => Span::styled(
+pub(crate) fn footer_hints(app: &App) -> Span<'static> {
+    match app.current_screen {
+        Screen::DeviceExplorer => Span::styled(
+            " [Enter/A] Select Disk  [U] Unmount  [R] Refresh  [C] Converter  [Esc/Q] Quit ",
+            Style::default().fg(Color::Gray),
+        ),
+        Screen::CaseSetup => {
+            let fields = crate::tui::app::FormField::all();
+            let cur = &fields[app.active_field % fields.len()];
+            if *cur == crate::tui::app::FormField::TargetDir {
+                Span::styled(
                     " [Tab] Autocomplete  [↓/Enter] Next Field  [Ctrl+U] Clear  [F5] Start  [Esc] Back ",
                     Style::default().fg(Color::Gray),
-                ),
-                1 => Span::styled(
-                    " [Space/Arrows] Toggle Mode  [Tab/↓/Enter] Next Field  [F5] Start  [Esc] Back ",
+                )
+            } else {
+                Span::styled(
+                    " [Tab/↓] Next Field  [Ctrl+U] Clear  [F5/Enter] Start Acquisition  [Esc] Back ",
                     Style::default().fg(Color::Gray),
-                ),
-                _ => Span::styled(
-                    " [Enter/Space/F5] Start Conversion  [Tab/↓] Next Field  [Esc] Back ",
-                    Style::default().fg(Color::Gray),
-                ),
-            },
-            _ => Span::styled("", Style::default()),
+                )
+            }
+        }
+        Screen::AcquisitionRunning => Span::styled(
+            " [Ctrl+C / Esc / A] Abort Acquisition ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        Screen::ReportSummary => Span::styled(
+            " [Enter / Esc / Q] Return to Explorer ",
+            Style::default().fg(Color::Green),
+        ),
+        Screen::Converter => match app.conv_active_field {
+            0 | 2 => Span::styled(
+                " [Tab] Autocomplete  [↓/Enter] Next Field  [Ctrl+U] Clear  [F5] Start  [Esc] Back ",
+                Style::default().fg(Color::Gray),
+            ),
+            1 => Span::styled(
+                " [Space/Arrows] Toggle Mode  [Tab/↓/Enter] Next Field  [F5] Start  [Esc] Back ",
+                Style::default().fg(Color::Gray),
+            ),
+            _ => Span::styled(
+                " [Enter/Space/F5] Start Conversion  [Tab/↓] Next Field  [Esc] Back ",
+                Style::default().fg(Color::Gray),
+            ),
         },
-    };
+        Screen::UnmountPrompt => Span::styled(
+            " [Y/Enter] Safe Unmount & Proceed  [N/Esc] Cancel ",
+            Style::default().fg(Color::Yellow),
+        ),
+        Screen::SystemDiskWarning => Span::styled(
+            " [Y] Proceed Anyway (Expert)  [N/Esc/Enter] Abort (Recommended) ",
+            Style::default().fg(Color::Red),
+        ),
+    }
+}
+
+fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let msg = footer_hints(app);
 
     let footer = Paragraph::new(Line::from(msg))
         .block(
@@ -1353,5 +1412,142 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_footer_hints_and_notification_separation() {
+        let mut app = App::new();
+
+        // 1. DeviceExplorer screen hints
+        app.current_screen = Screen::DeviceExplorer;
+        let hints = footer_hints(&app);
+        assert!(hints.content.contains("Select Disk"));
+        assert!(hints.content.contains("Esc/Q"));
+        assert!(!hints.content.contains("Setup"));
+
+        // Setting a notification message must NOT change or overwrite footer hints
+        app.notification_msg = Some(("Device list refreshed.".to_string(), false));
+        let hints_with_msg = footer_hints(&app);
+        assert_eq!(hints.content, hints_with_msg.content);
+
+        // 2. AcquisitionRunning screen hints - abort must always be present
+        app.current_screen = Screen::AcquisitionRunning;
+        let acq_hints = footer_hints(&app);
+        assert!(acq_hints.content.contains("Abort Acquisition"));
+
+        // With notification message set, abort hint still present
+        app.notification_msg = Some(("Aborting acquisition...".to_string(), true));
+        let acq_hints_with_msg = footer_hints(&app);
+        assert_eq!(acq_hints.content, acq_hints_with_msg.content);
+        assert!(acq_hints_with_msg.content.contains("Abort Acquisition"));
+    }
+
+    #[test]
+    fn test_render_header_and_footer_widgets() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(100, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new();
+        app.current_screen = Screen::DeviceExplorer;
+        app.notification_msg = Some(("Device list refreshed.".to_string(), false));
+
+        terminal
+            .draw(|f| {
+                render_header(f, &app, Rect::new(0, 0, 100, 3));
+                render_footer(f, &app, Rect::new(0, 7, 100, 3));
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered_text: String = buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        // Header must contain notification text
+        assert!(rendered_text.contains("Device list refreshed."));
+        // Footer must contain explorer shortcuts and NOT be replaced by notification
+        assert!(rendered_text.contains("Select Disk"));
+        assert!(rendered_text.contains("Esc/Q"));
+    }
+
+    #[test]
+    fn test_render_header_narrow_and_long_notifications() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let widths = [20, 40, 60, 80, 120];
+        for &w in &widths {
+            let backend = TestBackend::new(w, 5);
+            let mut terminal = Terminal::new(backend).unwrap();
+
+            let mut app = App::new();
+            // Test with very long notification (300 chars)
+            let long_msg = "X".repeat(300);
+            app.notification_msg = Some((long_msg, true));
+
+            terminal
+                .draw(|f| {
+                    render_header(f, &app, Rect::new(0, 0, w, 3));
+                })
+                .unwrap();
+
+            let buffer = terminal.backend().buffer();
+            let rendered_text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+            // Should contain error indicator without panicking
+            assert!(rendered_text.contains('⚠'));
+        }
+    }
+
+    #[test]
+    fn test_footer_hints_all_screens_coverage() {
+        let mut app = App::new();
+
+        // DeviceExplorer
+        app.current_screen = Screen::DeviceExplorer;
+        assert!(footer_hints(&app).content.contains("Select Disk"));
+        assert!(footer_hints(&app).content.contains("Esc/Q"));
+
+        // CaseSetup
+        app.current_screen = Screen::CaseSetup;
+        app.active_field = 0;
+        assert!(footer_hints(&app).content.contains("Start Acquisition"));
+        let target_dir_idx = crate::tui::app::FormField::all()
+            .iter()
+            .position(|f| *f == crate::tui::app::FormField::TargetDir)
+            .unwrap();
+        app.active_field = target_dir_idx;
+        assert!(footer_hints(&app).content.contains("Autocomplete"));
+
+        // AcquisitionRunning
+        app.current_screen = Screen::AcquisitionRunning;
+        assert!(footer_hints(&app).content.contains("Abort Acquisition"));
+        assert!(footer_hints(&app).content.contains("Ctrl+C / Esc / A"));
+
+        // ReportSummary
+        app.current_screen = Screen::ReportSummary;
+        assert!(footer_hints(&app).content.contains("Return to Explorer"));
+        assert!(footer_hints(&app).content.contains("Enter / Esc / Q"));
+
+        // Converter
+        app.current_screen = Screen::Converter;
+        app.conv_active_field = 0;
+        assert!(footer_hints(&app).content.contains("Autocomplete"));
+        app.conv_active_field = 1;
+        assert!(footer_hints(&app).content.contains("Toggle Mode"));
+        app.conv_active_field = 3;
+        assert!(footer_hints(&app).content.contains("Start Conversion"));
+
+        // UnmountPrompt
+        app.current_screen = Screen::UnmountPrompt;
+        assert!(footer_hints(&app).content.contains("Safe Unmount"));
+
+        // SystemDiskWarning
+        app.current_screen = Screen::SystemDiskWarning;
+        assert!(footer_hints(&app).content.contains("Proceed Anyway"));
     }
 }

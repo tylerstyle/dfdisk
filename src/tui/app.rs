@@ -100,6 +100,7 @@ pub struct App {
     pub telemetry: ProgressTelemetry,
     pub final_report: Option<ForensicInfoReport>,
     pub notification_msg: Option<(String, bool)>, // text, is_error
+    pub notification_time: Option<std::time::Instant>,
 
     // Background workers
     pub progress_rx: Option<mpsc::Receiver<ProgressTelemetry>>,
@@ -142,6 +143,7 @@ impl App {
             telemetry: ProgressTelemetry::default(),
             final_report: None,
             notification_msg: None,
+            notification_time: None,
             progress_rx: None,
             report_rx: None,
             abort_flag: Arc::new(AtomicBool::new(false)),
@@ -157,6 +159,16 @@ impl App {
         }
     }
 
+    pub fn set_notification(&mut self, text: impl Into<String>, is_error: bool) {
+        self.notification_msg = Some((text.into(), is_error));
+        self.notification_time = Some(std::time::Instant::now());
+    }
+
+    pub fn clear_notification(&mut self) {
+        self.notification_msg = None;
+        self.notification_time = None;
+    }
+
     pub fn refresh_devices(&mut self) {
         match DeviceScanner::scan_devices() {
             Ok(devs) => {
@@ -164,10 +176,10 @@ impl App {
                 if self.selected_device_idx >= self.devices.len() && !self.devices.is_empty() {
                     self.selected_device_idx = self.devices.len() - 1;
                 }
-                self.notification_msg = Some(("Device list refreshed.".to_string(), false));
+                self.set_notification("Device list refreshed.", false);
             }
             Err(e) => {
-                self.notification_msg = Some((format!("Scan error: {}", e), true));
+                self.set_notification(format!("Scan error: {}", e), true);
             }
         }
     }
@@ -216,8 +228,7 @@ impl App {
                     if dev.safety.is_mounted() {
                         self.current_screen = Screen::UnmountPrompt;
                     } else {
-                        self.notification_msg =
-                            Some(("Device is already unmounted.".to_string(), false));
+                        self.set_notification("Device is already unmounted.", false);
                     }
                 }
             }
@@ -279,14 +290,13 @@ impl App {
                 if let Some(dev) = self.selected_device() {
                     match SafetyChecker::unmount_all(&dev.mountpoints) {
                         Ok(()) => {
-                            self.notification_msg =
-                                Some(("Device successfully unmounted.".to_string(), false));
+                            self.set_notification("Device successfully unmounted.", false);
                             self.refresh_devices();
                             self.current_screen = Screen::CaseSetup;
                             self.reset_cursor_to_current_field();
                         }
                         Err(e) => {
-                            self.notification_msg = Some((format!("Unmount failed: {}", e), true));
+                            self.set_notification(format!("Unmount failed: {}", e), true);
                             self.current_screen = Screen::DeviceExplorer;
                         }
                     }
@@ -476,10 +486,11 @@ impl App {
             self.target_dir_str.trim(),
         ));
         if let Err(e) = std::fs::create_dir_all(&self.config.output_dir) {
-            self.notification_msg = Some((format!("Cannot create target dir: {}", e), true));
+            self.set_notification(format!("Cannot create target dir: {}", e), true);
             return;
         }
 
+        self.clear_notification();
         self.abort_flag.store(false, Ordering::Relaxed);
         let abort_flag_clone = self.abort_flag.clone();
 
@@ -528,10 +539,12 @@ impl App {
 
     fn handle_key_acquisition(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc
+            || key.code == KeyCode::Char('a')
+            || key.code == KeyCode::Char('A')
             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
         {
             self.abort_flag.store(true, Ordering::Relaxed);
-            self.notification_msg = Some(("Aborting acquisition...".to_string(), true));
+            self.set_notification("Aborting acquisition...", true);
         }
     }
 
@@ -773,7 +786,7 @@ impl App {
                     ("No matching directories found.".to_string(), true)
                 }
             };
-            self.notification_msg = Some((msg, is_err));
+            self.set_notification(msg, is_err);
         }
     }
 
@@ -838,6 +851,16 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        // Auto-expire notifications after 4 seconds (unless abort is actively in progress)
+        if let Some(time) = self.notification_time {
+            let is_aborting = self.abort_flag.load(Ordering::Relaxed)
+                && self.current_screen == Screen::AcquisitionRunning;
+            if !is_aborting && time.elapsed() > std::time::Duration::from_secs(4) {
+                self.notification_msg = None;
+                self.notification_time = None;
+            }
+        }
+
         // Poll for progress updates
         if let Some(ref mut rx) = self.progress_rx {
             while let Ok(prog) = rx.try_recv() {
@@ -854,7 +877,7 @@ impl App {
                         self.current_screen = Screen::ReportSummary;
                     }
                     Err(e) => {
-                        self.notification_msg = Some((format!("Acquisition failed: {}", e), true));
+                        self.set_notification(format!("Acquisition failed: {}", e), true);
                         self.current_screen = Screen::DeviceExplorer;
                     }
                 }
@@ -1304,5 +1327,43 @@ mod tests {
         assert_eq!(app.conv_source_path, format!("{}/file.raw", temp_str));
 
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_handle_key_acquisition_abort_keys() {
+        let mut app = App::new();
+        app.current_screen = Screen::AcquisitionRunning;
+
+        // Test pressing 'a' aborts
+        app.handle_key(key(KeyCode::Char('a')));
+        assert!(app.abort_flag.load(Ordering::Relaxed));
+        assert_eq!(app.notification_msg, Some(("Aborting acquisition...".to_string(), true)));
+
+        // Reset
+        app.abort_flag.store(false, Ordering::Relaxed);
+        app.notification_msg = None;
+
+        // Test pressing 'A' aborts
+        app.handle_key(key(KeyCode::Char('A')));
+        assert!(app.abort_flag.load(Ordering::Relaxed));
+        assert_eq!(app.notification_msg, Some(("Aborting acquisition...".to_string(), true)));
+
+        // Reset
+        app.abort_flag.store(false, Ordering::Relaxed);
+        app.notification_msg = None;
+
+        // Test pressing Esc aborts
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.abort_flag.load(Ordering::Relaxed));
+        assert_eq!(app.notification_msg, Some(("Aborting acquisition...".to_string(), true)));
+
+        // Reset
+        app.abort_flag.store(false, Ordering::Relaxed);
+        app.notification_msg = None;
+
+        // Test pressing Ctrl+C aborts
+        app.handle_key(ctrl_key(KeyCode::Char('c')));
+        assert!(app.abort_flag.load(Ordering::Relaxed));
+        assert_eq!(app.notification_msg, Some(("Aborting acquisition...".to_string(), true)));
     }
 }
