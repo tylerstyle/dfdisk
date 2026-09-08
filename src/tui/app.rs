@@ -1337,7 +1337,10 @@ mod tests {
         // Test pressing 'a' aborts
         app.handle_key(key(KeyCode::Char('a')));
         assert!(app.abort_flag.load(Ordering::Relaxed));
-        assert_eq!(app.notification_msg, Some(("Aborting acquisition...".to_string(), true)));
+        assert_eq!(
+            app.notification_msg,
+            Some(("Aborting acquisition...".to_string(), true))
+        );
 
         // Reset
         app.abort_flag.store(false, Ordering::Relaxed);
@@ -1346,7 +1349,10 @@ mod tests {
         // Test pressing 'A' aborts
         app.handle_key(key(KeyCode::Char('A')));
         assert!(app.abort_flag.load(Ordering::Relaxed));
-        assert_eq!(app.notification_msg, Some(("Aborting acquisition...".to_string(), true)));
+        assert_eq!(
+            app.notification_msg,
+            Some(("Aborting acquisition...".to_string(), true))
+        );
 
         // Reset
         app.abort_flag.store(false, Ordering::Relaxed);
@@ -1355,7 +1361,10 @@ mod tests {
         // Test pressing Esc aborts
         app.handle_key(key(KeyCode::Esc));
         assert!(app.abort_flag.load(Ordering::Relaxed));
-        assert_eq!(app.notification_msg, Some(("Aborting acquisition...".to_string(), true)));
+        assert_eq!(
+            app.notification_msg,
+            Some(("Aborting acquisition...".to_string(), true))
+        );
 
         // Reset
         app.abort_flag.store(false, Ordering::Relaxed);
@@ -1364,6 +1373,9 @@ mod tests {
         // Test pressing Ctrl+C aborts
         app.handle_key(ctrl_key(KeyCode::Char('c')));
         assert!(app.abort_flag.load(Ordering::Relaxed));
-        assert_eq!(app.notification_msg, Some(("Aborting acquisition...".to_string(), true)));
+        assert_eq!(
+            app.notification_msg,
+            Some(("Aborting acquisition...".to_string(), true))
+        );
     }
 }
