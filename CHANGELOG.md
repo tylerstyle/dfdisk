@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-09-18
+
+### Added
+- **Native RAW Acquisition Engine**: Direct streaming disk imaging engine (`RawAcquireEngine`) with in-flight cryptographic multi-hashing (MD5, SHA-1, SHA-256), destination read-back verification pass, and court-ready `.info` sidecar generation.
+
+### Refactored
+- **Acquisition Routing**: Routed raw image acquisition (`--format raw` and TUI format selection) directly to `RawAcquireEngine`.
+- **Forensic Verification Semantics**: Introduced `VerificationStatus` enum (`Verified`, `Mismatch`, `DamagedMedia`, `Failed`, `NotVerified`) across reports and CLI handlers, with non-zero exit codes on verification failure.
+- **Rescue Progress & Error Telemetry**: Updated `ddrescue` stream parsing for modern bad-sector and read-error metrics, calculating bad sector counts via ceiling division.
+- **EWF Segment Matching**: Hardened segment file matching in `EwfAcquireEngine` with strict EWF extension validation (`.E01`–`.E99`, `.EAA`–`.EZZ`, `.s01`–`.sZZ`, `.001`–`.999`).
+- **Device Capacity Detection**: Linux `ioctl(BLKGETSIZE64)` block device size probing and explicit capacity support in `MultiHasher`.
+- **SMART Temperature Normalization**: Standardized temperature parsing with Kelvin and Celsius boundary normalization and ATA attribute fallback.
+
+---
+
 ## [0.1.5] - 2026-09-08
 
 ### Changed
