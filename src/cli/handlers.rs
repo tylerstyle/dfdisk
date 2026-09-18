@@ -2,11 +2,14 @@ use crate::cli::args::{
     AcquireArgs, CliCompression, CliImageFormat, CliSplitSize, ConvertArgs, ListArgs, VerifyArgs,
 };
 use crate::discovery::{DeviceScanner, SafetyChecker};
-use crate::engines::{EwfAcquireEngine, FormatConverter, MultiHasher, RescueAcquireEngine};
+use crate::engines::{
+    EwfAcquireEngine, FormatConverter, MultiHasher, RawAcquireEngine, RescueAcquireEngine,
+};
 use crate::models::{
     case::CaseMetadata,
     config::{AcquisitionConfig, CompressionLevel, ImageFormat, SplitSize},
     device::{BlockDevice, DeviceSafety},
+    info_report::VerificationStatus,
     telemetry::AcquisitionStatus,
 };
 use std::path::Path;
@@ -189,14 +192,28 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
             RescueAcquireEngine::run_rescue(dev_clone, case_clone, cfg_clone, prog_tx, abort_clone)
                 .await
         } else {
-            EwfAcquireEngine::run_acquisition(
-                dev_clone,
-                case_clone,
-                cfg_clone,
-                prog_tx,
-                abort_clone,
-            )
-            .await
+            match cfg_clone.format {
+                ImageFormat::E01 => {
+                    EwfAcquireEngine::run_acquisition(
+                        dev_clone,
+                        case_clone,
+                        cfg_clone,
+                        prog_tx,
+                        abort_clone,
+                    )
+                    .await
+                }
+                ImageFormat::Raw => {
+                    RawAcquireEngine::run_acquisition(
+                        dev_clone,
+                        case_clone,
+                        cfg_clone,
+                        prog_tx,
+                        abort_clone,
+                    )
+                    .await
+                }
+            }
         }
     });
 
@@ -223,8 +240,39 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
     match report_res {
         Ok(report) => {
             println!("{}", report.render_text());
-            println!("[+] Acquisition and verification completed successfully!");
-            Ok(())
+            match report.verification_status {
+                VerificationStatus::Verified => {
+                    println!("[+] Acquisition and verification completed successfully!");
+                    Ok(())
+                }
+                VerificationStatus::DamagedMedia => {
+                    println!(
+                        "[!] Resilient acquisition completed with {} bad/unreadable sectors.",
+                        report.bad_sectors_count
+                    );
+                    println!(
+                        "    Destination image hashes recorded. Live source verification skipped due to media defects."
+                    );
+                    Ok(())
+                }
+                VerificationStatus::Mismatch => {
+                    eprintln!("[!] CRITICAL FORENSIC ERROR: Cryptographic verification failed!");
+                    eprintln!("    Destination image hashes do NOT match source hashes. Evidence integrity compromised.");
+                    Err("Cryptographic verification failed: hash mismatch detected.".into())
+                }
+                VerificationStatus::Failed => {
+                    eprintln!("[!] Acquisition finished, but cryptographic verification failed or could not be completed.");
+                    Err("Verification failed.".into())
+                }
+                VerificationStatus::NotVerified => {
+                    if report.verification_passed {
+                        println!("[+] Acquisition and verification completed successfully!");
+                    } else {
+                        println!("[+] Acquisition completed (verification not requested).");
+                    }
+                    Ok(())
+                }
+            }
         }
         Err(e) => {
             eprintln!("[!] Acquisition failed: {}", e);

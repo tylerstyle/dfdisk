@@ -1,5 +1,5 @@
 use crate::discovery::{DeviceScanner, SafetyChecker};
-use crate::engines::{EwfAcquireEngine, FormatConverter, RescueAcquireEngine};
+use crate::engines::{EwfAcquireEngine, FormatConverter, RawAcquireEngine, RescueAcquireEngine};
 use crate::models::{
     case::CaseMetadata,
     config::{AcquisitionConfig, CompressionLevel, ImageFormat, SplitSize},
@@ -521,14 +521,28 @@ impl App {
                 )
                 .await
             } else {
-                EwfAcquireEngine::run_acquisition(
-                    dev_clone,
-                    case_clone,
-                    cfg_clone,
-                    prog_tx,
-                    abort_flag_clone,
-                )
-                .await
+                match cfg_clone.format {
+                    ImageFormat::E01 => {
+                        EwfAcquireEngine::run_acquisition(
+                            dev_clone,
+                            case_clone,
+                            cfg_clone,
+                            prog_tx,
+                            abort_flag_clone,
+                        )
+                        .await
+                    }
+                    ImageFormat::Raw => {
+                        RawAcquireEngine::run_acquisition(
+                            dev_clone,
+                            case_clone,
+                            cfg_clone,
+                            prog_tx,
+                            abort_flag_clone,
+                        )
+                        .await
+                    }
+                }
             };
 
             let _ = rep_tx.send(res).await;

@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum DeviceSafety {
     /// Safe for acquisition (unmounted, not a system disk)
+    #[default]
     Safe,
     /// Has mounted partitions that should be unmounted before acquisition
     Mounted(Vec<String>),
@@ -29,7 +30,7 @@ impl DeviceSafety {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Partition {
     pub name: String,
     pub path: String,
@@ -41,7 +42,7 @@ pub struct Partition {
     pub is_read_only: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SmartInfo {
     pub passed: bool,
     pub power_on_hours: Option<u64>,
@@ -53,7 +54,7 @@ pub struct SmartInfo {
     pub assessment: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlockDevice {
     pub name: String,
     pub path: String,

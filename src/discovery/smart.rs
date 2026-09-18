@@ -50,7 +50,7 @@ impl SmartChecker {
         let mut temperature_celsius = val
             .pointer("/temperature/current")
             .and_then(|v| v.as_i64())
-            .map(|t| t as i32);
+            .and_then(normalize_temperature);
 
         let mut reallocated = None;
         let mut pending = None;
@@ -73,6 +73,16 @@ impl SmartChecker {
                     231 | 233 => wear = raw_val.map(|w| w as u32),
                     _ => {}
                 }
+
+                // If temperature missing, check ATA attributes 194 / 190
+                if temperature_celsius.is_none() && (id == 194 || id == 190) {
+                    if let Some(raw) = raw_val {
+                        let temp_candidate = (raw & 0xFFFF) as i64;
+                        if let Some(c) = normalize_temperature(temp_candidate) {
+                            temperature_celsius = Some(c);
+                        }
+                    }
+                }
             }
         }
 
@@ -89,12 +99,7 @@ impl SmartChecker {
             }
             if temperature_celsius.is_none() {
                 if let Some(temp) = nvme.get("temperature").and_then(|v| v.as_i64()) {
-                    let temp_c = if temp > 200 {
-                        (temp - 273) as i32
-                    } else {
-                        temp as i32
-                    };
-                    temperature_celsius = Some(temp_c);
+                    temperature_celsius = normalize_temperature(temp);
                 }
             }
         }
@@ -109,6 +114,19 @@ impl SmartChecker {
             wear_percentage: wear,
             assessment,
         }
+    }
+}
+
+pub fn normalize_temperature(val: i64) -> Option<i32> {
+    if (200..=400).contains(&val) {
+        // Kelvin -> Celsius (200 K = -73°C, 400 K = +127°C)
+        Some((val - 273) as i32)
+    } else if (-30..=120).contains(&val) {
+        // Legitimate Celsius operating range
+        Some(val as i32)
+    } else {
+        // Out of physical operational bounds, uninitialized, or sensor error sentinel
+        None
     }
 }
 
@@ -196,5 +214,18 @@ mod tests {
         assert_eq!(info.temperature_celsius, Some(37)); // 310 - 273 = 37
         assert_eq!(info.wear_percentage, Some(5)); // 100 - 95 = 5
         assert_eq!(info.uncorrectable_errors, Some(0));
+    }
+
+    #[test]
+    fn test_normalize_temperature() {
+        assert_eq!(normalize_temperature(310), Some(37)); // Kelvin -> 37°C
+        assert_eq!(normalize_temperature(273), Some(0)); // 0°C
+        assert_eq!(normalize_temperature(45), Some(45)); // Normal Celsius
+        assert_eq!(normalize_temperature(0), Some(0));
+        assert_eq!(normalize_temperature(-10), Some(-10));
+        // Out-of-bounds error sentinels
+        assert_eq!(normalize_temperature(65535), None);
+        assert_eq!(normalize_temperature(-100), None);
+        assert_eq!(normalize_temperature(150), None);
     }
 }

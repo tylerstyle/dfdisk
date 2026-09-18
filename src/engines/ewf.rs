@@ -3,7 +3,7 @@ use crate::models::{
     case::CaseMetadata,
     config::AcquisitionConfig,
     device::BlockDevice,
-    info_report::{ForensicInfoReport, HashResults},
+    info_report::{ForensicInfoReport, HashResults, VerificationStatus},
     telemetry::{AcquisitionStatus, ProgressTelemetry},
 };
 use chrono::Utc;
@@ -292,7 +292,7 @@ impl EwfAcquireEngine {
         if let Ok(entries) = std::fs::read_dir(target_dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(&base_name) {
+                if is_ewf_segment(&base_name, &name) {
                     generated_files.push(entry.path().to_string_lossy().to_string());
                 }
             }
@@ -312,6 +312,13 @@ impl EwfAcquireEngine {
         };
 
         let hashes_match = verify_ewf_hashes(&source_hashes, &destination_hashes);
+        let verification_status = if hashes_match {
+            VerificationStatus::Verified
+        } else if source_hashes.md5.is_some() && destination_hashes.md5.is_some() {
+            VerificationStatus::Mismatch
+        } else {
+            VerificationStatus::Failed
+        };
 
         let report = ForensicInfoReport {
             tool_name: "dfdisk".to_string(),
@@ -327,6 +334,7 @@ impl EwfAcquireEngine {
             source_hashes,
             destination_hashes,
             verification_passed: hashes_match,
+            verification_status,
             generated_files: generated_files.clone(),
         };
 
@@ -346,11 +354,40 @@ impl EwfAcquireEngine {
         telemetry.status = AcquisitionStatus::Completed;
         telemetry.percentage = 100.0;
         telemetry.bytes_processed = device.size_bytes;
-        telemetry.status_message =
-            "Acquisition and verification successfully completed.".to_string();
+        telemetry.status_message = if hashes_match {
+            "Acquisition and verification successfully completed.".to_string()
+        } else {
+            "Acquisition completed with verification warning/failure.".to_string()
+        };
         let _ = progress_tx.send(telemetry).await;
 
         Ok(report)
+    }
+}
+
+pub fn is_ewf_segment(base_name: &str, file_name: &str) -> bool {
+    let prefix = format!("{}.", base_name);
+    if !file_name.starts_with(&prefix) {
+        return false;
+    }
+
+    let ext = &file_name[prefix.len()..];
+    if ext.len() != 3 {
+        return false;
+    }
+
+    let bytes = ext.as_bytes();
+    let first = bytes[0].to_ascii_uppercase();
+    let second = bytes[1].to_ascii_uppercase();
+    let third = bytes[2].to_ascii_uppercase();
+
+    match first {
+        b'E' | b'S' => {
+            (second.is_ascii_digit() && third.is_ascii_digit())
+                || (second.is_ascii_alphabetic() && third.is_ascii_alphabetic())
+        }
+        b'0'..=b'9' => second.is_ascii_digit() && third.is_ascii_digit(),
+        _ => false,
     }
 }
 
@@ -372,7 +409,7 @@ fn calculate_target_bytes(output_dir: &std::path::Path, base_name: &str) -> u64 
     if let Ok(entries) = fs::read_dir(output_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(base_name) && !name.ends_with(".info") {
+            if is_ewf_segment(base_name, &name) {
                 if let Ok(meta) = entry.metadata() {
                     total += meta.len();
                 }
@@ -524,5 +561,23 @@ mod tests {
             sha256: None,
         };
         assert!(!verify_ewf_hashes(&source, &dest));
+    }
+
+    #[test]
+    fn test_is_ewf_segment_matching() {
+        let base = "case_ea01_cf01_SERIAL";
+        assert!(is_ewf_segment(base, "case_ea01_cf01_SERIAL.E01"));
+        assert!(is_ewf_segment(base, "case_ea01_cf01_SERIAL.e01"));
+        assert!(is_ewf_segment(base, "case_ea01_cf01_SERIAL.E99"));
+        assert!(is_ewf_segment(base, "case_ea01_cf01_SERIAL.EAA"));
+        assert!(is_ewf_segment(base, "case_ea01_cf01_SERIAL.s01"));
+        assert!(is_ewf_segment(base, "case_ea01_cf01_SERIAL.001"));
+
+        // Must reject non-segment files
+        assert!(!is_ewf_segment(base, "case_ea01_cf01_SERIAL.info"));
+        assert!(!is_ewf_segment(base, "case_ea01_cf01_SERIAL.old"));
+        assert!(!is_ewf_segment(base, "case_ea01_cf01_SERIAL.E01.bak"));
+        assert!(!is_ewf_segment(base, "case_ea01_cf01_SERIAL_copy.E01"));
+        assert!(!is_ewf_segment(base, "other_case.E01"));
     }
 }
