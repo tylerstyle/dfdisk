@@ -1,3 +1,14 @@
+dfdisk (0.1.6-1) unstable; urgency=medium
+
+  * Add native RAW streaming acquisition engine with in-flight multi-hashing.
+  * Route CLI and TUI raw acquisitions to native engine.
+  * Add granular verification status classification and error reporting.
+  * Update ddrescue stream telemetry parsing and bad sector accounting.
+  * Harden EWF segment file matching and multi-hasher block device capacity probing.
+  * Normalize SMART temperature parsing.
+
+ -- tylerstyle <tylerstyle@users.noreply.github.com>  Fri, 18 Sep 2026 09:12:00 +0200
+
 dfdisk (0.1.5-1) unstable; urgency=medium
 
   * Keep bottom keyboard shortcuts permanently visible across all screens.

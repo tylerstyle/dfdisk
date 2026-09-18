@@ -304,7 +304,7 @@ mod tests {
     fn test_verification_status_rendering() {
         let mut report = ForensicInfoReport {
             tool_name: "dfdisk".to_string(),
-            tool_version: "0.1.5".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
             case_metadata: CaseMetadata::default(),
             device: BlockDevice::default(),
             config: AcquisitionConfig::default(),

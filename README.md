@@ -257,7 +257,7 @@ Total Sectors       : 1953525168 sectors
 Total Capacity      : 1000204886016 bytes (1.00 TB (931.51 GiB))
 
 [ACQUISITION CONFIGURATION]
-Acquisition Tool    : dfdisk v0.1.5
+Acquisition Tool    : dfdisk v0.1.6
 Output Format       : Expert Witness Format (E01)
 Compression         : Fast (Deflate)
 Segment Split Size  : 2.0 GiB (2048 MB)
