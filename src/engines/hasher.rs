@@ -64,8 +64,8 @@ impl MultiHasher {
                     if meta.file_type().is_block_device() {
                         let fd = file.as_raw_fd();
                         let mut size: u64 = 0;
-                        const BLKGETSIZE64: libc::c_ulong = 0x80081272;
-                        let ret = unsafe { libc::ioctl(fd, BLKGETSIZE64, &mut size) };
+                        const BLKGETSIZE64: u64 = 0x80081272;
+                        let ret = unsafe { libc::ioctl(fd, BLKGETSIZE64 as _, &mut size) };
                         if ret == 0 && size > 0 {
                             total_bytes = size;
                         }
