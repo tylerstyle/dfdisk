@@ -13,6 +13,21 @@ pub struct HashResults {
     pub sha256: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VerificationStatus {
+    /// Source and destination hashes strictly match
+    Verified,
+    /// Hashes were computed for both source and destination, but do not match
+    Mismatch,
+    /// Damaged media rescue: live source hashing not possible due to bad sectors; destination image hashes recorded
+    DamagedMedia,
+    /// Verification failed due to read/write errors or incomplete execution
+    Failed,
+    /// Verification was not requested or skipped
+    #[default]
+    NotVerified,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForensicInfoReport {
     pub tool_name: String,
@@ -28,6 +43,8 @@ pub struct ForensicInfoReport {
     pub source_hashes: HashResults,
     pub destination_hashes: HashResults,
     pub verification_passed: bool,
+    #[serde(default)]
+    pub verification_status: VerificationStatus,
     pub generated_files: Vec<String>,
 }
 
@@ -242,10 +259,26 @@ impl ForensicInfoReport {
         }
         out.push('\n');
 
-        let status_str = if self.verification_passed {
-            "VERIFIED - ALL HASHES MATCH (Acquisition Integrity Confirmed)"
-        } else {
-            "WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE"
+        let status_str = match self.verification_status {
+            VerificationStatus::Verified => {
+                "VERIFIED - ALL HASHES MATCH (Acquisition Integrity Confirmed)"
+            }
+            VerificationStatus::DamagedMedia => {
+                "WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE (Damaged Media / Unreadable Sectors Present)"
+            }
+            VerificationStatus::Mismatch => {
+                "CRITICAL ERROR - HASH MISMATCH (Evidence Invalidation / Cryptographic Disparity)"
+            }
+            VerificationStatus::Failed => {
+                "WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE (Verification Failed)"
+            }
+            VerificationStatus::NotVerified => {
+                if self.verification_passed {
+                    "VERIFIED - ALL HASHES MATCH (Acquisition Integrity Confirmed)"
+                } else {
+                    "WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE"
+                }
+            }
         };
         out.push_str(&format!("{:<20}: {}\n", "Verification Result", status_str));
 
@@ -260,5 +293,43 @@ impl ForensicInfoReport {
             "================================================================================\n",
         );
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verification_status_rendering() {
+        let mut report = ForensicInfoReport {
+            tool_name: "dfdisk".to_string(),
+            tool_version: "0.1.5".to_string(),
+            case_metadata: CaseMetadata::default(),
+            device: BlockDevice::default(),
+            config: AcquisitionConfig::default(),
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+            elapsed_seconds: 10,
+            average_speed_bytes_sec: 1000.0,
+            bad_sectors_count: 0,
+            source_hashes: HashResults::default(),
+            destination_hashes: HashResults::default(),
+            verification_passed: true,
+            verification_status: VerificationStatus::Verified,
+            generated_files: vec![],
+        };
+
+        assert!(report.render_text().contains("VERIFIED - ALL HASHES MATCH"));
+
+        report.verification_status = VerificationStatus::DamagedMedia;
+        report.verification_passed = false;
+        let txt = report.render_text();
+        assert!(txt.contains("WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE (Damaged Media"));
+
+        report.verification_status = VerificationStatus::Mismatch;
+        assert!(report
+            .render_text()
+            .contains("CRITICAL ERROR - HASH MISMATCH"));
     }
 }

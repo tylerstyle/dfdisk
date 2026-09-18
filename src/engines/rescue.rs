@@ -3,7 +3,7 @@ use crate::models::{
     case::CaseMetadata,
     config::AcquisitionConfig,
     device::BlockDevice,
-    info_report::ForensicInfoReport,
+    info_report::{ForensicInfoReport, VerificationStatus},
     telemetry::{AcquisitionStatus, ProgressTelemetry},
 };
 use chrono::Utc;
@@ -67,8 +67,12 @@ impl RescueAcquireEngine {
 
         let mut bad_sectors = 0u64;
         let regex_pct = Regex::new(r"pct rescued:\s*(\d+(?:\.\d+)?)%").unwrap();
-        let regex_errors = Regex::new(r"errsize:\s*(\d+(?:\.\d+)?)\s*([kKMGT]?B)").unwrap();
-        let regex_speed = Regex::new(r"current rate:\s*(\d+(?:\.\d+)?)\s*([kKMGT]?B/s)").unwrap();
+        let regex_bad_size =
+            Regex::new(r"(?:bad-sector|errsize):\s*(\d+(?:\.\d+)?)\s*([kKMGT]?i?B)").unwrap();
+        let regex_speed =
+            Regex::new(r"(?:current rate|average rate):\s*(\d+(?:\.\d+)?)\s*([kKMGT]?i?B/s)")
+                .unwrap();
+        let regex_read_errors = Regex::new(r"read errors:\s*(\d+)").unwrap();
 
         let mut poll_interval = tokio::time::interval(Duration::from_millis(100));
         let mut last_read_bytes = 0u64;
@@ -132,15 +136,33 @@ impl RescueAcquireEngine {
                                         "kB/s" | "KB/s" => 1_000.0,
                                         "MB/s" | "mB/s" => 1_000_000.0,
                                         "GB/s" => 1_000_000_000.0,
+                                        "KiB/s" => 1024.0,
+                                        "MiB/s" => 1024.0 * 1024.0,
+                                        "GiB/s" => 1024.0 * 1024.0 * 1024.0,
                                         _ => 1.0,
                                     };
                                     telemetry.speed_bps = val * mult;
                                 }
-                                if let Some(caps) = regex_errors.captures(text) {
-                                    let err_val = caps[1].parse::<f64>().unwrap_or(0.0);
-                                    if err_val > 0.0 {
-                                        bad_sectors += 1;
+                                if let Some(caps) = regex_bad_size.captures(text) {
+                                    if let Ok(val) = caps[1].parse::<f64>() {
+                                        let unit = &caps[2];
+                                        let bad_bytes = parse_size_to_bytes(val, unit);
+                                        let sector_size = device.logical_sector_size.max(512) as u64;
+                                        let calculated = if bad_bytes > 0 {
+                                            bad_bytes.div_ceil(sector_size)
+                                        } else {
+                                            0
+                                        };
+                                        bad_sectors = calculated;
                                         telemetry.bad_sectors = bad_sectors;
+                                    }
+                                }
+                                if let Some(caps) = regex_read_errors.captures(text) {
+                                    if let Ok(err_count) = caps[1].parse::<u64>() {
+                                        if bad_sectors == 0 && err_count > 0 {
+                                            bad_sectors = err_count;
+                                            telemetry.bad_sectors = bad_sectors;
+                                        }
                                     }
                                 }
 
@@ -214,6 +236,7 @@ impl RescueAcquireEngine {
             source_hashes: crate::models::info_report::HashResults::default(),
             destination_hashes: hashes,
             verification_passed: false,
+            verification_status: VerificationStatus::DamagedMedia,
             generated_files,
         };
 
@@ -228,6 +251,22 @@ impl RescueAcquireEngine {
 
         Ok(report)
     }
+}
+
+pub fn parse_size_to_bytes(val: f64, unit: &str) -> u64 {
+    let mult: f64 = match unit {
+        "B" | "b" => 1.0,
+        "kB" | "KB" => 1_000.0,
+        "MB" => 1_000_000.0,
+        "GB" => 1_000_000_000.0,
+        "TB" => 1_000_000_000_000.0,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => 1.0,
+    };
+    (val * mult) as u64
 }
 
 pub(crate) fn parse_rchar(content: &str) -> Option<u64> {
@@ -305,6 +344,7 @@ mod tests {
             source_hashes: crate::models::info_report::HashResults::default(),
             destination_hashes: hashes,
             verification_passed: false,
+            verification_status: VerificationStatus::DamagedMedia,
             generated_files: vec!["test.raw".to_string()],
         };
 
@@ -316,9 +356,21 @@ mod tests {
         // Destination hashes are present
         assert!(report.destination_hashes.md5.is_some());
         assert!(!report.verification_passed);
+        assert_eq!(report.verification_status, VerificationStatus::DamagedMedia);
 
         // Rendered text must state warning / verification incomplete
         let text = report.render_text();
         assert!(text.contains("WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE"));
+    }
+
+    #[test]
+    fn test_parse_size_to_bytes_units() {
+        assert_eq!(parse_size_to_bytes(512.0, "B"), 512);
+        assert_eq!(parse_size_to_bytes(10.0, "kB"), 10_000);
+        assert_eq!(parse_size_to_bytes(10.0, "KB"), 10_000);
+        assert_eq!(parse_size_to_bytes(4.0, "KiB"), 4096);
+        assert_eq!(parse_size_to_bytes(2.0, "MB"), 2_000_000);
+        assert_eq!(parse_size_to_bytes(1.0, "MiB"), 1_048_576);
+        assert_eq!(parse_size_to_bytes(1.0, "GiB"), 1_073_741_824);
     }
 }

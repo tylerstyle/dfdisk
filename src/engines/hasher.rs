@@ -29,16 +29,52 @@ impl MultiHasher {
         calc_sha256: bool,
         progress_tx: Option<mpsc::Sender<HashProgress>>,
     ) -> Result<HashResults, String> {
+        Self::hash_stream_with_capacity(path, calc_md5, calc_sha1, calc_sha256, None, progress_tx)
+            .await
+    }
+
+    /// Computes MD5, SHA-1, and SHA-256 simultaneously with an optional pre-discovered device size
+    pub async fn hash_stream_with_capacity(
+        path: &Path,
+        calc_md5: bool,
+        calc_sha1: bool,
+        calc_sha256: bool,
+        known_size: Option<u64>,
+        progress_tx: Option<mpsc::Sender<HashProgress>>,
+    ) -> Result<HashResults, String> {
         let path_buf = path.to_path_buf();
 
         tokio::task::spawn_blocking(move || {
             let mut file = File::open(&path_buf)
                 .map_err(|e| format!("Failed to open {}: {}", path_buf.display(), e))?;
 
-            let mut total_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let mut total_bytes = known_size.unwrap_or(0);
             if total_bytes == 0 {
-                // For Linux block devices, metadata().len() returns 0.
-                // Seek to the end of the block device to determine true capacity.
+                if let Ok(meta) = file.metadata() {
+                    total_bytes = meta.len();
+                }
+            }
+
+            #[cfg(target_os = "linux")]
+            if total_bytes == 0 {
+                use std::os::unix::fs::FileTypeExt;
+                use std::os::unix::io::AsRawFd;
+
+                if let Ok(meta) = file.metadata() {
+                    if meta.file_type().is_block_device() {
+                        let fd = file.as_raw_fd();
+                        let mut size: u64 = 0;
+                        const BLKGETSIZE64: libc::c_ulong = 0x80081272;
+                        let ret = unsafe { libc::ioctl(fd, BLKGETSIZE64, &mut size) };
+                        if ret == 0 && size > 0 {
+                            total_bytes = size;
+                        }
+                    }
+                }
+            }
+
+            if total_bytes == 0 {
+                // Seek fallback for sparse files or virtual devices
                 if let Ok(end_pos) = file.seek(SeekFrom::End(0)) {
                     total_bytes = end_pos;
                     let _ = file.seek(SeekFrom::Start(0));

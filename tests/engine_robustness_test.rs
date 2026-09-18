@@ -12,7 +12,7 @@ use models::{
     case::CaseMetadata,
     config::AcquisitionConfig,
     device::{BlockDevice, DeviceSafety},
-    info_report::{ForensicInfoReport, HashResults},
+    info_report::{ForensicInfoReport, HashResults, VerificationStatus},
 };
 
 #[test]
@@ -216,6 +216,7 @@ fn test_truthful_forensic_reporting_damaged_media_rescue() {
         source_hashes: HashResults::default(),
         destination_hashes: dest_hashes.clone(),
         verification_passed: false,
+        verification_status: VerificationStatus::DamagedMedia,
         generated_files: vec![
             "crime_2026_resq_eaea_01_bad_disk_01_WD-WCC4M0000000.raw".to_string(),
             "crime_2026_resq_eaea_01_bad_disk_01_WD-WCC4M0000000.map".to_string(),
@@ -260,4 +261,162 @@ fn test_truthful_forensic_reporting_damaged_media_rescue() {
     assert!(!cert_text.contains("Source MD5"));
     assert!(!cert_text.contains("Source SHA-1"));
     assert!(!cert_text.contains("Source SHA-256"));
+}
+
+#[tokio::test]
+async fn test_raw_acquisition_end_to_end() {
+    let temp_dir = std::env::temp_dir().join("dfdisk_test_raw_acq");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let source_disk = temp_dir.join("virtual_source.bin");
+    let test_data = vec![0x42u8; 2 * 1024 * 1024]; // 2 MB of test data
+    std::fs::write(&source_disk, &test_data).unwrap();
+
+    let device = BlockDevice {
+        name: "virtual_src".to_string(),
+        path: source_disk.to_string_lossy().to_string(),
+        devlinks: vec![],
+        size_bytes: test_data.len() as u64,
+        model: Some("Virtual Test Disk".to_string()),
+        vendor: Some("RustTest".to_string()),
+        serial: Some("VT10001".to_string()),
+        wwn: None,
+        revision: None,
+        bus_type: "Virtual".to_string(),
+        is_rotational: Some(false),
+        is_removable: false,
+        is_read_only: false,
+        logical_sector_size: 512,
+        physical_sector_size: 512,
+        partition_table_type: None,
+        partitions: vec![],
+        mountpoints: vec![],
+        safety: DeviceSafety::Safe,
+        smart: None,
+    };
+
+    let case = CaseMetadata {
+        case_number: "CASE2026-RAW".to_string(),
+        location_ea: "LOC01".to_string(),
+        evidence_number: "EV01".to_string(),
+        authority: "Federal Cybercrime Unit".to_string(),
+        examiner: "Forensic Specialist".to_string(),
+        description: "Test Raw Acquisition".to_string(),
+        notes: "Automated verification test".to_string(),
+    };
+
+    let out_dir = temp_dir.join("evidence_output");
+    let config = AcquisitionConfig {
+        format: models::config::ImageFormat::Raw,
+        output_dir: out_dir.clone(),
+        calc_md5: true,
+        calc_sha1: true,
+        calc_sha256: true,
+        ..Default::default()
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(50);
+    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+    let report = engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort)
+        .await
+        .expect("RAW acquisition must succeed");
+
+    assert!(report.verification_passed);
+    assert_eq!(
+        report.verification_status,
+        models::info_report::VerificationStatus::Verified
+    );
+    assert_eq!(report.bad_sectors_count, 0);
+    assert_eq!(report.source_hashes.md5, report.destination_hashes.md5);
+    assert_eq!(report.source_hashes.sha1, report.destination_hashes.sha1);
+    assert_eq!(
+        report.source_hashes.sha256,
+        report.destination_hashes.sha256
+    );
+
+    let cert_text = report.render_text();
+    assert!(cert_text.contains("VERIFIED - ALL HASHES MATCH"));
+    assert!(cert_text.contains("DFDISK FORENSIC ACQUISITION REPORT"));
+
+    // Verify written raw file exists and matches source
+    let expected_raw = std::path::PathBuf::from(&report.generated_files[0]);
+    assert!(expected_raw.exists());
+    let written = std::fs::read(&expected_raw).unwrap();
+    assert_eq!(written, test_data);
+
+    // Verify .info sidecar exists
+    let expected_info = expected_raw.with_extension("info");
+    assert!(expected_info.exists());
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_raw_acquisition_abort_reactivity() {
+    let temp_dir = std::env::temp_dir().join("dfdisk_test_raw_abort");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let source_disk = temp_dir.join("virtual_source.bin");
+    let test_data = vec![0xaau8; 10 * 1024 * 1024]; // 10 MB
+    std::fs::write(&source_disk, &test_data).unwrap();
+
+    let device = BlockDevice {
+        name: "virtual_src".to_string(),
+        path: source_disk.to_string_lossy().to_string(),
+        devlinks: vec![],
+        size_bytes: test_data.len() as u64,
+        model: Some("Virtual Test Disk".to_string()),
+        vendor: Some("RustTest".to_string()),
+        serial: Some("VT10002".to_string()),
+        wwn: None,
+        revision: None,
+        bus_type: "Virtual".to_string(),
+        is_rotational: Some(false),
+        is_removable: false,
+        is_read_only: false,
+        logical_sector_size: 512,
+        physical_sector_size: 512,
+        partition_table_type: None,
+        partitions: vec![],
+        mountpoints: vec![],
+        safety: DeviceSafety::Safe,
+        smart: None,
+    };
+
+    let case = CaseMetadata {
+        case_number: "CASE-ABORT".to_string(),
+        location_ea: "01".to_string(),
+        evidence_number: "CF01".to_string(),
+        authority: "DFIR Unit".to_string(),
+        examiner: "Examiner".to_string(),
+        description: "Test Abort".to_string(),
+        notes: "".to_string(),
+    };
+
+    let out_dir = temp_dir.join("evidence_output");
+    let config = AcquisitionConfig {
+        format: models::config::ImageFormat::Raw,
+        output_dir: out_dir.clone(),
+        ..Default::default()
+    };
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(50);
+    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Trigger abort flag immediately
+    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let res =
+        engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
+
+    assert!(res.is_err(), "Must return Err on abort");
+    let err_msg = res.unwrap_err();
+    assert!(err_msg.contains("aborted by user"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
 }
