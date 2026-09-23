@@ -15,6 +15,7 @@ use crate::models::{
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 pub async fn handle_list(args: ListArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -54,17 +55,138 @@ pub async fn handle_list(args: ListArgs) -> Result<(), Box<dyn std::error::Error
 }
 
 pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let devices = DeviceScanner::scan_devices().unwrap_or_default();
-    let target_dev = if let Some(d) = devices
-        .into_iter()
-        .find(|d| d.path == args.device || d.name == args.device)
+    let target_path = Path::new(&args.device);
+    let canonical_path = std::fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let canonical_str = canonical_path.to_string_lossy().to_string();
+
+    if !target_path.exists() && !canonical_path.exists() {
+        return Err(format!("Target device or file not found: {}", args.device).into());
+    }
+
+    let meta = std::fs::symlink_metadata(&canonical_path)
+        .map_err(|e| format!("Failed to inspect target {}: {}", canonical_path.display(), e))?;
+
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::FileTypeExt;
+        let ft = meta.file_type();
+        if !ft.is_file() && !ft.is_block_device() {
+            return Err(format!(
+                "Critical Safety Error: Target {} is neither a regular file nor a recognized block device.",
+                args.device
+            ).into());
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if !meta.is_file() {
+            return Err(format!(
+                "Critical Safety Error: Target {} is not a regular file.",
+                args.device
+            ).into());
+        }
+    }
+
+    let devices = DeviceScanner::scan_devices().unwrap_or_default();
+
+    let mut matched_device: Option<BlockDevice> = None;
+
+    // 1. Check for whole disks
+    for dev in &devices {
+        let is_dev_match = dev.path == args.device
+            || dev.name == args.device
+            || dev.path == canonical_str
+            || dev.devlinks.iter().any(|link| link == &args.device || link == &canonical_str);
+
+        let is_canonical_match = std::fs::canonicalize(&dev.path).ok() == Some(canonical_path.clone());
+
+        if is_dev_match || is_canonical_match {
+            matched_device = Some(dev.clone());
+            break;
+        }
+    }
+
+    // 2. Check for partitions on all discovered disks
+    if matched_device.is_none() {
+        for dev in &devices {
+            for part in &dev.partitions {
+                let is_part_match = part.path == args.device
+                    || part.name == args.device
+                    || part.path == canonical_str;
+                let is_part_canonical =
+                    std::fs::canonicalize(&part.path).ok() == Some(canonical_path.clone());
+
+                if is_part_match || is_part_canonical {
+                    let part_mounts = if let Some(ref m) = part.mountpoint {
+                        vec![m.clone()]
+                    } else {
+                        Vec::new()
+                    };
+                    let direct_part_safety = SafetyChecker::evaluate_safety(&part_mounts, false);
+
+                    // Inherit parent system disk safety if parent is system
+                    let safety = match (&dev.safety, direct_part_safety) {
+                        (DeviceSafety::SystemDisk(parent_mounts), _) => {
+                            DeviceSafety::SystemDisk(parent_mounts.clone())
+                        }
+                        (_, DeviceSafety::SystemDisk(mounts)) => DeviceSafety::SystemDisk(mounts),
+                        (_, DeviceSafety::Mounted(mounts)) => DeviceSafety::Mounted(mounts),
+                        (DeviceSafety::Mounted(parent_mounts), DeviceSafety::Safe) => {
+                            DeviceSafety::Mounted(parent_mounts.clone())
+                        }
+                        (DeviceSafety::Safe, DeviceSafety::Safe) => DeviceSafety::Safe,
+                    };
+
+                    matched_device = Some(BlockDevice {
+                        name: part.name.clone(),
+                        path: part.path.clone(),
+                        devlinks: Vec::new(),
+                        size_bytes: part.size_bytes,
+                        model: dev.model.clone(),
+                        vendor: dev.vendor.clone(),
+                        serial: dev.serial.clone(),
+                        wwn: dev.wwn.clone(),
+                        revision: dev.revision.clone(),
+                        bus_type: dev.bus_type.clone(),
+                        is_rotational: dev.is_rotational,
+                        is_removable: dev.is_removable,
+                        is_read_only: part.is_read_only,
+                        logical_sector_size: dev.logical_sector_size,
+                        physical_sector_size: dev.physical_sector_size,
+                        partition_table_type: None,
+                        partitions: Vec::new(),
+                        mountpoints: part_mounts,
+                        safety,
+                        smart: dev.smart.clone(),
+                    });
+                    break;
+                }
+            }
+            if matched_device.is_some() {
+                break;
+            }
+        }
+    }
+
+    let target_dev = if let Some(d) = matched_device {
         d
-    } else if Path::new(&args.device).exists() {
-        let path = Path::new(&args.device);
-        let meta = std::fs::metadata(path)?;
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            let ft = meta.file_type();
+            if ft.is_block_device() {
+                return Err(format!(
+                    "Critical Safety Error: Block device {} could not be verified by system discovery. Refusing to acquire unverified block device in CLI mode.",
+                    args.device
+                ).into());
+            }
+        }
+
+        // Regular file fallback for testing/conversion
         let size_bytes = meta.len();
-        let name = path
+        let name = target_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("target")
@@ -75,9 +197,9 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
             path: args.device.clone(),
             devlinks: Vec::new(),
             size_bytes,
-            model: Some(format!("Source File/Disk {}", name)),
+            model: Some(format!("Source File/Image {}", name)),
             vendor: Some("Generic".to_string()),
-            serial: Some(format!("TEST_{}", name.to_uppercase())),
+            serial: Some(format!("FILE_{}", name.to_uppercase())),
             wwn: None,
             revision: None,
             bus_type: "FILE/IMAGE".to_string(),
@@ -92,8 +214,6 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
             safety: DeviceSafety::Safe,
             smart: None,
         }
-    } else {
-        return Err(format!("Target device or file not found: {}", args.device).into());
     };
 
     println!("\n[+] Target Device Selected: {}", target_dev.path);
@@ -171,6 +291,7 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
         error_retries: args.retries,
         wipe_bad_sectors: true,
         rescue_mode: args.rescue,
+        resume: args.resume,
     };
 
     std::fs::create_dir_all(&config.output_dir)?;
@@ -341,7 +462,153 @@ pub async fn handle_convert(args: ConvertArgs) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+pub fn is_ewf_image_file(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if ext == "e01" || ext == "s01" {
+        return true;
+    }
+
+    if let Ok(mut f) = std::fs::File::open(path) {
+        use std::io::Read;
+        let mut magic = [0u8; 6];
+        if f.read_exact(&mut magic).is_ok() && &magic == b"EVF\x09\x0d\x0a" {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub async fn handle_verify_ewf(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
+    println!("\n[*] Forensic E01 Decoded Stream Verifier (ewfverify)");
+    println!("    Target EWF Segment: {}", args.image.display());
+
+    let mut cmd = tokio::process::Command::new("ewfverify");
+    cmd.arg("-d").arg("md5,sha1,sha256");
+    cmd.arg(&args.image);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        format!("Failed to spawn ewfverify (ensure libewf is installed): {}", e)
+    })?;
+
+    let stdout = child.stdout.take().ok_or("Failed to capture ewfverify stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to capture ewfverify stderr")?;
+
+    let mut reader_out = tokio::io::BufReader::new(stdout).lines();
+    let mut reader_err = tokio::io::BufReader::new(stderr).lines();
+
+    let regex_md5 = regex::Regex::new(r"MD5 hash calculated over data:\s*([a-fA-F0-9]{32})").unwrap();
+    let regex_sha1 = regex::Regex::new(r"SHA1 hash calculated over data:\s*([a-fA-F0-9]{40})").unwrap();
+    let regex_sha256 = regex::Regex::new(r"SHA256 hash calculated over data:\s*([a-fA-F0-9]{64})").unwrap();
+
+    let mut calc_md5 = None;
+    let mut calc_sha1 = None;
+    let mut calc_sha256 = None;
+    let mut verify_success = false;
+
+    let mut out_closed = false;
+    let mut err_closed = false;
+
+    while !out_closed || !err_closed {
+        tokio::select! {
+            line = reader_out.next_line(), if !out_closed => {
+                match line {
+                    Ok(Some(l)) => {
+                        let text = l.trim();
+                        if text.contains("ewfverify: SUCCESS") {
+                            verify_success = true;
+                        }
+                        if let Some(caps) = regex_md5.captures(text) {
+                            calc_md5 = Some(caps[1].to_lowercase());
+                        }
+                        if let Some(caps) = regex_sha1.captures(text) {
+                            calc_sha1 = Some(caps[1].to_lowercase());
+                        }
+                        if let Some(caps) = regex_sha256.captures(text) {
+                            calc_sha256 = Some(caps[1].to_lowercase());
+                        }
+                    }
+                    Ok(None) | Err(_) => out_closed = true,
+                }
+            }
+            line = reader_err.next_line(), if !err_closed => {
+                match line {
+                    Ok(Some(l)) => {
+                        let text = l.trim();
+                        if !text.is_empty() {
+                            eprintln!("[ewfverify] {}", text);
+                        }
+                    }
+                    Ok(None) | Err(_) => err_closed = true,
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await?;
+    println!("\n================================================================================");
+    println!("  MD5 (decoded data)   : {}", calc_md5.as_deref().unwrap_or("N/A"));
+    println!("  SHA-1 (decoded data) : {}", calc_sha1.as_deref().unwrap_or("N/A"));
+    println!("  SHA-256 (decoded data): {}", calc_sha256.as_deref().unwrap_or("N/A"));
+    println!("================================================================================");
+
+    let any_checked = args.md5.is_some() || args.sha1.is_some() || args.sha256.is_some();
+    let mut all_match = true;
+
+    if let (Some(exp), Some(calc)) = (&args.md5, &calc_md5) {
+        if exp.eq_ignore_ascii_case(calc) {
+            println!("  [+] MD5 MATCH");
+        } else {
+            println!("  [!] MD5 MISMATCH! Expected: {}", exp);
+            all_match = false;
+        }
+    }
+    if let (Some(exp), Some(calc)) = (&args.sha1, &calc_sha1) {
+        if exp.eq_ignore_ascii_case(calc) {
+            println!("  [+] SHA-1 MATCH");
+        } else {
+            println!("  [!] SHA-1 MISMATCH! Expected: {}", exp);
+            all_match = false;
+        }
+    }
+    if let (Some(exp), Some(calc)) = (&args.sha256, &calc_sha256) {
+        if exp.eq_ignore_ascii_case(calc) {
+            println!("  [+] SHA-256 MATCH");
+        } else {
+            println!("  [!] SHA-256 MISMATCH! Expected: {}", exp);
+            all_match = false;
+        }
+    }
+
+    if !status.success() || !verify_success {
+        println!("\n[!] VERIFICATION RESULT: FAILED (EWF structure or media checksum error)");
+        return Err("EWF image verification failed".into());
+    }
+
+    if !any_checked {
+        println!("\n[*] HASH COMPUTATION COMPLETE (No verification hashes supplied, EWF structure verified)");
+        Ok(())
+    } else if all_match {
+        println!("\n[+] VERIFICATION RESULT: PASSED");
+        Ok(())
+    } else {
+        println!("\n[!] VERIFICATION RESULT: FAILED (INTEGRITY ERROR)");
+        Err("Cryptographic hash mismatch".into())
+    }
+}
+
 pub async fn handle_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if is_ewf_image_file(&args.image) {
+        return handle_verify_ewf(args).await;
+    }
+
     println!("\n[*] Cryptographic Image Integrity Verifier");
     println!("    Image: {}", args.image.display());
 

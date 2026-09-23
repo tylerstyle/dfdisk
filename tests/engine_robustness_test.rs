@@ -420,3 +420,265 @@ async fn test_raw_acquisition_abort_reactivity() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[tokio::test]
+async fn test_raw_acquisition_destination_exists_refusal() {
+    let temp_dir = std::env::temp_dir().join("dfdisk_test_raw_exists_refusal");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let source_disk = temp_dir.join("source.bin");
+    std::fs::write(&source_disk, b"sample source data").unwrap();
+
+    let out_dir = temp_dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let case = CaseMetadata {
+        case_number: "CASE01".to_string(),
+        location_ea: "01".to_string(),
+        evidence_number: "CF01".to_string(),
+        authority: "DFIR".to_string(),
+        examiner: "Examiner".to_string(),
+        description: "Test".to_string(),
+        notes: "".to_string(),
+    };
+    let device = BlockDevice {
+        name: "test_dev".to_string(),
+        path: source_disk.to_string_lossy().to_string(),
+        devlinks: vec![],
+        size_bytes: 18,
+        model: Some("Test".to_string()),
+        vendor: Some("Test".to_string()),
+        serial: Some("SER001".to_string()),
+        wwn: None,
+        revision: None,
+        bus_type: "Virtual".to_string(),
+        is_rotational: Some(false),
+        is_removable: false,
+        is_read_only: false,
+        logical_sector_size: 512,
+        physical_sector_size: 512,
+        partition_table_type: None,
+        partitions: vec![],
+        mountpoints: vec![],
+        safety: DeviceSafety::Safe,
+        smart: None,
+    };
+    let config = AcquisitionConfig {
+        format: models::config::ImageFormat::Raw,
+        output_dir: out_dir.clone(),
+        ..Default::default()
+    };
+
+    // Pre-create the destination raw file
+    let expected_dest = out_dir.join(case.generate_filename(&device.display_serial(), "raw"));
+    std::fs::write(&expected_dest, b"already existing file").unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(50);
+    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let res = engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
+
+    assert!(res.is_err(), "Must fail if destination RAW already exists");
+    let err = res.unwrap_err();
+    assert!(err.contains("already exists"), "Error was: {}", err);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_raw_acquisition_source_destination_collision() {
+    let temp_dir = std::env::temp_dir().join("dfdisk_test_raw_collision");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let out_dir = temp_dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let case = CaseMetadata {
+        case_number: "CASE01".to_string(),
+        location_ea: "01".to_string(),
+        evidence_number: "CF01".to_string(),
+        authority: "DFIR".to_string(),
+        examiner: "Examiner".to_string(),
+        description: "Test".to_string(),
+        notes: "".to_string(),
+    };
+    let serial = "COLLIDE01";
+    let target_filename = case.generate_filename(serial, "raw");
+    let source_disk = out_dir.join(&target_filename);
+    std::fs::write(&source_disk, b"precious evidence data that must not be truncated").unwrap();
+
+    let device = BlockDevice {
+        name: "test_dev".to_string(),
+        path: source_disk.to_string_lossy().to_string(),
+        devlinks: vec![],
+        size_bytes: 51,
+        model: Some("Test".to_string()),
+        vendor: Some("Test".to_string()),
+        serial: Some(serial.to_string()),
+        wwn: None,
+        revision: None,
+        bus_type: "Virtual".to_string(),
+        is_rotational: Some(false),
+        is_removable: false,
+        is_read_only: false,
+        logical_sector_size: 512,
+        physical_sector_size: 512,
+        partition_table_type: None,
+        partitions: vec![],
+        mountpoints: vec![],
+        safety: DeviceSafety::Safe,
+        smart: None,
+    };
+    let config = AcquisitionConfig {
+        format: models::config::ImageFormat::Raw,
+        output_dir: out_dir.clone(),
+        ..Default::default()
+    };
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(50);
+    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let res = engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
+
+    assert!(res.is_err(), "Must fail when destination matches source");
+    // Ensure the source file was NOT truncated to 0 bytes!
+    let data = std::fs::read(&source_disk).unwrap();
+    assert_eq!(data, b"precious evidence data that must not be truncated");
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_raw_acquisition_incomplete_size_mismatch() {
+    let temp_dir = std::env::temp_dir().join("dfdisk_test_raw_size_mismatch");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let source_disk = temp_dir.join("truncated_source.bin");
+    std::fs::write(&source_disk, b"short data").unwrap(); // 10 bytes
+
+    let out_dir = temp_dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let case = CaseMetadata {
+        case_number: "CASE01".to_string(),
+        location_ea: "01".to_string(),
+        evidence_number: "CF01".to_string(),
+        authority: "DFIR".to_string(),
+        examiner: "Examiner".to_string(),
+        description: "Test".to_string(),
+        notes: "".to_string(),
+    };
+    let device = BlockDevice {
+        name: "test_dev".to_string(),
+        path: source_disk.to_string_lossy().to_string(),
+        devlinks: vec![],
+        size_bytes: 1000, // Device reported 1000 bytes, but file only has 10!
+        model: Some("Test".to_string()),
+        vendor: Some("Test".to_string()),
+        serial: Some("SER_MISMATCH".to_string()),
+        wwn: None,
+        revision: None,
+        bus_type: "Virtual".to_string(),
+        is_rotational: Some(false),
+        is_removable: false,
+        is_read_only: false,
+        logical_sector_size: 512,
+        physical_sector_size: 512,
+        partition_table_type: None,
+        partitions: vec![],
+        mountpoints: vec![],
+        safety: DeviceSafety::Safe,
+        smart: None,
+    };
+    let config = AcquisitionConfig {
+        format: models::config::ImageFormat::Raw,
+        output_dir: out_dir.clone(),
+        ..Default::default()
+    };
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(50);
+    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let res = engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
+
+    assert!(res.is_err(), "Must fail when bytes copied != expected device size");
+    let err = res.unwrap_err();
+    assert!(err.contains("Acquisition incomplete"), "Error was: {}", err);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_rescue_stale_files_refusal_without_resume() {
+    let temp_dir = std::env::temp_dir().join("dfdisk_test_rescue_stale_refusal");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let source_disk = temp_dir.join("source.bin");
+    std::fs::write(&source_disk, b"source").unwrap();
+
+    let out_dir = temp_dir.join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let case = CaseMetadata {
+        case_number: "CASE01".to_string(),
+        location_ea: "01".to_string(),
+        evidence_number: "CF01".to_string(),
+        authority: "DFIR".to_string(),
+        examiner: "Examiner".to_string(),
+        description: "Test".to_string(),
+        notes: "".to_string(),
+    };
+    let device = BlockDevice {
+        name: "test_dev".to_string(),
+        path: source_disk.to_string_lossy().to_string(),
+        devlinks: vec![],
+        size_bytes: 6,
+        model: Some("Test".to_string()),
+        vendor: Some("Test".to_string()),
+        serial: Some("RESCUE001".to_string()),
+        wwn: None,
+        revision: None,
+        bus_type: "Virtual".to_string(),
+        is_rotational: Some(false),
+        is_removable: false,
+        is_read_only: false,
+        logical_sector_size: 512,
+        physical_sector_size: 512,
+        partition_table_type: None,
+        partitions: vec![],
+        mountpoints: vec![],
+        safety: DeviceSafety::Safe,
+        smart: None,
+    };
+    let config = AcquisitionConfig {
+        format: models::config::ImageFormat::E01,
+        compression: models::config::CompressionLevel::Fast,
+        split_size: models::config::SplitSize::TwoGb,
+        output_dir: out_dir.clone(),
+        rescue_mode: true,
+        resume: false,
+        ..Default::default()
+    };
+
+    // Pre-create existing mapfile
+    let base_name = case.generate_base_filename(&device.display_serial());
+    let existing_map = out_dir.join(format!("{}.map", base_name));
+    std::fs::write(&existing_map, b"# ddrescue mapfile\n").unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(50);
+    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let res = engines::rescue::RescueAcquireEngine::run_rescue(device, case, config, tx, abort).await;
+
+    assert!(res.is_err(), "Must refuse to silently overwrite or reuse existing mapfile without --resume");
+    let err = res.unwrap_err();
+    assert!(err.contains("already exists"), "Error was: {}", err);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+

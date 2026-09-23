@@ -37,6 +37,64 @@ impl RescueAcquireEngine {
         let raw_path = config.output_dir.join(&raw_filename);
         let map_path = config.output_dir.join(&map_filename);
 
+        // Check canonical path identity collision between source and outputs
+        if let (Ok(c_src), Ok(c_raw)) = (
+            std::fs::canonicalize(&device.path),
+            std::fs::canonicalize(&raw_path),
+        ) {
+            if c_src == c_raw {
+                return Err(format!(
+                    "Critical Safety Error: ddrescue destination {} points to the same file or device as source {}!",
+                    raw_path.display(),
+                    device.path
+                ));
+            }
+        }
+        if let (Ok(c_src), Ok(c_map)) = (
+            std::fs::canonicalize(&device.path),
+            std::fs::canonicalize(&map_path),
+        ) {
+            if c_src == c_map {
+                return Err(format!(
+                    "Critical Safety Error: ddrescue mapfile {} points to the same file or device as source {}!",
+                    map_path.display(),
+                    device.path
+                ));
+            }
+        }
+
+        // Prevent silent reuse of stale evidence vs explicit resume
+        if !config.resume {
+            if raw_path.exists() || map_path.exists() {
+                return Err(format!(
+                    "Destination image or mapfile already exists (image: {}, map: {}). Refusing to overwrite or silently reuse existing rescue data. Specify --resume to explicitly continue an interrupted rescue.",
+                    raw_path.display(),
+                    map_path.display()
+                ));
+            }
+        } else {
+            if !map_path.exists() {
+                return Err(format!(
+                    "Cannot resume rescue: ddrescue mapfile does not exist: {}",
+                    map_path.display()
+                ));
+            }
+            if !raw_path.exists() {
+                return Err(format!(
+                    "Cannot resume rescue: destination RAW image does not exist: {}",
+                    raw_path.display()
+                ));
+            }
+            let map_meta = std::fs::metadata(&map_path)
+                .map_err(|e| format!("Failed to read rescue mapfile metadata: {}", e))?;
+            if map_meta.len() == 0 {
+                return Err(format!(
+                    "Rescue mapfile {} is empty (0 bytes); cannot resume from empty mapfile.",
+                    map_path.display()
+                ));
+            }
+        }
+
         let mut cmd = Command::new("ddrescue");
         cmd.arg("-d"); // Direct I/O
         cmd.arg("-r").arg(config.error_retries.to_string());
@@ -197,12 +255,13 @@ impl RescueAcquireEngine {
         telemetry.status_message = "Computing cryptographic integrity hashes...".to_string();
         let _ = progress_tx.send(telemetry.clone()).await;
 
-        let hashes = MultiHasher::hash_stream(
+        let hashes = MultiHasher::hash_stream_with_abort(
             &raw_path,
             config.calc_md5,
             config.calc_sha1,
             config.calc_sha256,
             None,
+            Some(abort_flag),
         )
         .await?;
 
@@ -219,12 +278,18 @@ impl RescueAcquireEngine {
             map_path.to_string_lossy().to_string(),
         ];
 
+        // Record effective engine settings: ddrescue always outputs RAW with no compression or splitting
+        let mut effective_config = config.clone();
+        effective_config.format = crate::models::config::ImageFormat::Raw;
+        effective_config.compression = crate::models::config::CompressionLevel::None;
+        effective_config.split_size = crate::models::config::SplitSize::None;
+
         let report = ForensicInfoReport {
             tool_name: "dfdisk (ddrescue engine)".to_string(),
             tool_version: env!("CARGO_PKG_VERSION").to_string(),
             case_metadata: case.clone(),
             device: device.clone(),
-            config: config.clone(),
+            config: effective_config,
             started_at: start_time,
             ended_at: end_time,
             elapsed_seconds,
@@ -240,9 +305,24 @@ impl RescueAcquireEngine {
             generated_files,
         };
 
+        // Write court certificate sidecar atomically and propagate errors
         let info_filename = case.generate_filename(&device.display_serial(), "info");
         let info_path = config.output_dir.join(&info_filename);
-        let _ = std::fs::write(&info_path, report.render_text());
+        let tmp_info_path = config.output_dir.join(format!("{}.tmp", info_filename));
+        std::fs::write(&tmp_info_path, report.render_text()).map_err(|e| {
+            format!(
+                "Failed to write forensic report to temporary file {}: {}",
+                tmp_info_path.display(),
+                e
+            )
+        })?;
+        std::fs::rename(&tmp_info_path, &info_path).map_err(|e| {
+            format!(
+                "Failed to finalize forensic report {}: {}",
+                info_path.display(),
+                e
+            )
+        })?;
 
         telemetry.status = AcquisitionStatus::Completed;
         telemetry.percentage = 100.0;

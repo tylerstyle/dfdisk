@@ -86,6 +86,7 @@ fn test_subcommand_help() {
     assert!(acq_str.contains("--split"));
     assert!(acq_str.contains("--compression"));
     assert!(acq_str.contains("--rescue"));
+    assert!(acq_str.contains("--resume"));
     assert!(acq_str.contains("--auto-unmount"));
 
     // 3. convert --help
@@ -375,3 +376,34 @@ EOF
 
     let _ = std::fs::remove_dir_all(temp_dir);
 }
+
+#[test]
+fn test_acquire_rejects_nonexistent() {
+    let output = Command::new(BIN)
+        .args(["acquire", "/nonexistent/device/path/12345"])
+        .output()
+        .expect("Failed to execute dfdisk acquire");
+
+    assert!(!output.status.success(), "Must exit non-zero for non-existent target");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Target device or file not found") || stderr.contains("not found"));
+}
+
+#[test]
+fn test_acquire_rejects_directory() {
+    let temp_dir = std::env::temp_dir().join("dfdisk_test_acquire_dir");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let output = Command::new(BIN)
+        .args(["acquire", &temp_dir.to_string_lossy()])
+        .output()
+        .expect("Failed to execute dfdisk acquire");
+
+    assert!(!output.status.success(), "Must exit non-zero when target is a directory");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Critical Safety Error") || stderr.contains("neither a regular file"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+

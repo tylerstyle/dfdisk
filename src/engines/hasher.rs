@@ -6,6 +6,8 @@ use sha2::Sha256;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
@@ -29,11 +31,24 @@ impl MultiHasher {
         calc_sha256: bool,
         progress_tx: Option<mpsc::Sender<HashProgress>>,
     ) -> Result<HashResults, String> {
-        Self::hash_stream_with_capacity(path, calc_md5, calc_sha1, calc_sha256, None, progress_tx)
+        Self::hash_stream_with_capacity(path, calc_md5, calc_sha1, calc_sha256, None, progress_tx, None)
             .await
     }
 
-    /// Computes MD5, SHA-1, and SHA-256 simultaneously with an optional pre-discovered device size
+    /// Computes MD5, SHA-1, and SHA-256 simultaneously with an optional abort flag
+    pub async fn hash_stream_with_abort(
+        path: &Path,
+        calc_md5: bool,
+        calc_sha1: bool,
+        calc_sha256: bool,
+        progress_tx: Option<mpsc::Sender<HashProgress>>,
+        abort_flag: Option<Arc<AtomicBool>>,
+    ) -> Result<HashResults, String> {
+        Self::hash_stream_with_capacity(path, calc_md5, calc_sha1, calc_sha256, None, progress_tx, abort_flag)
+            .await
+    }
+
+    /// Computes MD5, SHA-1, and SHA-256 simultaneously with an optional pre-discovered device size and abort flag
     pub async fn hash_stream_with_capacity(
         path: &Path,
         calc_md5: bool,
@@ -41,6 +56,7 @@ impl MultiHasher {
         calc_sha256: bool,
         known_size: Option<u64>,
         progress_tx: Option<mpsc::Sender<HashProgress>>,
+        abort_flag: Option<Arc<AtomicBool>>,
     ) -> Result<HashResults, String> {
         let path_buf = path.to_path_buf();
 
@@ -97,6 +113,12 @@ impl MultiHasher {
             let mut last_report = Instant::now();
 
             loop {
+                if let Some(ref abort) = abort_flag {
+                    if abort.load(Ordering::Relaxed) {
+                        return Err("Hashing aborted by user.".to_string());
+                    }
+                }
+
                 let n = reader.read(&mut buffer).map_err(|e| {
                     format!("Read error while hashing {}: {}", path_buf.display(), e)
                 })?;

@@ -108,6 +108,7 @@ pub struct AcquisitionConfig {
     pub error_retries: u32,
     pub wipe_bad_sectors: bool,
     pub rescue_mode: bool,
+    pub resume: bool,
 }
 
 impl Default for AcquisitionConfig {
@@ -123,6 +124,7 @@ impl Default for AcquisitionConfig {
             error_retries: 2,
             wipe_bad_sectors: true,
             rescue_mode: false,
+            resume: false,
         }
     }
 }
