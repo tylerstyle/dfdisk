@@ -31,8 +31,16 @@ impl MultiHasher {
         calc_sha256: bool,
         progress_tx: Option<mpsc::Sender<HashProgress>>,
     ) -> Result<HashResults, String> {
-        Self::hash_stream_with_capacity(path, calc_md5, calc_sha1, calc_sha256, None, progress_tx, None)
-            .await
+        Self::hash_stream_with_capacity(
+            path,
+            calc_md5,
+            calc_sha1,
+            calc_sha256,
+            None,
+            progress_tx,
+            None,
+        )
+        .await
     }
 
     /// Computes MD5, SHA-1, and SHA-256 simultaneously with an optional abort flag
@@ -44,8 +52,16 @@ impl MultiHasher {
         progress_tx: Option<mpsc::Sender<HashProgress>>,
         abort_flag: Option<Arc<AtomicBool>>,
     ) -> Result<HashResults, String> {
-        Self::hash_stream_with_capacity(path, calc_md5, calc_sha1, calc_sha256, None, progress_tx, abort_flag)
-            .await
+        Self::hash_stream_with_capacity(
+            path,
+            calc_md5,
+            calc_sha1,
+            calc_sha256,
+            None,
+            progress_tx,
+            abort_flag,
+        )
+        .await
     }
 
     /// Computes MD5, SHA-1, and SHA-256 simultaneously with an optional pre-discovered device size and abort flag

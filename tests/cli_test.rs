@@ -384,7 +384,10 @@ fn test_acquire_rejects_nonexistent() {
         .output()
         .expect("Failed to execute dfdisk acquire");
 
-    assert!(!output.status.success(), "Must exit non-zero for non-existent target");
+    assert!(
+        !output.status.success(),
+        "Must exit non-zero for non-existent target"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Target device or file not found") || stderr.contains("not found"));
 }
@@ -400,10 +403,12 @@ fn test_acquire_rejects_directory() {
         .output()
         .expect("Failed to execute dfdisk acquire");
 
-    assert!(!output.status.success(), "Must exit non-zero when target is a directory");
+    assert!(
+        !output.status.success(),
+        "Must exit non-zero when target is a directory"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Critical Safety Error") || stderr.contains("neither a regular file"));
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
-
