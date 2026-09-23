@@ -118,6 +118,10 @@ pub struct AcquireArgs {
     #[arg(long)]
     pub rescue: bool,
 
+    /// Explicitly resume an interrupted ddrescue acquisition (requires existing mapfile)
+    #[arg(long)]
+    pub resume: bool,
+
     /// Automatically unmount mounted partitions on target device
     #[arg(long)]
     pub auto_unmount: bool,

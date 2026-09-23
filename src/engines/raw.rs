@@ -65,14 +65,54 @@ impl RawAcquireEngine {
                 let mut src_file = File::open(&src_path)
                     .map_err(|e| format!("Failed to open source device {}: {}", src_path, e))?;
 
+                let src_meta = src_file
+                    .metadata()
+                    .map_err(|e| format!("Failed to read metadata for source device {}: {}", src_path, e))?;
+
+                // Check for destination collisions before opening
+                if target_raw_path.exists() {
+                    return Err(format!(
+                        "Destination RAW image already exists: {}. Refusing to overwrite existing evidence image.",
+                        target_raw_path.display()
+                    ));
+                }
+
+                // Check canonical path identity collision
+                if let (Ok(c_src), Ok(c_dest)) = (
+                    std::fs::canonicalize(&src_path),
+                    std::fs::canonicalize(&target_raw_path),
+                ) {
+                    if c_src == c_dest {
+                        return Err(format!(
+                            "Critical Safety Error: Destination {} points to the same file or block device identity as source {}!",
+                            target_raw_path.display(),
+                            src_path
+                        ));
+                    }
+                }
+
+                // Verify identity collision on Unix
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if let Ok(dest_meta) = std::fs::symlink_metadata(&target_raw_path) {
+                        if dest_meta.dev() == src_meta.dev() && dest_meta.ino() == src_meta.ino() {
+                            return Err(format!(
+                                "Critical Safety Error: Destination {} has the same file identity as source {}!",
+                                target_raw_path.display(),
+                                src_path
+                            ));
+                        }
+                    }
+                }
+
                 let mut dest_file = OpenOptions::new()
-                    .create(true)
                     .write(true)
-                    .truncate(true)
+                    .create_new(true)
                     .open(&target_raw_path)
                     .map_err(|e| {
                         format!(
-                            "Failed to create RAW destination file {}: {}",
+                            "Failed to exclusively create RAW destination file {}: {}",
                             target_raw_path.display(),
                             e
                         )
@@ -198,6 +238,15 @@ impl RawAcquireEngine {
                     .sync_all()
                     .map_err(|e| format!("Failed to sync RAW file to disk: {}", e))?;
 
+                // Enforce expected device size match
+                if total_device_bytes > 0 && bytes_processed != total_device_bytes {
+                    let _ = std::fs::remove_file(&target_raw_path);
+                    return Err(format!(
+                        "Acquisition incomplete: copied {} bytes, but source device reported {} bytes",
+                        bytes_processed, total_device_bytes
+                    ));
+                }
+
                 let source_hashes = HashResults {
                     md5: md5_hasher.map(|h| hex::encode(h.finalize())),
                     sha1: sha1_hasher.map(|h| hex::encode(h.finalize())),
@@ -238,6 +287,7 @@ impl RawAcquireEngine {
 
         let (v_tx, mut v_rx) = mpsc::channel::<HashProgress>(50);
         let raw_path_clone = raw_path.clone();
+        let verif_abort = abort_flag.clone();
 
         let verif_handle = tokio::spawn(async move {
             MultiHasher::hash_stream_with_capacity(
@@ -247,21 +297,37 @@ impl RawAcquireEngine {
                 config.calc_sha256,
                 Some(bytes_copied),
                 Some(v_tx),
+                Some(verif_abort),
             )
             .await
         });
 
         while let Some(hp) = v_rx.recv().await {
+            if abort_flag.load(Ordering::Relaxed) {
+                telemetry.status = AcquisitionStatus::Aborted;
+                let _ = progress_tx.send(telemetry).await;
+                return Err("RAW verification aborted by user.".to_string());
+            }
             telemetry.percentage = hp.percentage;
             telemetry.speed_bps = hp.speed_bps;
             telemetry.status_message = format!("Verifying RAW image: {:.1}%", hp.percentage);
             let _ = progress_tx.send(telemetry.clone()).await;
         }
 
-        let destination_hashes = verif_handle
-            .await
-            .map_err(|e| format!("Verification task error: {}", e))?
-            .map_err(|e| format!("Failed to compute destination image hashes: {}", e))?;
+        let destination_hashes = match verif_handle.await {
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => {
+                telemetry.status = AcquisitionStatus::Failed(e.clone());
+                let _ = progress_tx.send(telemetry).await;
+                return Err(e);
+            }
+            Err(e) => {
+                let msg = format!("Verification task error: {}", e);
+                telemetry.status = AcquisitionStatus::Failed(msg.clone());
+                let _ = progress_tx.send(telemetry).await;
+                return Err(msg);
+            }
+        };
 
         let end_time = Utc::now();
         let elapsed_seconds = instant_start.elapsed().as_secs();
@@ -323,10 +389,24 @@ impl RawAcquireEngine {
             generated_files,
         };
 
-        // Write court certificate sidecar
+        // Write court certificate sidecar atomically and propagate errors
         let info_filename = case.generate_filename(&device.display_serial(), "info");
         let info_path = config.output_dir.join(&info_filename);
-        let _ = std::fs::write(&info_path, report.render_text());
+        let tmp_info_path = config.output_dir.join(format!("{}.tmp", info_filename));
+        std::fs::write(&tmp_info_path, report.render_text()).map_err(|e| {
+            format!(
+                "Failed to write forensic report to temporary file {}: {}",
+                tmp_info_path.display(),
+                e
+            )
+        })?;
+        std::fs::rename(&tmp_info_path, &info_path).map_err(|e| {
+            format!(
+                "Failed to finalize forensic report {}: {}",
+                info_path.display(),
+                e
+            )
+        })?;
 
         telemetry.status = AcquisitionStatus::Completed;
         telemetry.percentage = 100.0;

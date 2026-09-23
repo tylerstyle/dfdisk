@@ -299,6 +299,95 @@ impl EwfAcquireEngine {
         }
         generated_files.sort();
 
+        if generated_files.is_empty() {
+            return Err("No EWF segment files found in output directory after acquisition".to_string());
+        }
+
+        // Post-acquisition independent destination verification pass using ewfverify
+        telemetry.status = AcquisitionStatus::Verifying;
+        telemetry.percentage = 0.0;
+        telemetry.status_message = "Verifying written E01 image via ewfverify...".to_string();
+        telemetry.push_log("Beginning post-acquisition destination verification pass via ewfverify...");
+        let _ = progress_tx.send(telemetry.clone()).await;
+
+        let first_segment = &generated_files[0];
+        let mut v_cmd = Command::new("ewfverify");
+        v_cmd.arg("-d").arg("md5,sha1,sha256");
+        v_cmd.arg(first_segment);
+        v_cmd.stdout(Stdio::piped());
+        v_cmd.stderr(Stdio::piped());
+
+        let mut v_child = v_cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn ewfverify: {}", e))?;
+
+        let v_stdout = v_child.stdout.take().ok_or("Failed to capture ewfverify stdout")?;
+        let v_stderr = v_child.stderr.take().ok_or("Failed to capture ewfverify stderr")?;
+
+        let mut v_reader_out = BufReader::new(v_stdout).lines();
+        let mut v_reader_err = BufReader::new(v_stderr).lines();
+
+        let mut dest_md5: Option<String> = None;
+        let mut dest_sha1: Option<String> = None;
+        let mut dest_sha256: Option<String> = None;
+        let mut ewfverify_success = false;
+
+        let mut v_out_closed = false;
+        let mut v_err_closed = false;
+
+        while !v_out_closed || !v_err_closed {
+            if abort_flag.load(Ordering::Relaxed) {
+                let _ = v_child.kill().await;
+                telemetry.status = AcquisitionStatus::Aborted;
+                let _ = progress_tx.send(telemetry).await;
+                return Err("EWF verification aborted by user.".to_string());
+            }
+
+            tokio::select! {
+                line = v_reader_out.next_line(), if !v_out_closed => {
+                    match line {
+                        Ok(Some(l)) => {
+                            let text = l.trim();
+                            if text.contains("ewfverify: SUCCESS") {
+                                ewfverify_success = true;
+                            }
+                            if let Some(caps) = regex_md5.captures(text) {
+                                dest_md5 = Some(caps[1].to_lowercase());
+                            }
+                            if let Some(caps) = regex_sha1.captures(text) {
+                                dest_sha1 = Some(caps[1].to_lowercase());
+                            }
+                            if let Some(caps) = regex_sha256.captures(text) {
+                                dest_sha256 = Some(caps[1].to_lowercase());
+                            }
+                        }
+                        Ok(None) | Err(_) => v_out_closed = true,
+                    }
+                }
+                line = v_reader_err.next_line(), if !v_err_closed => {
+                    match line {
+                        Ok(Some(l)) => {
+                            let text = l.trim();
+                            if !text.is_empty() {
+                                telemetry.push_log(text);
+                                let _ = progress_tx.send(telemetry.clone()).await;
+                            }
+                        }
+                        Ok(None) | Err(_) => v_err_closed = true,
+                    }
+                }
+            }
+        }
+
+        let v_status = v_child
+            .wait()
+            .await
+            .map_err(|e| format!("Failed to wait on ewfverify: {}", e))?;
+
+        if !v_status.success() || !ewfverify_success {
+            telemetry.push_log(format!("ewfverify failed with status {:?}", v_status.code()));
+        }
+
         let source_hashes = HashResults {
             md5: source_md5,
             sha1: source_sha1,
@@ -306,12 +395,15 @@ impl EwfAcquireEngine {
         };
 
         let destination_hashes = HashResults {
-            md5: image_md5,
-            sha1: image_sha1,
-            sha256: image_sha256,
+            md5: dest_md5.or(image_md5),
+            sha1: dest_sha1.or(image_sha1),
+            sha256: dest_sha256.or(image_sha256),
         };
 
-        let hashes_match = verify_ewf_hashes(&source_hashes, &destination_hashes);
+        let hashes_match = v_status.success()
+            && ewfverify_success
+            && verify_ewf_hashes(&source_hashes, &destination_hashes);
+
         let verification_status = if hashes_match {
             VerificationStatus::Verified
         } else if source_hashes.md5.is_some() && destination_hashes.md5.is_some() {
@@ -338,18 +430,28 @@ impl EwfAcquireEngine {
             generated_files: generated_files.clone(),
         };
 
-        // Write .info sidecar report
+        // Write .info sidecar report atomically and propagate errors
         let info_filename = case.generate_filename(&device.display_serial(), "info");
         let info_path = config.output_dir.join(&info_filename);
-        let info_text = report.render_text();
-        if let Err(e) = std::fs::write(&info_path, info_text) {
-            telemetry.push_log(format!("Warning: Failed to write .info file: {}", e));
-        } else {
-            telemetry.push_log(format!(
-                "Forensic certificate saved to: {}",
-                info_path.display()
-            ));
-        }
+        let tmp_info_path = config.output_dir.join(format!("{}.tmp", info_filename));
+        std::fs::write(&tmp_info_path, report.render_text()).map_err(|e| {
+            format!(
+                "Failed to write forensic report to temporary file {}: {}",
+                tmp_info_path.display(),
+                e
+            )
+        })?;
+        std::fs::rename(&tmp_info_path, &info_path).map_err(|e| {
+            format!(
+                "Failed to finalize forensic report {}: {}",
+                info_path.display(),
+                e
+            )
+        })?;
+        telemetry.push_log(format!(
+            "Forensic certificate saved to: {}",
+            info_path.display()
+        ));
 
         telemetry.status = AcquisitionStatus::Completed;
         telemetry.percentage = 100.0;

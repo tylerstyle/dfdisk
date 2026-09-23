@@ -115,6 +115,7 @@ pub struct App {
     pub conv_to_e01: bool,
     pub conv_status_msg: String,
     pub conv_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    pub conv_abort: Option<Arc<AtomicBool>>,
 
     // Autocomplete State
     pub autocomplete_state: Option<crate::tui::autocomplete::PathAutocompleteState>,
@@ -154,6 +155,7 @@ impl App {
             conv_to_e01: true,
             conv_status_msg: "Ready to convert images.".to_string(),
             conv_rx: None,
+            conv_abort: None,
             autocomplete_state: None,
             should_quit: false,
         }
@@ -211,7 +213,13 @@ impl App {
 
     fn handle_key_explorer(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') | KeyCode::Esc => {
+                if let Some(ref abort) = self.conv_abort {
+                    abort.store(true, Ordering::Relaxed);
+                }
+                self.abort_flag.store(true, Ordering::Relaxed);
+                self.should_quit = true;
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.selected_device_idx > 0 {
                     self.selected_device_idx -= 1;
@@ -578,8 +586,21 @@ impl App {
             self.autocomplete_state = None;
         }
 
+        if (key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A'))
+            && self.conv_rx.is_some()
+        {
+            if let Some(ref abort) = self.conv_abort {
+                abort.store(true, Ordering::Relaxed);
+                self.conv_status_msg = "Aborting conversion...".to_string();
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
+                if let Some(ref abort) = self.conv_abort {
+                    abort.store(true, Ordering::Relaxed);
+                }
                 self.current_screen = Screen::DeviceExplorer;
             }
             KeyCode::F(5) => {
@@ -840,8 +861,9 @@ impl App {
             return;
         }
 
-        self.conv_status_msg = "Converting in background...".to_string();
+        self.conv_status_msg = "Converting in background... (Press 'a' or Esc to abort)".to_string();
         let abort = Arc::new(AtomicBool::new(false));
+        self.conv_abort = Some(abort.clone());
         let (tx, rx) = mpsc::channel(1);
         self.conv_rx = Some(rx);
 
@@ -912,6 +934,7 @@ impl App {
                     }
                 }
                 self.conv_rx = None;
+                self.conv_abort = None;
             }
         }
     }
