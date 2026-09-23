@@ -477,7 +477,8 @@ async fn test_raw_acquisition_destination_exists_refusal() {
     let (tx, _rx) = tokio::sync::mpsc::channel(50);
     let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let res = engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
+    let res =
+        engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
 
     assert!(res.is_err(), "Must fail if destination RAW already exists");
     let err = res.unwrap_err();
@@ -507,7 +508,11 @@ async fn test_raw_acquisition_source_destination_collision() {
     let serial = "COLLIDE01";
     let target_filename = case.generate_filename(serial, "raw");
     let source_disk = out_dir.join(&target_filename);
-    std::fs::write(&source_disk, b"precious evidence data that must not be truncated").unwrap();
+    std::fs::write(
+        &source_disk,
+        b"precious evidence data that must not be truncated",
+    )
+    .unwrap();
 
     let device = BlockDevice {
         name: "test_dev".to_string(),
@@ -540,7 +545,8 @@ async fn test_raw_acquisition_source_destination_collision() {
     let (tx, _rx) = tokio::sync::mpsc::channel(50);
     let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let res = engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
+    let res =
+        engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
 
     assert!(res.is_err(), "Must fail when destination matches source");
     // Ensure the source file was NOT truncated to 0 bytes!
@@ -602,9 +608,13 @@ async fn test_raw_acquisition_incomplete_size_mismatch() {
     let (tx, _rx) = tokio::sync::mpsc::channel(50);
     let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let res = engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
+    let res =
+        engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
 
-    assert!(res.is_err(), "Must fail when bytes copied != expected device size");
+    assert!(
+        res.is_err(),
+        "Must fail when bytes copied != expected device size"
+    );
     let err = res.unwrap_err();
     assert!(err.contains("Acquisition incomplete"), "Error was: {}", err);
 
@@ -672,13 +682,15 @@ async fn test_rescue_stale_files_refusal_without_resume() {
     let (tx, _rx) = tokio::sync::mpsc::channel(50);
     let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    let res = engines::rescue::RescueAcquireEngine::run_rescue(device, case, config, tx, abort).await;
+    let res =
+        engines::rescue::RescueAcquireEngine::run_rescue(device, case, config, tx, abort).await;
 
-    assert!(res.is_err(), "Must refuse to silently overwrite or reuse existing mapfile without --resume");
+    assert!(
+        res.is_err(),
+        "Must refuse to silently overwrite or reuse existing mapfile without --resume"
+    );
     let err = res.unwrap_err();
     assert!(err.contains("already exists"), "Error was: {}", err);
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
-
-

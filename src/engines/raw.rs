@@ -60,14 +60,17 @@ impl RawAcquireEngine {
         let (copy_prog_tx, mut copy_prog_rx) = mpsc::channel::<ProgressTelemetry>(100);
         let copy_abort = abort_flag.clone();
 
-        let copy_task =
-            tokio::task::spawn_blocking(move || -> Result<(HashResults, u64), String> {
+        let copy_task = tokio::task::spawn_blocking(
+            move || -> Result<(HashResults, u64), String> {
                 let mut src_file = File::open(&src_path)
                     .map_err(|e| format!("Failed to open source device {}: {}", src_path, e))?;
 
-                let src_meta = src_file
-                    .metadata()
-                    .map_err(|e| format!("Failed to read metadata for source device {}: {}", src_path, e))?;
+                let src_meta = src_file.metadata().map_err(|e| {
+                    format!(
+                        "Failed to read metadata for source device {}: {}",
+                        src_path, e
+                    )
+                })?;
 
                 // Check for destination collisions before opening
                 if target_raw_path.exists() {
@@ -254,7 +257,8 @@ impl RawAcquireEngine {
                 };
 
                 Ok((source_hashes, bytes_processed))
-            });
+            },
+        );
 
         // Forward progress events during copying
         while let Some(prog) = copy_prog_rx.recv().await {

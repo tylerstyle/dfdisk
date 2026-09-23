@@ -300,14 +300,17 @@ impl EwfAcquireEngine {
         generated_files.sort();
 
         if generated_files.is_empty() {
-            return Err("No EWF segment files found in output directory after acquisition".to_string());
+            return Err(
+                "No EWF segment files found in output directory after acquisition".to_string(),
+            );
         }
 
         // Post-acquisition independent destination verification pass using ewfverify
         telemetry.status = AcquisitionStatus::Verifying;
         telemetry.percentage = 0.0;
         telemetry.status_message = "Verifying written E01 image via ewfverify...".to_string();
-        telemetry.push_log("Beginning post-acquisition destination verification pass via ewfverify...");
+        telemetry
+            .push_log("Beginning post-acquisition destination verification pass via ewfverify...");
         let _ = progress_tx.send(telemetry.clone()).await;
 
         let first_segment = &generated_files[0];
@@ -321,8 +324,14 @@ impl EwfAcquireEngine {
             .spawn()
             .map_err(|e| format!("Failed to spawn ewfverify: {}", e))?;
 
-        let v_stdout = v_child.stdout.take().ok_or("Failed to capture ewfverify stdout")?;
-        let v_stderr = v_child.stderr.take().ok_or("Failed to capture ewfverify stderr")?;
+        let v_stdout = v_child
+            .stdout
+            .take()
+            .ok_or("Failed to capture ewfverify stdout")?;
+        let v_stderr = v_child
+            .stderr
+            .take()
+            .ok_or("Failed to capture ewfverify stderr")?;
 
         let mut v_reader_out = BufReader::new(v_stdout).lines();
         let mut v_reader_err = BufReader::new(v_stderr).lines();
@@ -385,7 +394,10 @@ impl EwfAcquireEngine {
             .map_err(|e| format!("Failed to wait on ewfverify: {}", e))?;
 
         if !v_status.success() || !ewfverify_success {
-            telemetry.push_log(format!("ewfverify failed with status {:?}", v_status.code()));
+            telemetry.push_log(format!(
+                "ewfverify failed with status {:?}",
+                v_status.code()
+            ));
         }
 
         let source_hashes = HashResults {

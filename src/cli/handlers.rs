@@ -56,15 +56,21 @@ pub async fn handle_list(args: ListArgs) -> Result<(), Box<dyn std::error::Error
 
 pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error::Error>> {
     let target_path = Path::new(&args.device);
-    let canonical_path = std::fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let canonical_path =
+        std::fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
     let canonical_str = canonical_path.to_string_lossy().to_string();
 
     if !target_path.exists() && !canonical_path.exists() {
         return Err(format!("Target device or file not found: {}", args.device).into());
     }
 
-    let meta = std::fs::symlink_metadata(&canonical_path)
-        .map_err(|e| format!("Failed to inspect target {}: {}", canonical_path.display(), e))?;
+    let meta = std::fs::symlink_metadata(&canonical_path).map_err(|e| {
+        format!(
+            "Failed to inspect target {}: {}",
+            canonical_path.display(),
+            e
+        )
+    })?;
 
     #[cfg(unix)]
     {
@@ -84,7 +90,8 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
             return Err(format!(
                 "Critical Safety Error: Target {} is not a regular file.",
                 args.device
-            ).into());
+            )
+            .into());
         }
     }
 
@@ -97,9 +104,13 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
         let is_dev_match = dev.path == args.device
             || dev.name == args.device
             || dev.path == canonical_str
-            || dev.devlinks.iter().any(|link| link == &args.device || link == &canonical_str);
+            || dev
+                .devlinks
+                .iter()
+                .any(|link| link == &args.device || link == &canonical_str);
 
-        let is_canonical_match = std::fs::canonicalize(&dev.path).ok() == Some(canonical_path.clone());
+        let is_canonical_match =
+            std::fs::canonicalize(&dev.path).ok() == Some(canonical_path.clone());
 
         if is_dev_match || is_canonical_match {
             matched_device = Some(dev.clone());
@@ -495,18 +506,30 @@ pub async fn handle_verify_ewf(args: VerifyArgs) -> Result<(), Box<dyn std::erro
     cmd.stderr(std::process::Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| {
-        format!("Failed to spawn ewfverify (ensure libewf is installed): {}", e)
+        format!(
+            "Failed to spawn ewfverify (ensure libewf is installed): {}",
+            e
+        )
     })?;
 
-    let stdout = child.stdout.take().ok_or("Failed to capture ewfverify stdout")?;
-    let stderr = child.stderr.take().ok_or("Failed to capture ewfverify stderr")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("Failed to capture ewfverify stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("Failed to capture ewfverify stderr")?;
 
     let mut reader_out = tokio::io::BufReader::new(stdout).lines();
     let mut reader_err = tokio::io::BufReader::new(stderr).lines();
 
-    let regex_md5 = regex::Regex::new(r"MD5 hash calculated over data:\s*([a-fA-F0-9]{32})").unwrap();
-    let regex_sha1 = regex::Regex::new(r"SHA1 hash calculated over data:\s*([a-fA-F0-9]{40})").unwrap();
-    let regex_sha256 = regex::Regex::new(r"SHA256 hash calculated over data:\s*([a-fA-F0-9]{64})").unwrap();
+    let regex_md5 =
+        regex::Regex::new(r"MD5 hash calculated over data:\s*([a-fA-F0-9]{32})").unwrap();
+    let regex_sha1 =
+        regex::Regex::new(r"SHA1 hash calculated over data:\s*([a-fA-F0-9]{40})").unwrap();
+    let regex_sha256 =
+        regex::Regex::new(r"SHA256 hash calculated over data:\s*([a-fA-F0-9]{64})").unwrap();
 
     let mut calc_md5 = None;
     let mut calc_sha1 = None;
@@ -554,9 +577,18 @@ pub async fn handle_verify_ewf(args: VerifyArgs) -> Result<(), Box<dyn std::erro
 
     let status = child.wait().await?;
     println!("\n================================================================================");
-    println!("  MD5 (decoded data)   : {}", calc_md5.as_deref().unwrap_or("N/A"));
-    println!("  SHA-1 (decoded data) : {}", calc_sha1.as_deref().unwrap_or("N/A"));
-    println!("  SHA-256 (decoded data): {}", calc_sha256.as_deref().unwrap_or("N/A"));
+    println!(
+        "  MD5 (decoded data)   : {}",
+        calc_md5.as_deref().unwrap_or("N/A")
+    );
+    println!(
+        "  SHA-1 (decoded data) : {}",
+        calc_sha1.as_deref().unwrap_or("N/A")
+    );
+    println!(
+        "  SHA-256 (decoded data): {}",
+        calc_sha256.as_deref().unwrap_or("N/A")
+    );
     println!("================================================================================");
 
     let any_checked = args.md5.is_some() || args.sha1.is_some() || args.sha256.is_some();

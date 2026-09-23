@@ -861,7 +861,8 @@ impl App {
             return;
         }
 
-        self.conv_status_msg = "Converting in background... (Press 'a' or Esc to abort)".to_string();
+        self.conv_status_msg =
+            "Converting in background... (Press 'a' or Esc to abort)".to_string();
         let abort = Arc::new(AtomicBool::new(false));
         self.conv_abort = Some(abort.clone());
         let (tx, rx) = mpsc::channel(1);
