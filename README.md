@@ -412,3 +412,22 @@ nix-build
 - **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
 
 at your option.
+
+---
+
+## ⚖️ Legal, Forensic & Trademark Disclaimers
+
+### 1. Forensic Tool Validation & Chain of Custody
+`dfdisk` provides forensic bit-stream imaging, damaged media rescue, evidence container conversion, and cryptographic verification designed in alignment with NIST Computer Forensic Tool Testing (CFTT) standards. However, because digital forensics, criminal casework, and electronic discovery are governed by rigorous legal and chain-of-custody requirements:
+- **Examiner Responsibility**: Forensic practitioners, law enforcement officers, and incident responders remain solely responsible for validating their hardware write-blockers, storage bus interfaces, host environments, and software toolchains in accordance with applicable standards (e.g., **ISO/IEC 17025**, **ISO/IEC 27037**, **ASTM E3016**) and jurisdiction-specific rules of evidence before deploying `dfdisk` on live casework or evidence media.
+- **Limitation of Liability**: THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, EVIDENCE INTEGRITY, AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, LOSS OF EVIDENCE, HARDWARE FAILURE, DATA CORRUPTION, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+### 2. Trademarks & Nominative Fair Use
+All trademarks, product names, logos, and brands mentioned in this repository are the property of their respective owners:
+- **EnCase®** and **E01** (Expert Witness Compression Format) are trademarks or registered trademarks of OpenText Corporation (formerly Guidance Software).
+- **Linux®** is a registered trademark of Linus Torvalds.
+- **Ratatui** is an open-source project licensed under MIT / Apache-2.0.
+- **libewf** is an open-source library maintained by Joachim Metz and the libyal project.
+- **GNU ddrescue** is an open-source utility developed under the GNU General Public License.
+
+Their use within `dfdisk` documentation and software is strictly for **nominative identification, compatibility description, and technical interoperability** (e.g., referencing support for Expert Witness `.E01` evidence images or integration with system utilities). `dfdisk` is an independent open-source project and is not affiliated with, sponsored by, authorized by, or endorsed by OpenText Corporation or any of the trademark owners listed above.
