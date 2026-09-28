@@ -120,6 +120,8 @@ jobs:
     name: Update NUR Package
     needs: [publish-release]
     runs-on: ubuntu-latest
+    env:
+      NUR_UPDATE_TOKEN: ${{ secrets.NUR_UPDATE_TOKEN }}
     steps:
       - name: Checkout dfdisk
         uses: actions/checkout@v7
@@ -165,17 +167,14 @@ jobs:
           echo "cargo_hash=$CARGO_HASH" >> "$GITHUB_OUTPUT"
           echo "Computed: version=$VERSION, src_hash=$SRC_HASH, cargo_hash=$CARGO_HASH"
 
-      - name: Checkout NUR repository
-        if: ${{ secrets.NUR_UPDATE_TOKEN != '' }}
-        uses: actions/checkout@v7
-        with:
-          repository: tylerstyle/nur-packages
-          token: ${{ secrets.NUR_UPDATE_TOKEN }}
-          path: nur-packages
-
       - name: Update NUR derivation and push
-        if: ${{ secrets.NUR_UPDATE_TOKEN != '' }}
         run: |
+          if [ -z "$NUR_UPDATE_TOKEN" ]; then
+            echo "::warning::NUR_UPDATE_TOKEN secret is not set. Skipping automatic update to tylerstyle/nur-packages."
+            exit 0
+          fi
+
+          git clone "https://x-access-token:${NUR_UPDATE_TOKEN}@github.com/tylerstyle/nur-packages.git" nur-packages
           cd nur-packages
           TARGET_FILE="pkgs/dfdisk/default.nix"
           VERSION="${{ steps.hashes.outputs.version }}"
@@ -200,8 +199,3 @@ jobs:
             # Notify upstream NUR index to trigger webhook re-evaluation
             curl -s -XPOST "https://nur-update.nix-community.org/update?repo=tylerstyle" || true
           fi
-
-      - name: Warn if NUR token missing
-        if: ${{ secrets.NUR_UPDATE_TOKEN == '' }}
-        run: |
-          echo "::warning::NUR_UPDATE_TOKEN secret is not set. Skipping automatic update to tylerstyle/nur-packages."
