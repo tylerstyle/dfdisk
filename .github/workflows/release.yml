@@ -115,3 +115,93 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+
+  update-nur:
+    name: Update NUR Package
+    needs: [publish-release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout dfdisk
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculate release hashes
+        id: hashes
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          TARBALL_URL="https://github.com/tylerstyle/dfdisk/archive/refs/tags/${TAG}.tar.gz"
+
+          echo "Prefetching source hash for $TARBALL_URL..."
+          SRC_PREFETCH=$(nix-prefetch-url --unpack "$TARBALL_URL")
+          SRC_HASH=$(nix hash convert --to sri "sha256:$SRC_PREFETCH")
+          echo "src_hash=$SRC_HASH" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          echo "Calculating cargo vendor hash..."
+          CARGO_HASH=$(nix-build --expr "
+            with import <nixpkgs> {};
+            rustPlatform.fetchCargoVendor {
+              src = fetchFromGitHub {
+                owner = \"tylerstyle\";
+                repo = \"dfdisk\";
+                tag = \"$TAG\";
+                hash = \"$SRC_HASH\";
+              };
+              hash = lib.fakeHash;
+            }
+          " 2>&1 | grep "got:" | awk '{print $2}' || true)
+
+          if [ -z "$CARGO_HASH" ]; then
+            echo "Failed to calculate cargoHash"
+            exit 1
+          fi
+          echo "cargo_hash=$CARGO_HASH" >> "$GITHUB_OUTPUT"
+          echo "Computed: version=$VERSION, src_hash=$SRC_HASH, cargo_hash=$CARGO_HASH"
+
+      - name: Checkout NUR repository
+        if: ${{ secrets.NUR_UPDATE_TOKEN != '' }}
+        uses: actions/checkout@v7
+        with:
+          repository: tylerstyle/nur-packages
+          token: ${{ secrets.NUR_UPDATE_TOKEN }}
+          path: nur-packages
+
+      - name: Update NUR derivation and push
+        if: ${{ secrets.NUR_UPDATE_TOKEN != '' }}
+        run: |
+          cd nur-packages
+          TARGET_FILE="pkgs/dfdisk/default.nix"
+          VERSION="${{ steps.hashes.outputs.version }}"
+          SRC_HASH="${{ steps.hashes.outputs.src_hash }}"
+          CARGO_HASH="${{ steps.hashes.outputs.cargo_hash }}"
+
+          sed -i -E "s/version = \"[^\"]+\";/version = \"$VERSION\";/" "$TARGET_FILE"
+          sed -i -E "s|hash = \"sha256-[^\"]+\";|hash = \"$SRC_HASH\";|" "$TARGET_FILE"
+          sed -i -E "s|cargoHash = \"sha256-[^\"]+\";|cargoHash = \"$CARGO_HASH\";|" "$TARGET_FILE"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet "$TARGET_FILE"; then
+            echo "No changes detected in NUR derivation."
+          else
+            git add "$TARGET_FILE"
+            git commit -m "feat(dfdisk): bump to v$VERSION with updated source and cargo hashes"
+            git push origin main
+            echo "Successfully committed and pushed NUR update for v$VERSION"
+
+            # Notify upstream NUR index to trigger webhook re-evaluation
+            curl -s -XPOST "https://nur-update.nix-community.org/update?repo=tylerstyle" || true
+          fi
+
+      - name: Warn if NUR token missing
+        if: ${{ secrets.NUR_UPDATE_TOKEN == '' }}
+        run: |
+          echo "::warning::NUR_UPDATE_TOKEN secret is not set. Skipping automatic update to tylerstyle/nur-packages."
