@@ -129,6 +129,7 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
         with:
+          nix_path: nixpkgs=channel:nixos-unstable
           extra_nix_config: |
             experimental-features = nix-command flakes
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
@@ -147,7 +148,8 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           echo "Calculating cargo vendor hash..."
-          CARGO_HASH=$(nix-build --expr "
+          BUILD_LOG=$(mktemp)
+          nix-build -I nixpkgs=channel:nixos-unstable --expr "
             with import <nixpkgs> {};
             rustPlatform.fetchCargoVendor {
               src = fetchFromGitHub {
@@ -158,7 +160,9 @@ jobs:
               };
               hash = lib.fakeHash;
             }
-          " 2>&1 | grep "got:" | awk '{print $2}' || true)
+          " > "$BUILD_LOG" 2>&1 || true
+          cat "$BUILD_LOG"
+          CARGO_HASH=$(grep "got:" "$BUILD_LOG" | tail -n1 | awk '{print $2}')
 
           if [ -z "$CARGO_HASH" ]; then
             echo "Failed to calculate cargoHash"
