@@ -916,8 +916,8 @@ fn render_converter(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(9), // Form and status box
-            Constraint::Length(3), // Action button
-            Constraint::Min(4),    // Converter help & instructions
+            Constraint::Min(4),    // Converter help & instructions (expands on taller screens)
+            Constraint::Length(3), // Action button anchored at the bottom
         ])
         .split(area);
 
@@ -1063,22 +1063,7 @@ fn render_converter(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(para, chunks[0]);
 
-    // Action button in chunks[1]
-    let conv_fields = crate::tui::app::ConverterField::all();
-    let is_btn_active = conv_fields[app.conv_active_field % conv_fields.len()]
-        == crate::tui::app::ConverterField::StartButton;
-    let is_busy = app.conv_rx.is_some();
-    render_action_button(
-        frame,
-        chunks[1],
-        "Start Conversion",
-        "F5",
-        is_btn_active,
-        is_busy,
-        "Conversion in Progress...",
-    );
-
-    // Converter Instructions in chunk[2]
+    // Converter Instructions in chunk[1] (expands vertically on taller screens)
     let help_lines = vec![
         Line::from(vec![
             Span::styled(
@@ -1133,7 +1118,22 @@ fn render_converter(frame: &mut Frame, app: &App, area: Rect) {
             .border_style(Style::default().fg(Color::DarkGray))
             .title(" Converter Help & Instructions "),
     );
-    frame.render_widget(help_para, chunks[2]);
+    frame.render_widget(help_para, chunks[1]);
+
+    // Action button anchored at the bottom in chunk[2]
+    let conv_fields = crate::tui::app::ConverterField::all();
+    let is_btn_active = conv_fields[app.conv_active_field % conv_fields.len()]
+        == crate::tui::app::ConverterField::StartButton;
+    let is_busy = app.conv_rx.is_some();
+    render_action_button(
+        frame,
+        chunks[2],
+        "Start Conversion",
+        "F5",
+        is_btn_active,
+        is_busy,
+        "Conversion in Progress...",
+    );
 }
 
 fn render_unmount_modal(frame: &mut Frame, app: &App, area: Rect) {
@@ -1246,9 +1246,9 @@ pub(crate) fn render_action_button(
         return;
     }
 
-    // Determine target width: clamp between 28 and 48 columns, reserving side margins
+    // Determine target width: clamp between 20 and 48 columns, reserving side margins
     let max_avail = area.width.saturating_sub(4);
-    let btn_width = max_avail.clamp(28, 48).min(area.width);
+    let btn_width = max_avail.clamp(20, 48).min(area.width);
     let x_offset = area.x + (area.width.saturating_sub(btn_width)) / 2;
     let btn_area = Rect {
         x: x_offset,
@@ -1257,14 +1257,45 @@ pub(crate) fn render_action_button(
         height: area.height.min(3),
     };
 
-    if btn_area.height < 3 {
-        let text = if is_busy {
+    // Calculate available inner text width before branching on height
+    let inner_width = btn_width.saturating_sub(if btn_area.height >= 3 { 2 } else { 0 });
+    let avail_text_width = if is_focused {
+        inner_width.saturating_sub(4)
+    } else {
+        inner_width
+    };
+
+    let base_text = if is_busy {
+        if avail_text_width >= busy_label.len() as u16 {
             busy_label.to_string()
-        } else if is_focused {
-            format!("▶ {} [{}] ◀", label, shortcut)
         } else {
-            format!("[ {} · {} ]", label, shortcut)
-        };
+            "Busy...".to_string()
+        }
+    } else {
+        let full_text = format!("{} · {}", label, shortcut);
+        if avail_text_width >= full_text.len() as u16 {
+            full_text
+        } else {
+            let short_label = label
+                .strip_prefix("Start Forensic ")
+                .map(|s| format!("Start {}", s))
+                .unwrap_or_else(|| label.to_string());
+            let medium_text = format!("{} · {}", short_label, shortcut);
+            if avail_text_width >= medium_text.len() as u16 {
+                medium_text
+            } else {
+                format!("Start · {}", shortcut)
+            }
+        }
+    };
+
+    let display_text = if is_focused {
+        format!("▶ {} ◀", base_text)
+    } else {
+        base_text
+    };
+
+    if btn_area.height < 3 {
         let style = if is_busy {
             Style::default().fg(Color::Yellow)
         } else if is_focused {
@@ -1275,7 +1306,9 @@ pub(crate) fn render_action_button(
         } else {
             Style::default().fg(Color::White).bg(Color::DarkGray)
         };
-        let p = Paragraph::new(text).alignment(Alignment::Center).style(style);
+        let p = Paragraph::new(display_text)
+            .alignment(Alignment::Center)
+            .style(style);
         frame.render_widget(p, btn_area);
         return;
     }
@@ -1285,7 +1318,7 @@ pub(crate) fn render_action_button(
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::DarkGray));
-        let p = Paragraph::new(busy_label)
+        let p = Paragraph::new(display_text)
             .alignment(Alignment::Center)
             .style(
                 Style::default()
@@ -1297,24 +1330,12 @@ pub(crate) fn render_action_button(
         return;
     }
 
-    let display_text = if btn_width >= 44 {
-        format!("{} · {}", label, shortcut)
-    } else if btn_width >= 34 {
-        let short_label = label
-            .strip_prefix("Start Forensic ")
-            .map(|s| format!("Start {}", s))
-            .unwrap_or_else(|| label.to_string());
-        format!("{} · {}", short_label, shortcut)
-    } else {
-        format!("Start · {}", shortcut)
-    };
-
     if is_focused {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Double)
             .border_style(Style::default().fg(Color::Green));
-        let p = Paragraph::new(format!("▶ {} ◀", display_text))
+        let p = Paragraph::new(display_text)
             .alignment(Alignment::Center)
             .style(
                 Style::default()
@@ -1384,7 +1405,7 @@ pub(crate) fn footer_hints(app: &App) -> Span<'static> {
         Screen::Converter => {
             if app.conv_rx.is_some() {
                 Span::styled(
-                    " [Esc] Back to Explorer  (Conversion in progress...) ",
+                    " [A] Abort  [Esc] Abort & Return to Explorer  (Conversion in progress...) ",
                     Style::default().fg(Color::Yellow),
                 )
             } else {
@@ -1677,7 +1698,9 @@ mod tests {
             .position(|f| *f == crate::tui::app::FormField::StartButton)
             .unwrap();
         app.active_field = start_btn_idx;
-        assert!(footer_hints(&app).content.contains("[Enter/Space/F5] Start Acquisition"));
+        assert!(footer_hints(&app)
+            .content
+            .contains("[Enter/Space/F5] Start Acquisition"));
 
         // AcquisitionRunning
         app.current_screen = Screen::AcquisitionRunning;
@@ -1696,12 +1719,17 @@ mod tests {
         app.conv_active_field = 1;
         assert!(footer_hints(&app).content.contains("Toggle Mode"));
         app.conv_active_field = 3;
-        assert!(footer_hints(&app).content.contains("[Enter/Space/F5] Start Conversion"));
+        assert!(footer_hints(&app)
+            .content
+            .contains("[Enter/Space/F5] Start Conversion"));
 
         // Converter Busy
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         app.conv_rx = Some(rx);
-        assert!(footer_hints(&app).content.contains("Conversion in progress..."));
+        let busy_hint = footer_hints(&app).content.to_string();
+        assert!(busy_hint.contains("[A] Abort"));
+        assert!(busy_hint.contains("Abort & Return to Explorer"));
+        assert!(busy_hint.contains("Conversion in progress..."));
         app.conv_rx = None;
 
         // UnmountPrompt
@@ -1738,6 +1766,19 @@ mod tests {
                         );
                     })
                     .unwrap();
+                let unfocused_text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(
+                    unfocused_text.contains("F5"),
+                    "Unfocused button must retain F5 at {}x{}",
+                    w,
+                    h
+                );
 
                 // Focused
                 terminal
@@ -1753,6 +1794,25 @@ mod tests {
                         );
                     })
                     .unwrap();
+                let focused_text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(
+                    focused_text.contains("F5"),
+                    "Focused button must retain F5 at {}x{}",
+                    w,
+                    h
+                );
+                assert!(
+                    focused_text.contains('▶') && focused_text.contains('◀'),
+                    "Focused button must retain focus markers at {}x{}",
+                    w,
+                    h
+                );
 
                 // Busy
                 terminal
@@ -1768,6 +1828,19 @@ mod tests {
                         );
                     })
                     .unwrap();
+                let busy_text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect();
+                assert!(
+                    busy_text.contains("Converting") || busy_text.contains("Busy"),
+                    "Busy button must display busy indicator at {}x{}",
+                    w,
+                    h
+                );
             }
         }
     }
@@ -1801,14 +1874,23 @@ mod tests {
         let buf = terminal.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("▶"));
+        assert!(text.contains("◀"));
 
-        // 3. Render Converter
+        // 3. Render Converter and verify button is anchored at bottom rows (18..21)
         app.current_screen = Screen::Converter;
         app.conv_active_field = 0;
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer().clone();
-        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("Start Conversion"));
+        let mut bottom_text = String::new();
+        for y in 18..21 {
+            for x in 0..80 {
+                bottom_text.push_str(buf.get(x, y).symbol());
+            }
+        }
+        assert!(
+            bottom_text.contains("Start Conversion") || bottom_text.contains("Start · F5"),
+            "Converter action button must be anchored at the bottom (rows 18..20), got: {}",
+            bottom_text
+        );
     }
 }
-
