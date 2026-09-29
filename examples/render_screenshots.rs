@@ -1,9 +1,9 @@
-use std::fs::File;
-use std::io::Write;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
+use std::fs::File;
+use std::io::Write;
 
 use dfdisk::models::case::CaseMetadata;
 use dfdisk::models::config::{AcquisitionConfig, CompressionLevel, ImageFormat, SplitSize};
@@ -38,10 +38,26 @@ fn color_to_string(color: Color) -> String {
 fn is_box_drawing(sym: &str) -> bool {
     matches!(
         sym,
-        "─" | "│" | "╭" | "╮" | "╯" | "╰"
-            | "┌" | "┐" | "└" | "┘"
-            | "├" | "┤" | "┬" | "┴" | "┼"
-            | "═" | "║" | "╔" | "╗" | "╚" | "╝"
+        "─" | "│"
+            | "╭"
+            | "╮"
+            | "╯"
+            | "╰"
+            | "┌"
+            | "┐"
+            | "└"
+            | "┘"
+            | "├"
+            | "┤"
+            | "┬"
+            | "┴"
+            | "┼"
+            | "═"
+            | "║"
+            | "╔"
+            | "╗"
+            | "╚"
+            | "╝"
             | "█"
     )
 }
@@ -254,7 +270,11 @@ fn buffer_to_svg(buffer: &Buffer, width_cells: u16, height_cells: u16) -> String
                 let span_cx = pad_x + start_x as f64 * cell_w;
 
                 let is_bold = cur_mod.contains(Modifier::BOLD);
-                let bold_attr = if is_bold { r#" font-weight="bold""# } else { "" };
+                let bold_attr = if is_bold {
+                    r#" font-weight="bold""#
+                } else {
+                    ""
+                };
 
                 let escaped = text
                     .replace("&", "&amp;")
@@ -380,7 +400,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(status.success());
 
     let status = std::process::Command::new("magick")
-        .args(["/tmp/image_converter.svg", "assets/screenshots/image_converter.png"])
+        .args([
+            "/tmp/image_converter.svg",
+            "assets/screenshots/image_converter.png",
+        ])
         .status()?;
     assert!(status.success());
 
