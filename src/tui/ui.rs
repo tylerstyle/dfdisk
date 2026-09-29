@@ -1884,7 +1884,7 @@ mod tests {
         let mut bottom_text = String::new();
         for y in 18..21 {
             for x in 0..80 {
-                bottom_text.push_str(buf.get(x, y).symbol());
+                bottom_text.push_str(buf[(x, y)].symbol());
             }
         }
         assert!(
