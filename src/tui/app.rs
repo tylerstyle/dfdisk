@@ -1473,7 +1473,9 @@ mod tests {
         app.conv_source_path = "/nonexistent/test.raw".to_string();
 
         app.start_conversion();
-        assert_eq!(app.conv_status_msg, "A conversion is already in progress...");
+        assert_eq!(
+            app.conv_status_msg,
+            "A conversion is already in progress..."
+        );
     }
 }
-
