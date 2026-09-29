@@ -355,12 +355,16 @@ fn render_device_explorer(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_case_setup(frame: &mut Frame, app: &App, area: Rect) {
+    let is_compact = area.height < 21;
+    let preview_height = if is_compact { 3 } else { 5 };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(12), // Fields grid
-            Constraint::Length(5),  // Live Filename Preview Banner
-            Constraint::Length(3),  // Action bar
+            Constraint::Length(12),             // Fields grid
+            Constraint::Length(preview_height), // Live Filename Preview Banner
+            Constraint::Min(0),                 // Flexible spacer on taller screens
+            Constraint::Length(3),              // Action button
         ])
         .split(area);
 
@@ -653,10 +657,41 @@ fn render_case_setup(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap_or_else(|| "SERIAL".to_string());
     let preview_info = app.case_metadata.generate_filename(&serial, "info");
 
-    let preview_lines = vec![
-        Line::from(vec![
+    let preview_lines = if preview_height >= 4 {
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    "  Target Image File       : ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    preview_e01,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "  Forensic Certificate    : ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    preview_info,
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        ]
+    } else {
+        vec![Line::from(vec![
             Span::styled(
-                "  Target Image File       : ",
+                " Target: ",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -667,22 +702,10 @@ fn render_case_setup(frame: &mut Frame, app: &App, area: Rect) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "  Forensic Certificate    : ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                preview_info,
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-    ];
+            Span::styled(" │ Cert: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(preview_info, Style::default().fg(Color::Green)),
+        ])]
+    };
 
     let preview_box = Paragraph::new(preview_lines).block(
         Block::default()
@@ -694,21 +717,18 @@ fn render_case_setup(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(preview_box, chunks[1]);
 
     // Action button
-    let is_start_active = app.active_field == 15;
-    let button_style = if is_start_active {
-        Style::default()
-            .bg(Color::Green)
-            .fg(Color::Black)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().bg(Color::DarkGray).fg(Color::White)
-    };
-
-    let start_button = Paragraph::new(" ▶ [ F5 / ENTER : START FORENSIC ACQUISITION ] ◀ ")
-        .style(button_style)
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::NONE));
-    frame.render_widget(start_button, chunks[2]);
+    let fields = crate::tui::app::FormField::all();
+    let is_start_active =
+        fields[app.active_field % fields.len()] == crate::tui::app::FormField::StartButton;
+    render_action_button(
+        frame,
+        chunks[3],
+        "Start Forensic Acquisition",
+        "F5",
+        is_start_active,
+        false,
+        "",
+    );
 }
 
 fn render_acquisition(frame: &mut Frame, app: &App, area: Rect) {
@@ -894,7 +914,11 @@ fn render_report_summary(frame: &mut Frame, app: &App, area: Rect) {
 fn render_converter(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(12), Constraint::Min(6)])
+        .constraints([
+            Constraint::Length(9), // Form and status box
+            Constraint::Length(3), // Action button
+            Constraint::Min(4),    // Converter help & instructions
+        ])
         .split(area);
 
     let mut lines = Vec::new();
@@ -1024,29 +1048,6 @@ fn render_converter(frame: &mut Frame, app: &App, area: Rect) {
     // Spacer
     lines.push(Line::from(""));
 
-    // Start Button (active_field == 3)
-    let is_btn_active = app.conv_active_field == 3;
-    lines.push(Line::from(vec![
-        Span::styled(
-            if is_btn_active { "▶ " } else { "  " },
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled(
-            "  [ START CONVERSION (F5 / Enter) ]  ",
-            if is_btn_active {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Green)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White).bg(Color::DarkGray)
-            },
-        ),
-    ]));
-
-    // Spacer
-    lines.push(Line::from(""));
-
     // Status message
     lines.push(Line::from(vec![
         Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
@@ -1062,7 +1063,22 @@ fn render_converter(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(para, chunks[0]);
 
-    // Converter Instructions in chunk[1]
+    // Action button in chunks[1]
+    let conv_fields = crate::tui::app::ConverterField::all();
+    let is_btn_active = conv_fields[app.conv_active_field % conv_fields.len()]
+        == crate::tui::app::ConverterField::StartButton;
+    let is_busy = app.conv_rx.is_some();
+    render_action_button(
+        frame,
+        chunks[1],
+        "Start Conversion",
+        "F5",
+        is_btn_active,
+        is_busy,
+        "Conversion in Progress...",
+    );
+
+    // Converter Instructions in chunk[2]
     let help_lines = vec![
         Line::from(vec![
             Span::styled(
@@ -1117,7 +1133,7 @@ fn render_converter(frame: &mut Frame, app: &App, area: Rect) {
             .border_style(Style::default().fg(Color::DarkGray))
             .title(" Converter Help & Instructions "),
     );
-    frame.render_widget(help_para, chunks[1]);
+    frame.render_widget(help_para, chunks[2]);
 }
 
 fn render_unmount_modal(frame: &mut Frame, app: &App, area: Rect) {
@@ -1217,6 +1233,110 @@ fn render_system_warning_modal(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, modal_area);
 }
 
+pub(crate) fn render_action_button(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    shortcut: &str,
+    is_focused: bool,
+    is_busy: bool,
+    busy_label: &str,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    // Determine target width: clamp between 28 and 48 columns, reserving side margins
+    let max_avail = area.width.saturating_sub(4);
+    let btn_width = max_avail.clamp(28, 48).min(area.width);
+    let x_offset = area.x + (area.width.saturating_sub(btn_width)) / 2;
+    let btn_area = Rect {
+        x: x_offset,
+        y: area.y,
+        width: btn_width,
+        height: area.height.min(3),
+    };
+
+    if btn_area.height < 3 {
+        let text = if is_busy {
+            busy_label.to_string()
+        } else if is_focused {
+            format!("▶ {} [{}] ◀", label, shortcut)
+        } else {
+            format!("[ {} · {} ]", label, shortcut)
+        };
+        let style = if is_busy {
+            Style::default().fg(Color::Yellow)
+        } else if is_focused {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White).bg(Color::DarkGray)
+        };
+        let p = Paragraph::new(text).alignment(Alignment::Center).style(style);
+        frame.render_widget(p, btn_area);
+        return;
+    }
+
+    if is_busy {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let p = Paragraph::new(busy_label)
+            .alignment(Alignment::Center)
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(block);
+        frame.render_widget(p, btn_area);
+        return;
+    }
+
+    let display_text = if btn_width >= 44 {
+        format!("{} · {}", label, shortcut)
+    } else if btn_width >= 34 {
+        let short_label = label
+            .strip_prefix("Start Forensic ")
+            .map(|s| format!("Start {}", s))
+            .unwrap_or_else(|| label.to_string());
+        format!("{} · {}", short_label, shortcut)
+    } else {
+        format!("Start · {}", shortcut)
+    };
+
+    if is_focused {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(Color::Green));
+        let p = Paragraph::new(format!("▶ {} ◀", display_text))
+            .alignment(Alignment::Center)
+            .style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(block);
+        frame.render_widget(p, btn_area);
+    } else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Gray));
+        let p = Paragraph::new(display_text)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::White))
+            .block(block);
+        frame.render_widget(p, btn_area);
+    }
+}
+
 pub(crate) fn footer_hints(app: &App) -> Span<'static> {
     match app.current_screen {
         Screen::DeviceExplorer => Span::styled(
@@ -1226,16 +1346,31 @@ pub(crate) fn footer_hints(app: &App) -> Span<'static> {
         Screen::CaseSetup => {
             let fields = crate::tui::app::FormField::all();
             let cur = &fields[app.active_field % fields.len()];
-            if *cur == crate::tui::app::FormField::TargetDir {
-                Span::styled(
+            match cur {
+                crate::tui::app::FormField::TargetDir => Span::styled(
                     " [Tab] Autocomplete  [↓/Enter] Next Field  [Ctrl+U] Clear  [F5] Start  [Esc] Back ",
                     Style::default().fg(Color::Gray),
-                )
-            } else {
-                Span::styled(
-                    " [Tab/↓] Next Field  [Ctrl+U] Clear  [F5/Enter] Start Acquisition  [Esc] Back ",
+                ),
+                crate::tui::app::FormField::Format
+                | crate::tui::app::FormField::SplitSize
+                | crate::tui::app::FormField::Compression
+                | crate::tui::app::FormField::HashMd5
+                | crate::tui::app::FormField::HashSha1
+                | crate::tui::app::FormField::HashSha256
+                | crate::tui::app::FormField::RescueMode => Span::styled(
+                    " [Space/←/→] Toggle  [Tab/↓/Enter] Next Field  [F5] Start  [Esc] Back ",
                     Style::default().fg(Color::Gray),
-                )
+                ),
+                crate::tui::app::FormField::StartButton => Span::styled(
+                    " [Enter/Space/F5] Start Acquisition  [Shift+Tab/↑] Prev Field  [Esc] Back ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                _ => Span::styled(
+                    " [Tab/↓/Enter] Next Field  [Ctrl+U] Clear  [F5] Start Acquisition  [Esc] Back ",
+                    Style::default().fg(Color::Gray),
+                ),
             }
         }
         Screen::AcquisitionRunning => Span::styled(
@@ -1246,20 +1381,34 @@ pub(crate) fn footer_hints(app: &App) -> Span<'static> {
             " [Enter / Esc / Q] Return to Explorer ",
             Style::default().fg(Color::Green),
         ),
-        Screen::Converter => match app.conv_active_field {
-            0 | 2 => Span::styled(
-                " [Tab] Autocomplete  [↓/Enter] Next Field  [Ctrl+U] Clear  [F5] Start  [Esc] Back ",
-                Style::default().fg(Color::Gray),
-            ),
-            1 => Span::styled(
-                " [Space/Arrows] Toggle Mode  [Tab/↓/Enter] Next Field  [F5] Start  [Esc] Back ",
-                Style::default().fg(Color::Gray),
-            ),
-            _ => Span::styled(
-                " [Enter/Space/F5] Start Conversion  [Tab/↓] Next Field  [Esc] Back ",
-                Style::default().fg(Color::Gray),
-            ),
-        },
+        Screen::Converter => {
+            if app.conv_rx.is_some() {
+                Span::styled(
+                    " [Esc] Back to Explorer  (Conversion in progress...) ",
+                    Style::default().fg(Color::Yellow),
+                )
+            } else {
+                let conv_fields = crate::tui::app::ConverterField::all();
+                let cur = &conv_fields[app.conv_active_field % conv_fields.len()];
+                match cur {
+                    crate::tui::app::ConverterField::SourcePath
+                    | crate::tui::app::ConverterField::TargetDir => Span::styled(
+                        " [Tab] Autocomplete  [↓/Enter] Next Field  [Ctrl+U] Clear  [F5] Start  [Esc] Back ",
+                        Style::default().fg(Color::Gray),
+                    ),
+                    crate::tui::app::ConverterField::Mode => Span::styled(
+                        " [Space/←/→] Toggle Mode  [Tab/↓/Enter] Next Field  [F5] Start  [Esc] Back ",
+                        Style::default().fg(Color::Gray),
+                    ),
+                    crate::tui::app::ConverterField::StartButton => Span::styled(
+                        " [Enter/Space/F5] Start Conversion  [Shift+Tab/↑] Prev Field  [Esc] Back ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                }
+            }
+        }
         Screen::UnmountPrompt => Span::styled(
             " [Y/Enter] Safe Unmount & Proceed  [N/Esc] Cancel ",
             Style::default().fg(Color::Yellow),
@@ -1511,13 +1660,24 @@ mod tests {
         // CaseSetup
         app.current_screen = Screen::CaseSetup;
         app.active_field = 0;
-        assert!(footer_hints(&app).content.contains("Start Acquisition"));
+        let hint_field0 = footer_hints(&app).content.to_string();
+        assert!(hint_field0.contains("[Tab/↓/Enter] Next Field"));
+        assert!(hint_field0.contains("[F5] Start Acquisition"));
+        assert!(!hint_field0.contains("[F5/Enter]"));
+
         let target_dir_idx = crate::tui::app::FormField::all()
             .iter()
             .position(|f| *f == crate::tui::app::FormField::TargetDir)
             .unwrap();
         app.active_field = target_dir_idx;
         assert!(footer_hints(&app).content.contains("Autocomplete"));
+
+        let start_btn_idx = crate::tui::app::FormField::all()
+            .iter()
+            .position(|f| *f == crate::tui::app::FormField::StartButton)
+            .unwrap();
+        app.active_field = start_btn_idx;
+        assert!(footer_hints(&app).content.contains("[Enter/Space/F5] Start Acquisition"));
 
         // AcquisitionRunning
         app.current_screen = Screen::AcquisitionRunning;
@@ -1536,7 +1696,13 @@ mod tests {
         app.conv_active_field = 1;
         assert!(footer_hints(&app).content.contains("Toggle Mode"));
         app.conv_active_field = 3;
-        assert!(footer_hints(&app).content.contains("Start Conversion"));
+        assert!(footer_hints(&app).content.contains("[Enter/Space/F5] Start Conversion"));
+
+        // Converter Busy
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        app.conv_rx = Some(rx);
+        assert!(footer_hints(&app).content.contains("Conversion in progress..."));
+        app.conv_rx = None;
 
         // UnmountPrompt
         app.current_screen = Screen::UnmountPrompt;
@@ -1546,4 +1712,103 @@ mod tests {
         app.current_screen = Screen::SystemDiskWarning;
         assert!(footer_hints(&app).content.contains("Proceed Anyway"));
     }
+
+    #[test]
+    fn test_render_action_button_widget() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let widths = [25, 35, 45, 60, 80];
+        for &w in &widths {
+            for &h in &[1, 2, 3, 5] {
+                let backend = TestBackend::new(w, h);
+                let mut terminal = Terminal::new(backend).unwrap();
+
+                // Unfocused
+                terminal
+                    .draw(|f| {
+                        render_action_button(
+                            f,
+                            Rect::new(0, 0, w, h),
+                            "Start Forensic Acquisition",
+                            "F5",
+                            false,
+                            false,
+                            "",
+                        );
+                    })
+                    .unwrap();
+
+                // Focused
+                terminal
+                    .draw(|f| {
+                        render_action_button(
+                            f,
+                            Rect::new(0, 0, w, h),
+                            "Start Forensic Acquisition",
+                            "F5",
+                            true,
+                            false,
+                            "",
+                        );
+                    })
+                    .unwrap();
+
+                // Busy
+                terminal
+                    .draw(|f| {
+                        render_action_button(
+                            f,
+                            Rect::new(0, 0, w, h),
+                            "Start Forensic Acquisition",
+                            "F5",
+                            false,
+                            true,
+                            "Converting...",
+                        );
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_case_setup_and_converter_render_at_80x24() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let mut app = App::new();
+
+        // 1. Render CaseSetup unfocused
+        app.current_screen = Screen::CaseSetup;
+        app.active_field = 0;
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Start"));
+        assert!(text.contains("F5"));
+
+        // 2. Render CaseSetup focused on StartButton
+        let btn_idx = crate::tui::app::FormField::all()
+            .iter()
+            .position(|f| *f == crate::tui::app::FormField::StartButton)
+            .unwrap();
+        app.active_field = btn_idx;
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("▶"));
+
+        // 3. Render Converter
+        app.current_screen = Screen::Converter;
+        app.conv_active_field = 0;
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Start Conversion"));
+    }
 }
+

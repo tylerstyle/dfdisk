@@ -480,7 +480,11 @@ impl App {
                     self.config.rescue_mode = !self.config.rescue_mode;
                 }
             }
-            FormField::StartButton => {}
+            FormField::StartButton => {
+                if key.code == KeyCode::Char(' ') {
+                    self.start_acquisition();
+                }
+            }
         }
     }
 
@@ -637,9 +641,6 @@ impl App {
             KeyCode::Enter => match cur_field {
                 ConverterField::StartButton => {
                     self.start_conversion();
-                }
-                ConverterField::Mode => {
-                    self.conv_to_e01 = !self.conv_to_e01;
                 }
                 _ => {
                     self.conv_active_field = (self.conv_active_field + 1) % fields.len();
@@ -826,6 +827,11 @@ impl App {
     }
 
     pub fn start_conversion(&mut self) {
+        if self.conv_rx.is_some() {
+            self.conv_status_msg = "A conversion is already in progress...".to_string();
+            return;
+        }
+
         let src_trimmed = self.conv_source_path.trim();
         let out_trimmed = self.conv_target_dir.trim();
 
@@ -853,11 +859,6 @@ impl App {
                 "Destination path is a file, not a directory: {}",
                 out.display()
             );
-            return;
-        }
-
-        if self.conv_rx.is_some() {
-            self.conv_status_msg = "A conversion is already in progress...".to_string();
             return;
         }
 
@@ -1275,12 +1276,12 @@ mod tests {
         // Toggle mode using Space
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(!app.conv_to_e01);
-        // Toggle mode using Enter
-        app.handle_key(key(KeyCode::Enter));
+        // Toggle mode using Right arrow
+        app.handle_key(key(KeyCode::Right));
         assert!(app.conv_to_e01);
 
-        // Move to Destination Dir
-        app.handle_key(key(KeyCode::Down));
+        // Enter advances to Destination Dir (harmonized navigation)
+        app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.conv_active_field, 2);
 
         // Clear Destination Dir with Ctrl+U
@@ -1416,4 +1417,63 @@ mod tests {
             Some(("Aborting acquisition...".to_string(), true))
         );
     }
+
+    #[tokio::test]
+    async fn test_case_setup_navigation_and_start_button() {
+        let mut app = App::new();
+        app.devices = vec![BlockDevice::default()];
+        app.selected_device_idx = 0;
+        app.current_screen = Screen::CaseSetup;
+        app.active_field = 0; // CaseNumber
+
+        // Enter on text field advances to next field without starting acquisition
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.active_field, 1);
+        assert_eq!(app.current_screen, Screen::CaseSetup);
+
+        // Move to StartButton (last field)
+        let fields = FormField::all();
+        let btn_idx = fields
+            .iter()
+            .position(|f| *f == FormField::StartButton)
+            .unwrap();
+        app.active_field = btn_idx;
+
+        // Space on StartButton triggers acquisition
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.current_screen, Screen::AcquisitionRunning);
+
+        // Reset to CaseSetup
+        app.current_screen = Screen::CaseSetup;
+        app.active_field = btn_idx;
+
+        // Enter on StartButton triggers acquisition
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.current_screen, Screen::AcquisitionRunning);
+    }
+
+    #[tokio::test]
+    async fn test_case_setup_f5_triggers_globally() {
+        let mut app = App::new();
+        app.devices = vec![BlockDevice::default()];
+        app.selected_device_idx = 0;
+        app.current_screen = Screen::CaseSetup;
+        app.active_field = 0; // First field
+
+        // F5 from field 0 triggers acquisition immediately
+        app.handle_key(key(KeyCode::F(5)));
+        assert_eq!(app.current_screen, Screen::AcquisitionRunning);
+    }
+
+    #[test]
+    fn test_converter_busy_guard() {
+        let mut app = App::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        app.conv_rx = Some(rx);
+        app.conv_source_path = "/nonexistent/test.raw".to_string();
+
+        app.start_conversion();
+        assert_eq!(app.conv_status_msg, "A conversion is already in progress...");
+    }
 }
+
