@@ -123,6 +123,12 @@ pub struct App {
     pub should_quit: bool,
 }
 
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl App {
     pub fn new() -> Self {
         let devices = DeviceScanner::scan_devices().unwrap_or_default();
