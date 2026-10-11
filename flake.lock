@@ -1,5 +1,21 @@
 {
   "nodes": {
+    "dfcore": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1791731534,
+        "narHash": "sha256-mzwV620LnaWlUM9PawWg3pg04U6FrvAfk9VGyjFC0Ek=",
+        "owner": "tylerstyle",
+        "repo": "dfcore",
+        "rev": "ffce902b0119830f70211ec3efc3512c8bf7f365",
+        "type": "github"
+      },
+      "original": {
+        "owner": "tylerstyle",
+        "repo": "dfcore",
+        "type": "github"
+      }
+    },
     "flake-utils": {
       "inputs": {
         "systems": "systems"
@@ -36,6 +52,7 @@
     },
     "root": {
       "inputs": {
+        "dfcore": "dfcore",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs"
       }
