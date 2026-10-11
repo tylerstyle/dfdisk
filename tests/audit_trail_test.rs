@@ -139,5 +139,11 @@ async fn acquisition_report_and_audit_log_anchor_each_other() {
         hex::encode(Sha256::digest(vec![7u8; 8192]))
     );
 
+    // The case directory carries a verifiable copy of the log and its head
+    let copy = dir.join("out").join("audit.jsonl");
+    assert_eq!(dfcore::audit::verify(&copy).unwrap().records, 4);
+    let head = std::fs::read_to_string(dir.join("out").join("audit.head")).unwrap();
+    assert!(head.starts_with(&state.head), "{head}");
+
     let _ = std::fs::remove_dir_all(&dir);
 }

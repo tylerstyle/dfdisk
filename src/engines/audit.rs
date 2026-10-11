@@ -54,8 +54,14 @@ pub fn started(engine: &str, device: &BlockDevice, config: &AcquisitionConfig) -
     )
 }
 
-/// Record how the acquisition ended.
-pub fn finished(engine: &str, device: &BlockDevice, result: &Result<ForensicInfoReport, String>) {
+/// Record how the acquisition ended, then copy the verified log and its head into
+/// the case directory: /run is lost at power-off, the case drive is not.
+pub fn finished(
+    engine: &str,
+    device: &BlockDevice,
+    output_dir: &std::path::Path,
+    result: &Result<ForensicInfoReport, String>,
+) {
     let mut event = Event::new(TOOL, VERSION, "acquisition_finished")
         .device(identity(device))
         .detail("engine", engine);
@@ -93,4 +99,12 @@ pub fn finished(engine: &str, device: &BlockDevice, result: &Result<ForensicInfo
         }
     }
     record(event);
+    if output_dir.is_dir() {
+        if let Err(e) = audit::export(&audit::path(), output_dir) {
+            eprintln!(
+                "[!] WARNING: audit log not copied to {}: {e:#}",
+                output_dir.display()
+            );
+        }
+    }
 }

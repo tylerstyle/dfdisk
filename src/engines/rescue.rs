@@ -28,6 +28,7 @@ impl RescueAcquireEngine {
         progress_tx: mpsc::Sender<ProgressTelemetry>,
         abort_flag: Arc<AtomicBool>,
     ) -> Result<ForensicInfoReport, String> {
+        let output_dir = config.output_dir.clone();
         let audit_anchor = crate::engines::audit::started("rescue", &device, &config);
         let result = Self::acquire(
             device.clone(),
@@ -38,7 +39,7 @@ impl RescueAcquireEngine {
             audit_anchor,
         )
         .await;
-        crate::engines::audit::finished("rescue", &device, &result);
+        crate::engines::audit::finished("rescue", &device, &output_dir, &result);
         result
     }
 
