@@ -1,6 +1,7 @@
 pub mod converter;
 pub mod ewf;
 pub mod hasher;
+pub mod preflight;
 pub mod raw;
 pub mod rescue;
 

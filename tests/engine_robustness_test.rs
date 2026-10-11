@@ -7,16 +7,21 @@ mod models;
 mod engines;
 
 use chrono::Utc;
-use engines::ewf::verify_ewf_hashes;
 use models::{
     case::CaseMetadata,
     config::AcquisitionConfig,
     device::{BlockDevice, DeviceSafety},
-    info_report::{ForensicInfoReport, HashResults, VerificationStatus},
+    info_report::{
+        compare_selected, ForensicInfoReport, HashResults, HashSelection, VerificationStatus,
+    },
 };
 
+fn verified(sel: HashSelection, src: &HashResults, dst: &HashResults) -> bool {
+    compare_selected(sel, src, dst) == VerificationStatus::Verified
+}
+
 #[test]
-fn test_verify_ewf_hashes_comprehensive_matrix() {
+fn test_compare_selected_comprehensive_matrix() {
     let md5_good = "5eb63bbbe01eeed093cb22bb8f5acdc3".to_string();
     let md5_bad = "00000000000000000000000000000000".to_string();
     let sha1_good = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed".to_string();
@@ -25,119 +30,102 @@ fn test_verify_ewf_hashes_comprehensive_matrix() {
         "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".to_string();
     let sha256_bad = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
 
-    // 1. Dual-hash default scenario:
-    // Source has MD5 + SHA-1 + SHA-256 (computed via MultiHasher)
-    // Destination has MD5 + SHA-256 (ewfacquire default dual-hash)
-    let source_default = HashResults {
+    let all = HashSelection {
+        md5: true,
+        sha1: true,
+        sha256: true,
+    };
+    let md5_sha256 = HashSelection {
+        md5: true,
+        sha1: false,
+        sha256: true,
+    };
+    let md5_only = HashSelection {
+        md5: true,
+        sha1: false,
+        sha256: false,
+    };
+    let sha256_only = HashSelection {
+        md5: false,
+        sha1: false,
+        sha256: true,
+    };
+
+    let source_all = HashResults {
         md5: Some(md5_good.clone()),
         sha1: Some(sha1_good.clone()),
         sha256: Some(sha256_good.clone()),
     };
-    let dest_default = HashResults {
+    let dest_md5_sha256 = HashResults {
         md5: Some(md5_good.clone()),
         sha1: None,
         sha256: Some(sha256_good.clone()),
     };
-    assert!(
-        verify_ewf_hashes(&source_default, &dest_default),
-        "Standard dual-hash default scenario must pass verification"
+
+    // 1. Only the selected digests are compared
+    assert!(verified(md5_sha256, &source_all, &dest_md5_sha256));
+    assert!(verified(all, &source_all, &source_all));
+    // A selected digest the destination lacks is a failure, not a pass
+    assert_eq!(
+        compare_selected(all, &source_all, &dest_md5_sha256),
+        VerificationStatus::Failed
     );
 
-    // 2. All 3 hashes match
-    let dest_all_match = HashResults {
-        md5: Some(md5_good.clone()),
-        sha1: Some(sha1_good.clone()),
-        sha256: Some(sha256_good.clone()),
-    };
-    assert!(verify_ewf_hashes(&source_default, &dest_all_match));
-
-    // 3. Case insensitivity (lowercase vs uppercase hex)
+    // 2. Case insensitivity (lowercase vs uppercase hex)
     let dest_uppercase = HashResults {
         md5: Some(md5_good.to_uppercase()),
         sha1: None,
         sha256: Some(sha256_good.to_uppercase()),
     };
-    assert!(
-        verify_ewf_hashes(&source_default, &dest_uppercase),
-        "Hash comparison must be ASCII case-insensitive"
-    );
+    assert!(verified(md5_sha256, &source_all, &dest_uppercase));
 
-    // 4. Single hash match scenarios
-    let source_md5_only = HashResults {
-        md5: Some(md5_good.clone()),
-        sha1: None,
-        sha256: None,
-    };
-    let dest_md5_only = HashResults {
-        md5: Some(md5_good.clone()),
-        sha1: None,
-        sha256: None,
-    };
-    assert!(verify_ewf_hashes(&source_md5_only, &dest_md5_only));
+    // 3. Single digest selections
+    assert!(verified(md5_only, &source_all, &dest_md5_sha256));
+    assert!(verified(sha256_only, &source_all, &dest_md5_sha256));
 
-    let source_sha256_only = HashResults {
-        md5: None,
-        sha1: None,
-        sha256: Some(sha256_good.clone()),
-    };
-    let dest_sha256_only = HashResults {
-        md5: None,
-        sha1: None,
-        sha256: Some(sha256_good.clone()),
-    };
-    assert!(verify_ewf_hashes(&source_sha256_only, &dest_sha256_only));
-
-    // 5. Mismatch scenarios
-    // MD5 mismatch
+    // 4. Mismatches in any selected digest
     let dest_md5_mismatch = HashResults {
         md5: Some(md5_bad),
         sha1: None,
         sha256: Some(sha256_good.clone()),
     };
-    assert!(
-        !verify_ewf_hashes(&source_default, &dest_md5_mismatch),
-        "Must fail when MD5 mismatches"
+    assert_eq!(
+        compare_selected(md5_sha256, &source_all, &dest_md5_mismatch),
+        VerificationStatus::Mismatch
     );
-
-    // SHA-256 mismatch
     let dest_sha256_mismatch = HashResults {
         md5: Some(md5_good.clone()),
         sha1: None,
         sha256: Some(sha256_bad),
     };
-    assert!(
-        !verify_ewf_hashes(&source_default, &dest_sha256_mismatch),
-        "Must fail when SHA-256 mismatches"
+    assert_eq!(
+        compare_selected(md5_sha256, &source_all, &dest_sha256_mismatch),
+        VerificationStatus::Mismatch
     );
-
-    // SHA-1 mismatch
     let dest_sha1_mismatch = HashResults {
         md5: Some(md5_good.clone()),
         sha1: Some(sha1_bad),
         sha256: Some(sha256_good.clone()),
     };
-    assert!(
-        !verify_ewf_hashes(&source_default, &dest_sha1_mismatch),
-        "Must fail when SHA-1 mismatches"
+    assert_eq!(
+        compare_selected(all, &source_all, &dest_sha1_mismatch),
+        VerificationStatus::Mismatch
     );
+    // ...but a mismatch in an unselected digest is ignored
+    assert!(verified(md5_sha256, &source_all, &dest_sha1_mismatch));
 
-    // 6. Empty / None scenarios (rejection of tautological None == None match)
-    let all_none_1 = HashResults::default();
-    let all_none_2 = HashResults::default();
-    assert!(
-        !verify_ewf_hashes(&all_none_1, &all_none_2),
-        "All None hashes must NEVER pass verification"
-    );
-    assert!(
-        !verify_ewf_hashes(&source_default, &all_none_2),
-        "Destination with no hashes must not pass"
-    );
-    assert!(
-        !verify_ewf_hashes(&all_none_1, &dest_default),
-        "Source with no hashes must not pass"
-    );
+    // 5. Never a tautological pass
+    let none = HashResults::default();
+    assert!(!verified(all, &none, &none));
+    assert!(!verified(all, &source_all, &none));
+    assert!(!verified(all, &none, &source_all));
+    assert!(!verified(
+        HashSelection::default(),
+        &source_all,
+        &source_all
+    ));
 
-    // 7. Destination missing in source
+    // 6. Disabling SHA-1 while the destination still reports one is not a mismatch
     let source_no_sha1 = HashResults {
         md5: Some(md5_good.clone()),
         sha1: None,
@@ -146,12 +134,9 @@ fn test_verify_ewf_hashes_comprehensive_matrix() {
     let dest_has_sha1 = HashResults {
         md5: Some(md5_good),
         sha1: Some(sha1_good),
-        sha256: None,
+        sha256: source_no_sha1.sha256.clone(),
     };
-    assert!(
-        !verify_ewf_hashes(&source_no_sha1, &dest_has_sha1),
-        "Must fail when destination expects SHA-1 but source does not have it"
-    );
+    assert!(verified(md5_sha256, &source_no_sha1, &dest_has_sha1));
 }
 
 #[test]
@@ -221,6 +206,8 @@ fn test_truthful_forensic_reporting_damaged_media_rescue() {
             "crime_2026_resq_eaea_01_bad_disk_01_WD-WCC4M0000000.raw".to_string(),
             "crime_2026_resq_eaea_01_bad_disk_01_WD-WCC4M0000000.map".to_string(),
         ],
+        error_handling_note: None,
+        incomplete: None,
     };
 
     // 1. Assert structured integrity

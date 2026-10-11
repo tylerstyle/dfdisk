@@ -70,6 +70,10 @@ Convert between raw byte streams (`.raw`, `.dd`, `.img`) and EnCase Expert Witne
 - **Zero-Accident Safety Guardrails**:
   - Live OS and root filesystem protection against overwrites or improper live acquisition.
   - One-touch safe partition unmounting (`umount`) before imaging begins.
+  - Refuses to start if any output of the same acquisition (`.E01`/`.E02`…, `.raw`, `.map`, `.info`) already exists, including when drives without a serial number collide on `NOSERIAL`.
+  - Refuses output directories stored on the source's own physical disk (any partition, or LVM/RAID/crypt/loop stacks on it).
+  - Calculates all selected digests (MD5, SHA-1, SHA-256) in a single read pass over the source; only the selected digests are verified.
+  - RAW mode stops at the first unreadable sector, keeps the partial image and marks the report INCOMPLETE with the exact byte offset; use rescue mode (ddrescue) for damaged media.
 - **Bi-Directional Format Converter**: Seamless conversion between `RAW -> E01` (injecting case headers and hash records) and `E01 -> RAW` (with streamed verification).
 - **Terminal Autocompletion**: Smart shell-like Tab completion for directory and file paths with multi-candidate cycling.
 

@@ -1,4 +1,5 @@
 use crate::engines::hasher::MultiHasher;
+use crate::engines::preflight;
 use crate::models::{
     case::CaseMetadata,
     config::AcquisitionConfig,
@@ -93,6 +94,13 @@ impl RescueAcquireEngine {
                     map_path.display()
                 ));
             }
+        }
+
+        fs::create_dir_all(&config.output_dir)
+            .map_err(|e| format!("Failed to create output directory: {}", e))?;
+        preflight::ensure_destination_not_on_source(&device.path, &config.output_dir)?;
+        if !config.resume {
+            preflight::ensure_no_existing_outputs(&config.output_dir, &base_name)?;
         }
 
         let mut cmd = Command::new("ddrescue");
@@ -303,6 +311,8 @@ impl RescueAcquireEngine {
             verification_passed: false,
             verification_status: VerificationStatus::DamagedMedia,
             generated_files,
+            error_handling_note: None,
+            incomplete: None,
         };
 
         // Write court certificate sidecar atomically and propagate errors
@@ -426,6 +436,8 @@ mod tests {
             verification_passed: false,
             verification_status: VerificationStatus::DamagedMedia,
             generated_files: vec!["test.raw".to_string()],
+            error_handling_note: None,
+            incomplete: None,
         };
 
         // Source hashes must be empty (cannot be computed over damaged media)

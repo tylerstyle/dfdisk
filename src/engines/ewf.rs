@@ -1,15 +1,16 @@
-use crate::engines::hasher::MultiHasher;
+use crate::engines::preflight;
 use crate::models::{
     case::CaseMetadata,
     config::AcquisitionConfig,
     device::BlockDevice,
-    info_report::{ForensicInfoReport, HashResults, VerificationStatus},
+    info_report::{
+        compare_selected, ForensicInfoReport, HashResults, HashSelection, VerificationStatus,
+    },
     telemetry::{AcquisitionStatus, ProgressTelemetry},
 };
 use chrono::Utc;
 use regex::Regex;
 use std::fs;
-use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -36,8 +37,17 @@ impl EwfAcquireEngine {
         let target_path_without_ext = config.output_dir.join(&base_name);
         let target_str = target_path_without_ext.to_string_lossy().to_string();
 
+        // ewfacquire -u overwrites existing segment files without asking, so
+        // collisions are refused here before it is started
+        fs::create_dir_all(&config.output_dir)
+            .map_err(|e| format!("Failed to create output directory: {}", e))?;
+        preflight::ensure_no_existing_outputs(&config.output_dir, &base_name)?;
+        preflight::ensure_destination_not_on_source(&device.path, &config.output_dir)?;
+
+        let selection = ewf_selection(&config);
+
         let mut cmd = Command::new("ewfacquire");
-        cmd.arg("-u"); // Unattended mode
+        cmd.arg("-u"); // Unattended mode (no prompts; overwrite protection is ours)
 
         // Metadata flags
         cmd.arg("-C").arg(case.effective_case());
@@ -62,18 +72,10 @@ impl EwfAcquireEngine {
             cmd.arg("-w"); // Zero bad sectors
         }
 
-        // Digest / hash options
-        // ewfacquire only supports at most one additional digest flag (-d).
-        // By default, ewfacquire computes MD5. If both SHA256 and SHA1 are requested,
-        // pass sha256 to ewfacquire and compute sha1 additionally via MultiHasher.
-        let mut compute_additional_sha1 = false;
-        if config.calc_sha256 {
-            cmd.arg("-d").arg("sha256");
-            if config.calc_sha1 {
-                compute_additional_sha1 = true;
-            }
-        } else if config.calc_sha1 {
-            cmd.arg("-d").arg("sha1");
+        // All digests are calculated in ewfacquire's single read pass over the
+        // source; MD5 is always part of an E01, SHA-1 / SHA-256 on request
+        if let Some(extra) = ewf_digest_list(selection, false) {
+            cmd.arg("-d").arg(extra);
         }
 
         // Output and source
@@ -103,17 +105,9 @@ impl EwfAcquireEngine {
         };
 
         let mut bad_sectors = 0u64;
-        let mut source_md5 = None;
-        let mut source_sha1 = None;
-        let mut source_sha256 = None;
-        let mut image_md5 = None;
-        let mut image_sha1 = None;
-        let mut image_sha256 = None;
+        let mut source_hashes = HashResults::default();
 
         let regex_bad = Regex::new(r"(\d+)\s*bad sector").unwrap();
-        let regex_md5 = Regex::new(r"(?i)MD5\s*(?:hash|digest)?\s*(?:stored in image|calculated over data|verified)?\s*:\s*([a-f0-9]{32})").unwrap();
-        let regex_sha1 = Regex::new(r"(?i)SHA1\s*(?:hash|digest)?\s*(?:stored in image|calculated over data|verified)?\s*:\s*([a-f0-9]{40})").unwrap();
-        let regex_sha256 = Regex::new(r"(?i)SHA256\s*(?:hash|digest)?\s*(?:stored in image|calculated over data|verified)?\s*:\s*([a-f0-9]{64})").unwrap();
 
         // Real-time /proc/pid/io polling interval
         let mut poll_interval = tokio::time::interval(Duration::from_millis(100));
@@ -204,39 +198,7 @@ impl EwfAcquireEngine {
                             if !text.is_empty() {
                                 telemetry.push_log(text);
 
-                                if let Some(caps) = regex_md5.captures(text) {
-                                    let hash = caps[1].to_lowercase();
-                                    let lower = text.to_lowercase();
-                                    if lower.contains("stored in image") || lower.contains("verified") {
-                                        image_md5 = Some(hash);
-                                    } else if lower.contains("calculated over data") || source_md5.is_none() {
-                                        source_md5 = Some(hash);
-                                    } else {
-                                        image_md5 = Some(hash);
-                                    }
-                                }
-                                if let Some(caps) = regex_sha1.captures(text) {
-                                    let hash = caps[1].to_lowercase();
-                                    let lower = text.to_lowercase();
-                                    if lower.contains("stored in image") || lower.contains("verified") {
-                                        image_sha1 = Some(hash);
-                                    } else if lower.contains("calculated over data") || source_sha1.is_none() {
-                                        source_sha1 = Some(hash);
-                                    } else {
-                                        image_sha1 = Some(hash);
-                                    }
-                                }
-                                if let Some(caps) = regex_sha256.captures(text) {
-                                    let hash = caps[1].to_lowercase();
-                                    let lower = text.to_lowercase();
-                                    if lower.contains("stored in image") || lower.contains("verified") {
-                                        image_sha256 = Some(hash);
-                                    } else if lower.contains("calculated over data") || source_sha256.is_none() {
-                                        source_sha256 = Some(hash);
-                                    } else {
-                                        image_sha256 = Some(hash);
-                                    }
-                                }
+                                record_calculated_hash(&mut source_hashes, text);
                             }
                         }
                         Ok(None) | Err(_) => {
@@ -272,20 +234,6 @@ impl EwfAcquireEngine {
             ));
         }
 
-        // If both SHA-256 and SHA-1 were requested, compute missing SHA-1 via MultiHasher
-        if compute_additional_sha1 && source_sha1.is_none() {
-            telemetry.status = AcquisitionStatus::Verifying;
-            telemetry.status_message =
-                "Computing additional SHA-1 digest via MultiHasher...".to_string();
-            let _ = progress_tx.send(telemetry.clone()).await;
-
-            if let Ok(extra) =
-                MultiHasher::hash_stream(Path::new(&device.path), false, true, false, None).await
-            {
-                source_sha1 = extra.sha1;
-            }
-        }
-
         // Identify generated segment files
         let mut generated_files = Vec::new();
         let target_dir = &config.output_dir;
@@ -315,7 +263,10 @@ impl EwfAcquireEngine {
 
         let first_segment = &generated_files[0];
         let mut v_cmd = Command::new("ewfverify");
-        v_cmd.arg("-d").arg("md5,sha1,sha256");
+        // Recalculate exactly the selected digests over the written image
+        if let Some(digests) = ewf_digest_list(selection, true) {
+            v_cmd.arg("-d").arg(digests);
+        }
         v_cmd.arg(first_segment);
         v_cmd.stdout(Stdio::piped());
         v_cmd.stderr(Stdio::piped());
@@ -336,9 +287,7 @@ impl EwfAcquireEngine {
         let mut v_reader_out = BufReader::new(v_stdout).lines();
         let mut v_reader_err = BufReader::new(v_stderr).lines();
 
-        let mut dest_md5: Option<String> = None;
-        let mut dest_sha1: Option<String> = None;
-        let mut dest_sha256: Option<String> = None;
+        let mut destination_hashes = HashResults::default();
         let mut ewfverify_success = false;
 
         let mut v_out_closed = false;
@@ -360,15 +309,9 @@ impl EwfAcquireEngine {
                             if text.contains("ewfverify: SUCCESS") {
                                 ewfverify_success = true;
                             }
-                            if let Some(caps) = regex_md5.captures(text) {
-                                dest_md5 = Some(caps[1].to_lowercase());
-                            }
-                            if let Some(caps) = regex_sha1.captures(text) {
-                                dest_sha1 = Some(caps[1].to_lowercase());
-                            }
-                            if let Some(caps) = regex_sha256.captures(text) {
-                                dest_sha256 = Some(caps[1].to_lowercase());
-                            }
+                            // Only digests recalculated over the image data count; "stored in
+                            // file" and "Additional hash values" merely echo the acquisition
+                            record_calculated_hash(&mut destination_hashes, text);
                         }
                         Ok(None) | Err(_) => v_out_closed = true,
                     }
@@ -400,29 +343,14 @@ impl EwfAcquireEngine {
             ));
         }
 
-        let source_hashes = HashResults {
-            md5: source_md5,
-            sha1: source_sha1,
-            sha256: source_sha256,
-        };
-
-        let destination_hashes = HashResults {
-            md5: dest_md5.or(image_md5),
-            sha1: dest_sha1.or(image_sha1),
-            sha256: dest_sha256.or(image_sha256),
-        };
-
-        let hashes_match = v_status.success()
-            && ewfverify_success
-            && verify_ewf_hashes(&source_hashes, &destination_hashes);
-
-        let verification_status = if hashes_match {
-            VerificationStatus::Verified
-        } else if source_hashes.md5.is_some() && destination_hashes.md5.is_some() {
-            VerificationStatus::Mismatch
-        } else {
-            VerificationStatus::Failed
-        };
+        let verification_status =
+            match compare_selected(selection, &source_hashes, &destination_hashes) {
+                VerificationStatus::Verified if !(v_status.success() && ewfverify_success) => {
+                    VerificationStatus::Failed
+                }
+                status => status,
+            };
+        let hashes_match = verification_status == VerificationStatus::Verified;
 
         let report = ForensicInfoReport {
             tool_name: "dfdisk".to_string(),
@@ -440,6 +368,8 @@ impl EwfAcquireEngine {
             verification_passed: hashes_match,
             verification_status,
             generated_files: generated_files.clone(),
+            error_handling_note: None,
+            incomplete: None,
         };
 
         // Write .info sidecar report atomically and propagate errors
@@ -476,6 +406,65 @@ impl EwfAcquireEngine {
         let _ = progress_tx.send(telemetry).await;
 
         Ok(report)
+    }
+}
+
+/// Digests verified for an E01: MD5 is always calculated by ewfacquire.
+pub fn ewf_selection(config: &AcquisitionConfig) -> HashSelection {
+    HashSelection {
+        md5: true,
+        sha1: config.calc_sha1,
+        sha256: config.calc_sha256,
+    }
+}
+
+/// Comma-separated `-d` value. ewfacquire always calculates MD5 and only takes
+/// the additional types; ewfverify takes the full list.
+pub fn ewf_digest_list(selection: HashSelection, include_md5: bool) -> Option<String> {
+    let list: Vec<&str> = [
+        (include_md5 && selection.md5, "md5"),
+        (selection.sha1, "sha1"),
+        (selection.sha256, "sha256"),
+    ]
+    .iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, name)| *name)
+    .collect();
+    if list.is_empty() {
+        None
+    } else {
+        Some(list.join(","))
+    }
+}
+
+/// Parse a libewf "<ALGO> hash calculated over data: <hex>" line.
+pub fn parse_calculated_hash(line: &str) -> Option<(&'static str, String)> {
+    let (label, value) = line.split_once(':')?;
+    let algo = match label.trim() {
+        "MD5 hash calculated over data" => "md5",
+        "SHA1 hash calculated over data" => "sha1",
+        "SHA256 hash calculated over data" => "sha256",
+        _ => return None,
+    };
+    let value = value.trim().to_ascii_lowercase();
+    let expected_len = match algo {
+        "md5" => 32,
+        "sha1" => 40,
+        _ => 64,
+    };
+    if value.len() == expected_len && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some((algo, value))
+    } else {
+        None
+    }
+}
+
+fn record_calculated_hash(hashes: &mut HashResults, line: &str) {
+    match parse_calculated_hash(line) {
+        Some(("md5", v)) => hashes.md5 = Some(v),
+        Some(("sha1", v)) => hashes.sha1 = Some(v),
+        Some(("sha256", v)) => hashes.sha256 = Some(v),
+        _ => {}
     }
 }
 
@@ -533,148 +522,115 @@ fn calculate_target_bytes(output_dir: &std::path::Path, base_name: &str) -> u64 
     total
 }
 
-/// Verifies whether computed forensic image hashes match source hashes.
-/// Requires at least one hash pair to be present, and rejects tautological None == None matching.
-/// Destination hashes must also be present in source hashes.
-pub fn verify_ewf_hashes(source: &HashResults, destination: &HashResults) -> bool {
-    let mut compared_count = 0;
-    let mut all_match = true;
-
-    if let (Some(s), Some(d)) = (&source.md5, &destination.md5) {
-        compared_count += 1;
-        if !s.eq_ignore_ascii_case(d) {
-            all_match = false;
-        }
-    } else if destination.md5.is_some() && source.md5.is_none() {
-        all_match = false;
-    }
-
-    if let (Some(s), Some(d)) = (&source.sha1, &destination.sha1) {
-        compared_count += 1;
-        if !s.eq_ignore_ascii_case(d) {
-            all_match = false;
-        }
-    } else if destination.sha1.is_some() && source.sha1.is_none() {
-        all_match = false;
-    }
-
-    if let (Some(s), Some(d)) = (&source.sha256, &destination.sha256) {
-        compared_count += 1;
-        if !s.eq_ignore_ascii_case(d) {
-            all_match = false;
-        }
-    } else if destination.sha256.is_some() && source.sha256.is_none() {
-        all_match = false;
-    }
-
-    compared_count > 0 && all_match
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_verify_ewf_hashes_all_none() {
-        let empty1 = HashResults::default();
-        let empty2 = HashResults::default();
-        // Zero hashes compared must not tautologically pass
-        assert!(!verify_ewf_hashes(&empty1, &empty2));
+    // Output captured from libewf 20231119 (ewfacquire / ewfverify)
+    const EWFVERIFY_SHA256_ONLY: &str = "\
+MD5 hash stored in file:\t\t3ece4002f6ecc0968e80e6a7e154637c
+MD5 hash calculated over data:\t\t3ece4002f6ecc0968e80e6a7e154637c
+SHA256 hash stored in file:\t\tN/A
+SHA256 hash calculated over data:\tb0a771d9cfebc5f2609d54de66263a89b45139a01e6ab7ab2ff9dd961fcd9245
+
+Additional hash values:
+SHA1:\t250d58633db80fb956a63c9342520e013ec06a34
+
+ewfverify: SUCCESS";
+
+    fn parse_all(output: &str) -> HashResults {
+        let mut h = HashResults::default();
+        for line in output.lines() {
+            record_calculated_hash(&mut h, line.trim());
+        }
+        h
     }
 
     #[test]
-    fn test_verify_ewf_hashes_missing_destination() {
-        let source = HashResults {
-            md5: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
-            sha1: None,
+    fn test_parse_only_calculated_hashes() {
+        let h = parse_all(EWFVERIFY_SHA256_ONLY);
+        assert_eq!(h.md5.as_deref(), Some("3ece4002f6ecc0968e80e6a7e154637c"));
+        assert_eq!(
+            h.sha256.as_deref(),
+            Some("b0a771d9cfebc5f2609d54de66263a89b45139a01e6ab7ab2ff9dd961fcd9245")
+        );
+        // The stored SHA-1 under "Additional hash values" is not a recalculation
+        assert_eq!(h.sha1, None);
+        assert_eq!(
+            parse_calculated_hash("SHA256 hash stored in file:\t\tN/A"),
+            None
+        );
+        assert_eq!(
+            parse_calculated_hash("MD5 hash calculated over data: nothex"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_disabling_sha1_does_not_cause_false_mismatch() {
+        let config = AcquisitionConfig {
+            calc_sha1: false,
+            calc_sha256: true,
+            ..Default::default()
+        };
+        let sel = ewf_selection(&config);
+        assert_eq!(ewf_digest_list(sel, false).as_deref(), Some("sha256"));
+        assert_eq!(ewf_digest_list(sel, true).as_deref(), Some("md5,sha256"));
+
+        let acquire = "MD5 hash calculated over data:\t\t3ece4002f6ecc0968e80e6a7e154637c\n\
+SHA256 hash calculated over data:\tb0a771d9cfebc5f2609d54de66263a89b45139a01e6ab7ab2ff9dd961fcd9245\n\
+ewfacquire: SUCCESS";
+        let src = parse_all(acquire);
+        let dst = parse_all(EWFVERIFY_SHA256_ONLY);
+        assert_eq!(
+            compare_selected(sel, &src, &dst),
+            VerificationStatus::Verified
+        );
+    }
+
+    #[test]
+    fn test_disabling_sha256_and_dual_hash_lists() {
+        let base = AcquisitionConfig::default();
+        assert_eq!(
+            ewf_digest_list(ewf_selection(&base), false).as_deref(),
+            Some("sha1,sha256")
+        );
+        assert_eq!(
+            ewf_digest_list(ewf_selection(&base), true).as_deref(),
+            Some("md5,sha1,sha256")
+        );
+
+        let no256 = AcquisitionConfig {
+            calc_sha256: false,
+            ..Default::default()
+        };
+        let sel = ewf_selection(&no256);
+        assert_eq!(ewf_digest_list(sel, false).as_deref(), Some("sha1"));
+        let src = HashResults {
+            md5: Some("a".repeat(32)),
+            sha1: Some("b".repeat(40)),
             sha256: None,
         };
-        let dest = HashResults::default();
-        assert!(!verify_ewf_hashes(&source, &dest));
-    }
+        let dst = HashResults {
+            md5: Some("a".repeat(32)),
+            sha1: Some("b".repeat(40)),
+            sha256: Some("c".repeat(64)),
+        };
+        assert_eq!(
+            compare_selected(sel, &src, &dst),
+            VerificationStatus::Verified
+        );
 
-    #[test]
-    fn test_verify_ewf_hashes_matching() {
-        let h1 = "d41d8cd98f00b204e9800998ecf8427e".to_string();
-        let source = HashResults {
-            md5: Some(h1.clone()),
-            sha1: None,
-            sha256: Some(
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
-            ),
+        let md5_only = AcquisitionConfig {
+            calc_sha1: false,
+            calc_sha256: false,
+            ..Default::default()
         };
-        let dest = HashResults {
-            md5: Some(h1.to_uppercase()),
-            sha1: None,
-            sha256: Some(
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
-            ),
-        };
-        assert!(verify_ewf_hashes(&source, &dest));
-    }
-
-    #[test]
-    fn test_verify_ewf_hashes_mismatch() {
-        let source = HashResults {
-            md5: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
-            sha1: None,
-            sha256: None,
-        };
-        let dest = HashResults {
-            md5: Some("00000000000000000000000000000000".to_string()),
-            sha1: None,
-            sha256: None,
-        };
-        assert!(!verify_ewf_hashes(&source, &dest));
-    }
-
-    #[test]
-    fn test_verify_ewf_hashes_partial_mismatch() {
-        let source = HashResults {
-            md5: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
-            sha1: None,
-            sha256: Some(
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
-            ),
-        };
-        let dest = HashResults {
-            md5: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
-            sha1: None,
-            sha256: Some(
-                "badhash000000000000000000000000000000000000000000000000000000000".to_string(),
-            ),
-        };
-        assert!(!verify_ewf_hashes(&source, &dest));
-    }
-
-    #[test]
-    fn test_verify_ewf_hashes_dual_hash_default_scenario() {
-        let source = HashResults {
-            md5: Some("abc".to_string()),
-            sha1: Some("123".to_string()),
-            sha256: Some("xyz".to_string()),
-        };
-        let dest = HashResults {
-            md5: Some("abc".to_string()),
-            sha1: None,
-            sha256: Some("xyz".to_string()),
-        };
-        assert!(verify_ewf_hashes(&source, &dest));
-    }
-
-    #[test]
-    fn test_verify_ewf_hashes_destination_missing_in_source() {
-        let source = HashResults {
-            md5: Some("abc".to_string()),
-            sha1: None,
-            sha256: None,
-        };
-        let dest = HashResults {
-            md5: Some("abc".to_string()),
-            sha1: Some("123".to_string()),
-            sha256: None,
-        };
-        assert!(!verify_ewf_hashes(&source, &dest));
+        assert_eq!(ewf_digest_list(ewf_selection(&md5_only), false), None);
+        assert_eq!(
+            ewf_digest_list(ewf_selection(&md5_only), true).as_deref(),
+            Some("md5")
+        );
     }
 
     #[test]

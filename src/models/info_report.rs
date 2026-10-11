@@ -26,6 +26,69 @@ pub enum VerificationStatus {
     /// Verification was not requested or skipped
     #[default]
     NotVerified,
+    /// Acquisition stopped before the end of the source; the image and its
+    /// hashes cover only the bytes that were read
+    Incomplete,
+}
+
+/// Digests an acquisition was asked to produce and must verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HashSelection {
+    pub md5: bool,
+    pub sha1: bool,
+    pub sha256: bool,
+}
+
+impl HashSelection {
+    pub fn from_config(config: &AcquisitionConfig) -> Self {
+        Self {
+            md5: config.calc_md5,
+            sha1: config.calc_sha1,
+            sha256: config.calc_sha256,
+        }
+    }
+}
+
+/// Compare source and destination digests for the selected algorithms only.
+/// Digests that were not selected are ignored, so disabling an algorithm can
+/// never produce a mismatch. A selected digest missing on either side fails.
+pub fn compare_selected(
+    selection: HashSelection,
+    source: &HashResults,
+    destination: &HashResults,
+) -> VerificationStatus {
+    let pairs = [
+        (selection.md5, &source.md5, &destination.md5),
+        (selection.sha1, &source.sha1, &destination.sha1),
+        (selection.sha256, &source.sha256, &destination.sha256),
+    ];
+    let mut compared = 0;
+    let mut missing = false;
+    for (selected, s, d) in pairs {
+        if !selected {
+            continue;
+        }
+        match (s, d) {
+            (Some(s), Some(d)) if !s.eq_ignore_ascii_case(d) => {
+                return VerificationStatus::Mismatch
+            }
+            (Some(_), Some(_)) => compared += 1,
+            _ => missing = true,
+        }
+    }
+    if missing || compared == 0 {
+        VerificationStatus::Failed
+    } else {
+        VerificationStatus::Verified
+    }
+}
+
+/// Why and where an acquisition stopped before the end of the source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IncompleteAcquisition {
+    pub bytes_acquired: u64,
+    pub expected_bytes: u64,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +109,12 @@ pub struct ForensicInfoReport {
     #[serde(default)]
     pub verification_status: VerificationStatus,
     pub generated_files: Vec<String>,
+    /// How read errors were actually handled, when it differs from what the
+    /// configuration's retry / wipe settings would suggest
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_handling_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<IncompleteAcquisition>,
 }
 
 impl ForensicInfoReport {
@@ -201,16 +270,19 @@ impl ForensicInfoReport {
             "Segment Split Size",
             self.config.split_size.display_name()
         ));
-        out.push_str(&format!(
-            "{:<20}: Retries: {} | Wipe bad sectors: {}\n",
-            "Error Handling",
-            self.config.error_retries,
-            if self.config.wipe_bad_sectors {
-                "Yes (Zero-fill)"
-            } else {
-                "No"
-            }
-        ));
+        match &self.error_handling_note {
+            Some(note) => out.push_str(&format!("{:<20}: {}\n", "Error Handling", note)),
+            None => out.push_str(&format!(
+                "{:<20}: Retries: {} | Wipe bad sectors: {}\n",
+                "Error Handling",
+                self.config.error_retries,
+                if self.config.wipe_bad_sectors {
+                    "Yes (Zero-fill)"
+                } else {
+                    "No"
+                }
+            )),
+        }
         out.push('\n');
 
         // Timestamps & Performance
@@ -234,6 +306,24 @@ impl ForensicInfoReport {
             "Bad / Error Sectors", self.bad_sectors_count
         ));
         out.push('\n');
+
+        if let Some(inc) = &self.incomplete {
+            out.push_str("[ACQUISITION RESULT]\n");
+            out.push_str(&format!("{:<20}: INCOMPLETE\n", "Status"));
+            out.push_str(&format!(
+                "{:<20}: {} of {} bytes ({})\n",
+                "Acquired",
+                inc.bytes_acquired,
+                inc.expected_bytes,
+                format_bytes(inc.bytes_acquired)
+            ));
+            out.push_str(&format!("{:<20}: {}\n", "Stopped Because", inc.reason));
+            out.push_str(&format!(
+                "{:<20}: The image holds source bytes 0..{} only; nothing was zero-filled and all hashes below cover only that range.\n",
+                "Note", inc.bytes_acquired
+            ));
+            out.push('\n');
+        }
 
         // Cryptographic Hashes & Verification
         out.push_str("[CRYPTOGRAPHIC INTEGRITY & VERIFICATION]\n");
@@ -271,6 +361,9 @@ impl ForensicInfoReport {
             }
             VerificationStatus::Failed => {
                 "WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE (Verification Failed)"
+            }
+            VerificationStatus::Incomplete => {
+                "INCOMPLETE - ACQUISITION STOPPED EARLY (Image covers only the acquired range)"
             }
             VerificationStatus::NotVerified => {
                 if self.verification_passed {
@@ -318,6 +411,8 @@ mod tests {
             verification_passed: true,
             verification_status: VerificationStatus::Verified,
             generated_files: vec![],
+            error_handling_note: None,
+            incomplete: None,
         };
 
         assert!(report.render_text().contains("VERIFIED - ALL HASHES MATCH"));
@@ -331,5 +426,101 @@ mod tests {
         assert!(report
             .render_text()
             .contains("CRITICAL ERROR - HASH MISMATCH"));
+    }
+
+    #[test]
+    fn test_incomplete_rendering_never_claims_zero_fill() {
+        let config = AcquisitionConfig {
+            wipe_bad_sectors: true,
+            ..Default::default()
+        };
+        let report = ForensicInfoReport {
+            tool_name: "dfdisk (raw engine)".to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            case_metadata: CaseMetadata::default(),
+            device: BlockDevice::default(),
+            config,
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+            elapsed_seconds: 1,
+            average_speed_bytes_sec: 1.0,
+            bad_sectors_count: 0,
+            source_hashes: HashResults::default(),
+            destination_hashes: HashResults::default(),
+            verification_passed: false,
+            verification_status: VerificationStatus::Incomplete,
+            generated_files: vec![],
+            error_handling_note: Some("None (stops at first read error)".to_string()),
+            incomplete: Some(IncompleteAcquisition {
+                bytes_acquired: 3584,
+                expected_bytes: 5120,
+                reason: "Input/output error at byte offset 3584".to_string(),
+            }),
+        };
+        let txt = report.render_text();
+        assert!(!txt.contains("Zero-fill"), "{txt}");
+        assert!(txt.contains("INCOMPLETE"));
+        assert!(txt.contains("3584 of 5120 bytes"));
+        assert!(txt.contains("byte offset 3584"));
+        assert!(txt.contains("None (stops at first read error)"));
+    }
+
+    fn h(md5: Option<&str>, sha1: Option<&str>, sha256: Option<&str>) -> HashResults {
+        HashResults {
+            md5: md5.map(str::to_string),
+            sha1: sha1.map(str::to_string),
+            sha256: sha256.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_compare_selected_ignores_unselected_digests() {
+        let all = HashSelection {
+            md5: true,
+            sha1: true,
+            sha256: true,
+        };
+        let no_sha1 = HashSelection {
+            md5: true,
+            sha1: false,
+            sha256: true,
+        };
+        let no_sha256 = HashSelection {
+            md5: true,
+            sha1: true,
+            sha256: false,
+        };
+
+        let src = h(Some("aa"), None, Some("cc"));
+        // Destination carries an extra SHA-1 (e.g. recomputed by ewfverify): not a mismatch
+        let dst = h(Some("AA"), Some("bb"), Some("cc"));
+        assert_eq!(
+            compare_selected(no_sha1, &src, &dst),
+            VerificationStatus::Verified
+        );
+
+        let src = h(Some("aa"), Some("bb"), None);
+        let dst = h(Some("aa"), Some("bb"), Some("zz"));
+        assert_eq!(
+            compare_selected(no_sha256, &src, &dst),
+            VerificationStatus::Verified
+        );
+
+        // Selected but missing on one side
+        assert_eq!(
+            compare_selected(all, &src, &dst),
+            VerificationStatus::Failed
+        );
+        // Real disagreement
+        let dst = h(Some("aa"), Some("XX"), None);
+        assert_eq!(
+            compare_selected(no_sha256, &src, &dst),
+            VerificationStatus::Mismatch
+        );
+        // Nothing selected is never a pass
+        assert_eq!(
+            compare_selected(HashSelection::default(), &src, &src),
+            VerificationStatus::Failed
+        );
     }
 }

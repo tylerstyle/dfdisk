@@ -396,6 +396,10 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
                     eprintln!("[!] Acquisition finished, but cryptographic verification failed or could not be completed.");
                     Err("Verification failed.".into())
                 }
+                VerificationStatus::Incomplete => {
+                    eprintln!("[!] Acquisition stopped before the end of the source; the image is partial.");
+                    Err("Acquisition incomplete.".into())
+                }
                 VerificationStatus::NotVerified => {
                     if report.verification_passed {
                         println!("[+] Acquisition and verification completed successfully!");
