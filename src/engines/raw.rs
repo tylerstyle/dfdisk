@@ -180,6 +180,28 @@ impl RawAcquireEngine {
         progress_tx: mpsc::Sender<ProgressTelemetry>,
         abort_flag: Arc<AtomicBool>,
     ) -> Result<ForensicInfoReport, String> {
+        let audit_anchor = crate::engines::audit::started("raw", &device, &config);
+        let result = Self::acquire(
+            device.clone(),
+            case,
+            config,
+            progress_tx,
+            abort_flag,
+            audit_anchor,
+        )
+        .await;
+        crate::engines::audit::finished("raw", &device, &result);
+        result
+    }
+
+    async fn acquire(
+        device: BlockDevice,
+        case: CaseMetadata,
+        config: AcquisitionConfig,
+        progress_tx: mpsc::Sender<ProgressTelemetry>,
+        abort_flag: Arc<AtomicBool>,
+        audit_anchor: Option<String>,
+    ) -> Result<ForensicInfoReport, String> {
         let start_time = Utc::now();
         let instant_start = Instant::now();
         let selection = HashSelection::from_config(&config);
@@ -192,6 +214,7 @@ impl RawAcquireEngine {
         let raw_path = config.output_dir.join(&raw_filename);
 
         preflight::ensure_no_existing_outputs(&config.output_dir, &base_name)?;
+        preflight::ensure_not_protected(&device.path)?;
         preflight::ensure_destination_not_on_source(&device.path, &config.output_dir)?;
 
         let mut telemetry = ProgressTelemetry {
@@ -427,6 +450,7 @@ impl RawAcquireEngine {
             verification_passed,
             verification_status,
             generated_files,
+            audit_anchor: audit_anchor.clone(),
             error_handling_note: Some(RAW_ERROR_HANDLING.to_string()),
             incomplete: incomplete.clone(),
         };

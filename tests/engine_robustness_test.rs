@@ -206,6 +206,7 @@ fn test_truthful_forensic_reporting_damaged_media_rescue() {
             "crime_2026_resq_eaea_01_bad_disk_01_WD-WCC4M0000000.raw".to_string(),
             "crime_2026_resq_eaea_01_bad_disk_01_WD-WCC4M0000000.map".to_string(),
         ],
+        audit_anchor: None,
         error_handling_note: None,
         incomplete: None,
     };

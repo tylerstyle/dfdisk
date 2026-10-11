@@ -29,6 +29,28 @@ impl EwfAcquireEngine {
         progress_tx: mpsc::Sender<ProgressTelemetry>,
         abort_flag: Arc<AtomicBool>,
     ) -> Result<ForensicInfoReport, String> {
+        let audit_anchor = crate::engines::audit::started("e01", &device, &config);
+        let result = Self::acquire(
+            device.clone(),
+            case,
+            config,
+            progress_tx,
+            abort_flag,
+            audit_anchor,
+        )
+        .await;
+        crate::engines::audit::finished("e01", &device, &result);
+        result
+    }
+
+    async fn acquire(
+        device: BlockDevice,
+        case: CaseMetadata,
+        config: AcquisitionConfig,
+        progress_tx: mpsc::Sender<ProgressTelemetry>,
+        abort_flag: Arc<AtomicBool>,
+        audit_anchor: Option<String>,
+    ) -> Result<ForensicInfoReport, String> {
         let start_time = Utc::now();
         let instant_start = Instant::now();
 
@@ -42,6 +64,7 @@ impl EwfAcquireEngine {
         fs::create_dir_all(&config.output_dir)
             .map_err(|e| format!("Failed to create output directory: {}", e))?;
         preflight::ensure_no_existing_outputs(&config.output_dir, &base_name)?;
+        preflight::ensure_not_protected(&device.path)?;
         preflight::ensure_destination_not_on_source(&device.path, &config.output_dir)?;
 
         let selection = ewf_selection(&config);
@@ -368,6 +391,7 @@ impl EwfAcquireEngine {
             verification_passed: hashes_match,
             verification_status,
             generated_files: generated_files.clone(),
+            audit_anchor: audit_anchor.clone(),
             error_handling_note: None,
             incomplete: None,
         };

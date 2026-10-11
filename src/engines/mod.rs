@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod converter;
 pub mod ewf;
 pub mod hasher;

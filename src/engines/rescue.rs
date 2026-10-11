@@ -28,6 +28,28 @@ impl RescueAcquireEngine {
         progress_tx: mpsc::Sender<ProgressTelemetry>,
         abort_flag: Arc<AtomicBool>,
     ) -> Result<ForensicInfoReport, String> {
+        let audit_anchor = crate::engines::audit::started("rescue", &device, &config);
+        let result = Self::acquire(
+            device.clone(),
+            case,
+            config,
+            progress_tx,
+            abort_flag,
+            audit_anchor,
+        )
+        .await;
+        crate::engines::audit::finished("rescue", &device, &result);
+        result
+    }
+
+    async fn acquire(
+        device: BlockDevice,
+        case: CaseMetadata,
+        config: AcquisitionConfig,
+        progress_tx: mpsc::Sender<ProgressTelemetry>,
+        abort_flag: Arc<AtomicBool>,
+        audit_anchor: Option<String>,
+    ) -> Result<ForensicInfoReport, String> {
         let start_time = Utc::now();
         let instant_start = Instant::now();
 
@@ -98,6 +120,7 @@ impl RescueAcquireEngine {
 
         fs::create_dir_all(&config.output_dir)
             .map_err(|e| format!("Failed to create output directory: {}", e))?;
+        preflight::ensure_not_protected(&device.path)?;
         preflight::ensure_destination_not_on_source(&device.path, &config.output_dir)?;
         if !config.resume {
             preflight::ensure_no_existing_outputs(&config.output_dir, &base_name)?;
@@ -311,6 +334,7 @@ impl RescueAcquireEngine {
             verification_passed: false,
             verification_status: VerificationStatus::DamagedMedia,
             generated_files,
+            audit_anchor: audit_anchor.clone(),
             error_handling_note: None,
             incomplete: None,
         };
@@ -436,6 +460,7 @@ mod tests {
             verification_passed: false,
             verification_status: VerificationStatus::DamagedMedia,
             generated_files: vec!["test.raw".to_string()],
+            audit_anchor: None,
             error_handling_note: None,
             incomplete: None,
         };

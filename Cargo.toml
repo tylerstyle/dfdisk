@@ -1,6 +1,6 @@
 [package]
 name = "dfdisk"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
 description = "Modern forensic disk imaging, damaged media rescue and conversion CLI/TUI tool"
@@ -33,6 +33,7 @@ assets = [
 ]
 
 [dependencies]
+dfcore = { path = "../dfcore" }
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1.53", features = ["full"] }

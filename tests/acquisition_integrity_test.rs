@@ -294,18 +294,18 @@ async fn ewf_without_sha256_has_no_false_mismatch() {
 // Destination-on-source against this host's real block devices
 // ---------------------------------------------------------------------------
 
-fn dev_node_for(dev: engines::preflight::DevNum) -> Option<PathBuf> {
+fn dev_node_for(dev: dfcore::sysfs::DevNum) -> Option<PathBuf> {
     std::fs::read_dir("/dev")
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .find(|p| engines::preflight::source_device(p) == Some(dev))
+        .find(|p| dfcore::sysfs::source_device(p) == Some(dev))
 }
 
 #[test]
 fn image_on_the_source_disk_is_refused_on_this_host() {
     let dir = std::env::temp_dir();
-    let Some(dev) = engines::preflight::backing_device_of_path(&dir) else {
+    let Some(dev) = dfcore::sysfs::backing_device_of_path(&dir) else {
         eprintln!("skipping: temp dir is not on a block device");
         return;
     };
@@ -318,7 +318,7 @@ fn image_on_the_source_disk_is_refused_on_this_host() {
     assert!(err.contains("Critical Safety Error"), "{err}");
 
     // The whole disk that partition sits on must be refused as well
-    let topo = engines::preflight::BlockTopology::default();
+    let topo = dfcore::sysfs::BlockTopology::default();
     if let Some(name) = topo.name_of(dev) {
         for disk in topo.backing_disks(&name) {
             let disk_node = Path::new("/dev").join(&disk);

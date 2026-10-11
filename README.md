@@ -70,6 +70,8 @@ Convert between raw byte streams (`.raw`, `.dd`, `.img`) and EnCase Expert Witne
 - **Zero-Accident Safety Guardrails**:
   - Live OS and root filesystem protection against overwrites or improper live acquisition.
   - One-touch safe partition unmounting (`umount`) before imaging begins.
+  - Refuses sources listed in the dfnix boot-time protected-device registry (via [`dfcore`](https://github.com/tylerstyle/dfcore)).
+  - Records every acquisition in the hash-chained dfnix audit log: a "started" record whose hash is printed in the `.info` report as **Audit Anchor**, and a "finished" record with the outcome, hashes and the SHA-256 of the report.
   - Refuses to start if any output of the same acquisition (`.E01`/`.E02`…, `.raw`, `.map`, `.info`) already exists, including when drives without a serial number collide on `NOSERIAL`.
   - Refuses output directories stored on the source's own physical disk (any partition, or LVM/RAID/crypt/loop stacks on it).
   - Calculates all selected digests (MD5, SHA-1, SHA-256) in a single read pass over the source; only the selected digests are verified.

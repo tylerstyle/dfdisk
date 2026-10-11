@@ -457,13 +457,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "dfcore"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "dfdisk"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "chrono",
  "clap",
  "crossterm",
+ "dfcore",
  "digest 0.11.3",
  "futures",
  "hex",

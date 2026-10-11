@@ -109,6 +109,10 @@ pub struct ForensicInfoReport {
     #[serde(default)]
     pub verification_status: VerificationStatus,
     pub generated_files: Vec<String>,
+    /// Hash of the audit-log record written when this acquisition started; the
+    /// matching "finished" record carries this report's SHA-256
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_anchor: Option<String>,
     /// How read errors were actually handled, when it differs from what the
     /// configuration's retry / wipe settings would suggest
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -374,6 +378,12 @@ impl ForensicInfoReport {
             }
         };
         out.push_str(&format!("{:<20}: {}\n", "Verification Result", status_str));
+        if let Some(anchor) = &self.audit_anchor {
+            out.push_str(&format!(
+                "{:<20}: {} (dfnix audit log)\n",
+                "Audit Anchor", anchor
+            ));
+        }
 
         if !self.generated_files.is_empty() {
             out.push_str("\n[GENERATED EVIDENCE FILES]\n");
@@ -411,6 +421,7 @@ mod tests {
             verification_passed: true,
             verification_status: VerificationStatus::Verified,
             generated_files: vec![],
+            audit_anchor: None,
             error_handling_note: None,
             incomplete: None,
         };
@@ -450,6 +461,7 @@ mod tests {
             verification_passed: false,
             verification_status: VerificationStatus::Incomplete,
             generated_files: vec![],
+            audit_anchor: None,
             error_handling_note: Some("None (stops at first read error)".to_string()),
             incomplete: Some(IncompleteAcquisition {
                 bytes_acquired: 3584,
