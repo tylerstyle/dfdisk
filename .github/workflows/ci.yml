@@ -14,8 +14,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Checkout sibling dfcore
-        run: git clone https://github.com/tylerstyle/dfcore.git ../dfcore
+      - name: Checkout sibling dfcore at the locked revision
+        run: |
+          rev=$(jq -r '.nodes.dfcore.locked.rev' flake.lock)
+          git clone https://github.com/tylerstyle/dfcore.git ../dfcore
+          git -C ../dfcore checkout --detach "$rev"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -35,3 +38,19 @@ jobs:
 
       - name: Run unit and integration tests
         run: cargo test --verbose
+
+  nix:
+    name: Nix Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v14
+
+      - name: Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      - name: Build package (runs the test suite in the Nix sandbox)
+        run: nix build -L .#default
