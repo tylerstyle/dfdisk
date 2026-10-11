@@ -65,6 +65,7 @@ pub fn finished(
     let mut event = Event::new(TOOL, VERSION, "acquisition_finished")
         .device(identity(device))
         .detail("engine", engine);
+    let mut refused = false;
     match result {
         Ok(report) => {
             event = event
@@ -85,7 +86,7 @@ pub fn finished(
                 );
         }
         Err(e) => {
-            let refused = e.contains("Refusing")
+            refused = e.contains("Refusing")
                 || e.contains("Critical Safety Error")
                 || e.contains("ABORT");
             event = event.outcome(
@@ -99,7 +100,9 @@ pub fn finished(
         }
     }
     record(event);
-    if output_dir.is_dir() {
+    // A refused acquisition writes nothing to its destination, which may well be
+    // the very disk the refusal protects
+    if !refused && output_dir.is_dir() {
         if let Err(e) = audit::export(&audit::path(), output_dir) {
             eprintln!(
                 "[!] WARNING: audit log not copied to {}: {e:#}",
