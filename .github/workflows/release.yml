@@ -27,6 +27,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Checkout sibling dfcore
+        run: git clone https://github.com/tylerstyle/dfcore.git ../dfcore
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -68,6 +71,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      - name: Checkout sibling dfcore
+        run: git clone https://github.com/tylerstyle/dfcore.git ../dfcore
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
