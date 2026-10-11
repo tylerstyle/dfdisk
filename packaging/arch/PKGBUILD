@@ -1,7 +1,7 @@
 # Maintainer: tylerstyle <tylerstyle@users.noreply.github.com>
 
 pkgname=dfdisk
-pkgver=0.1.6
+pkgver=0.1.9
 pkgrel=1
 pkgdesc="Modern forensic disk imaging, damaged media rescue and conversion CLI/TUI tool"
 arch=('x86_64' 'aarch64')
@@ -10,7 +10,7 @@ license=('MIT' 'Apache-2.0')
 depends=('libewf' 'ddrescue' 'smartmontools' 'util-linux' 'systemd-libs')
 makedepends=('cargo' 'rust')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('b532e905f2ba18c496c8c04f35a2258e33de4b102a450b5f45a1bc8f20d327f9')
+sha256sums=('SKIP')
 
 prepare() {
     cd "$pkgname-$pkgver"

@@ -1,3 +1,26 @@
+dfdisk (0.1.9-1) unstable; urgency=medium
+
+  * Base software stack update across dependencies (tokio 1.53.2, clap 4.6.7,
+    serde_json 1.0.152, thiserror 2.0.21, libc 0.2.190, mio 1.2.4, rustix 1.1.5).
+  * Synchronize downstream packaging definitions and Nix derivation.
+
+ -- tylerstyle <tylerstyle@users.noreply.github.com>  Sun, 11 Oct 2026 08:48:00 +0200
+
+dfdisk (0.1.8-1) unstable; urgency=medium
+
+  * Responsive small-terminal action button rendering with line wrapping.
+  * Persistent busy state indicator in footer for active operations.
+  * Implement Default for App struct and add render_screenshots example.
+
+ -- tylerstyle <tylerstyle@users.noreply.github.com>  Tue, 29 Sep 2026 10:45:00 +0200
+
+dfdisk (0.1.7-1) unstable; urgency=medium
+
+  * Automate NUR package distribution and release webhook triggers.
+  * Hardening of release build pipeline and channel resolution.
+
+ -- tylerstyle <tylerstyle@users.noreply.github.com>  Sun, 27 Sep 2026 14:00:00 +0200
+
 dfdisk (0.1.6-1) unstable; urgency=medium
 
   * Add native RAW streaming acquisition engine with in-flight multi-hashing.

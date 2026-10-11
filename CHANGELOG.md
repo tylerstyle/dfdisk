@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-10-11
+
+### Changed
+- **Software Stack Base Update**: Upgraded Rust dependencies to latest compatible patch releases (`tokio 1.53.2`, `clap 4.6.7`, `serde_json 1.0.152`, `thiserror 2.0.21`, `libc 0.2.190`, `mio 1.2.4`, `rustix 1.1.5`, `smallvec 1.16.3`, `uuid 1.28.0`).
+- **Packaging Synchronization**: Synchronized package specifications, manifests, and changelogs across Arch Linux (`PKGBUILD`, `.SRCINFO`), Debian (`changelog`), and Nixpkgs derivations (`package.nix`, `packaging/nixpkgs/package.nix`).
+
+---
+
+## [0.1.8] - 2026-09-29
+
+### Added
+- **Responsive Small-Terminal Action Buttons**: Added wrapping and multi-row button rendering for action buttons on compact or narrow terminal displays.
+- **Persistent Busy Status**: Added persistent footer busy indicator and operational state cues during active background operations.
+- **Documentation Screenshots**: Added `examples/render_screenshots.rs` for capturing standardized high-fidelity TUI screenshots.
+- **Trait Implementations**: Implemented `Default` for `App` struct.
+
+---
+
+## [0.1.7] - 2026-09-27
+
+### Added
+- **Automated NUR Distribution**: Integrated automated release workflow in GitHub Actions to compute SRI source hashes and vendor `cargoHash`, automatically updating `tylerstyle/nur-packages` and triggering NUR index webhooks.
+- **Pipeline Hardening**: Pinned and verified Nix channel resolution for release automation.
+
+---
+
 ## [0.1.6] - 2026-09-18
 
 ### Added
