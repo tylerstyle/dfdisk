@@ -27,8 +27,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Checkout sibling dfcore
-        run: git clone https://github.com/tylerstyle/dfcore.git ../dfcore
+      - name: Checkout sibling dfcore at the locked revision
+        run: |
+          rev=$(jq -r '.nodes.dfcore.locked.rev' flake.lock)
+          git clone https://github.com/tylerstyle/dfcore.git ../dfcore
+          git -C ../dfcore checkout --detach "$rev"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -72,8 +75,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Checkout sibling dfcore
-        run: git clone https://github.com/tylerstyle/dfcore.git ../dfcore
+      - name: Checkout sibling dfcore at the locked revision
+        run: |
+          rev=$(jq -r '.nodes.dfcore.locked.rev' flake.lock)
+          git clone https://github.com/tylerstyle/dfcore.git ../dfcore
+          git -C ../dfcore checkout --detach "$rev"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -151,6 +157,20 @@ jobs:
           SRC_PREFETCH=$(nix-prefetch-url --unpack "$TARBALL_URL")
           SRC_HASH=$(nix hash convert --to sri "sha256:$SRC_PREFETCH")
           echo "src_hash=$SRC_HASH" >> "$GITHUB_OUTPUT"
+
+          # dfcore is a ../dfcore path dependency; the NUR derivation pins the
+          # revision locked in flake.lock. For github inputs narHash equals the
+          # fetchFromGitHub hash.
+          DFCORE_REV=$(jq -r '.nodes.dfcore.locked.rev' flake.lock)
+          DFCORE_HASH=$(jq -r '.nodes.dfcore.locked.narHash' flake.lock)
+          if [ -z "$DFCORE_REV" ] || [ "$DFCORE_REV" = null ] || [ -z "$DFCORE_HASH" ] || [ "$DFCORE_HASH" = null ]; then
+            echo "flake.lock has no locked dfcore input"
+            exit 1
+          fi
+          {
+            echo "dfcore_rev=$DFCORE_REV"
+            echo "dfcore_hash=$DFCORE_HASH"
+          } >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           echo "Calculating cargo vendor hash..."
@@ -191,9 +211,16 @@ jobs:
           SRC_HASH="${{ steps.hashes.outputs.src_hash }}"
           CARGO_HASH="${{ steps.hashes.outputs.cargo_hash }}"
 
+          DFCORE_REV="${{ steps.hashes.outputs.dfcore_rev }}"
+          DFCORE_HASH="${{ steps.hashes.outputs.dfcore_hash }}"
+
+          # Each fetchFromGitHub block is addressed by its repo line so the
+          # dfdisk and dfcore hashes are updated independently
           sed -i -E "s/version = \"[^\"]+\";/version = \"$VERSION\";/" "$TARGET_FILE"
-          sed -i -E "s|hash = \"sha256-[^\"]+\";|hash = \"$SRC_HASH\";|" "$TARGET_FILE"
+          sed -i -E "/repo = \"dfdisk\";/,/hash = /s|hash = \"sha256-[^\"]+\";|hash = \"$SRC_HASH\";|" "$TARGET_FILE"
+          sed -i -E "/repo = \"dfcore\";/,/hash = /{s|rev = \"[0-9a-f]+\";|rev = \"$DFCORE_REV\";|;s|hash = \"sha256-[^\"]+\";|hash = \"$DFCORE_HASH\";|}" "$TARGET_FILE"
           sed -i -E "s|cargoHash = \"sha256-[^\"]+\";|cargoHash = \"$CARGO_HASH\";|" "$TARGET_FILE"
+          grep -q "rev = \"$DFCORE_REV\";" "$TARGET_FILE" || { echo "dfcore pin not updated in $TARGET_FILE"; exit 1; }
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
