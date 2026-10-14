@@ -13,16 +13,7 @@ const TOOL: &str = "dfdisk";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn identity(device: &BlockDevice) -> DeviceIdentity {
-    DeviceIdentity {
-        path: device.path.clone(),
-        kernel_name: device.name.clone(),
-        maj_min: None,
-        serial: device.serial.clone().filter(|s| !s.trim().is_empty()),
-        wwn: device.wwn.clone().filter(|s| !s.trim().is_empty()),
-        model: Some(device.display_name()),
-        size: Some(device.size_bytes.to_string()),
-        diskseq: None,
-    }
+    device.device_identity()
 }
 
 fn record(event: Event) -> Option<String> {
@@ -70,20 +61,38 @@ pub fn finished(
     match result {
         Ok(report) => {
             event = event
-                .detail("verification", format!("{:?}", report.verification_status))
-                .detail("bad_sectors", report.bad_sectors_count)
                 .detail(
-                    "source_hashes",
-                    serde_json::to_value(&report.source_hashes).unwrap_or_default(),
+                    "outcome",
+                    serde_json::to_value(report.outcome).unwrap_or_default(),
+                )
+                .detail("exit_code", report.exit_code)
+                .detail("outcome_reason", report.outcome_reason.clone())
+                .detail("bytes_acquired", report.bytes_acquired)
+                .detail("expected_bytes", report.expected_bytes)
+                .detail(
+                    "read_errors",
+                    serde_json::json!({
+                        "ranges": report.read_errors.ranges.len(),
+                        "substituted_bytes": report.read_errors.substituted_bytes(),
+                        "unread_bytes": report.read_errors.unread_bytes(),
+                    }),
+                )
+                .detail(
+                    "acquisition_hashes",
+                    serde_json::to_value(&report.acquisition_hashes).unwrap_or_default(),
                 )
                 .detail(
                     "image_hashes",
-                    serde_json::to_value(&report.destination_hashes).unwrap_or_default(),
+                    serde_json::to_value(&report.image_hashes).unwrap_or_default(),
                 )
-                .detail("files", report.generated_files.clone())
+                .detail("files", report.image_files.clone())
                 .detail(
                     "report_sha256",
                     hex::encode(Sha256::digest(report.render_text().as_bytes())),
+                )
+                .detail(
+                    "report_json_sha256",
+                    hex::encode(Sha256::digest(report.to_json().as_bytes())),
                 );
         }
         Err(e) => {

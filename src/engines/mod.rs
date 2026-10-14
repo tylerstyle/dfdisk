@@ -3,6 +3,7 @@ pub mod converter;
 pub mod error;
 pub mod ewf;
 pub mod hasher;
+pub(crate) mod legacy;
 pub mod preflight;
 pub mod process;
 pub mod raw;

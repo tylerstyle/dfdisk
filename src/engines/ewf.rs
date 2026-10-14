@@ -1,14 +1,14 @@
-use crate::engines::preflight;
+use crate::engines::{legacy, preflight};
 use crate::models::{
     case::CaseMetadata,
-    config::AcquisitionConfig,
+    config::{AcquisitionConfig, EngineKind},
     device::BlockDevice,
     info_report::{
-        compare_selected, ForensicInfoReport, HashResults, HashSelection, VerificationStatus,
+        compare_digests, ForensicInfoReport, HashResults, HashSelection, VerificationInfo,
     },
+    outcome::{Outcome, VerificationResult},
     telemetry::{AcquisitionStatus, ProgressTelemetry},
 };
-use chrono::Utc;
 use regex::Regex;
 use std::fs;
 use std::process::Stdio;
@@ -52,8 +52,8 @@ impl EwfAcquireEngine {
         abort_flag: Arc<AtomicBool>,
         audit_anchor: Option<String>,
     ) -> Result<ForensicInfoReport, String> {
-        let start_time = Utc::now();
-        let instant_start = Instant::now();
+        let run = legacy::RunClock::start();
+        let instant_start = run.instant;
 
         // Target path without extension (ewfacquire appends .E01 automatically)
         let base_name = case.base_filename_checked(&device.display_serial())?;
@@ -242,14 +242,6 @@ impl EwfAcquireEngine {
             .await
             .map_err(|e| format!("Failed to wait on ewfacquire: {}", e))?;
 
-        let end_time = Utc::now();
-        let elapsed_seconds = instant_start.elapsed().as_secs();
-        let avg_speed = if elapsed_seconds > 0 {
-            device.size_bytes as f64 / elapsed_seconds as f64
-        } else {
-            0.0
-        };
-
         if !status.success() {
             telemetry.status = AcquisitionStatus::Failed(format!(
                 "ewfacquire exited with code {:?}",
@@ -371,58 +363,48 @@ impl EwfAcquireEngine {
             ));
         }
 
-        let verification_status =
-            match compare_selected(selection, &source_hashes, &destination_hashes) {
-                VerificationStatus::Verified if !(v_status.success() && ewfverify_success) => {
-                    VerificationStatus::Failed
-                }
-                status => status,
-            };
-        let hashes_match = verification_status == VerificationStatus::Verified;
-
-        let report = ForensicInfoReport {
-            tool_name: "dfdisk".to_string(),
-            tool_version: env!("CARGO_PKG_VERSION").to_string(),
-            case_metadata: case.clone(),
-            device: device.clone(),
-            config: config.clone(),
-            started_at: start_time,
-            ended_at: end_time,
-            elapsed_seconds,
-            average_speed_bytes_sec: avg_speed,
-            bad_sectors_count: bad_sectors,
-            source_hashes,
-            destination_hashes,
-            verification_passed: hashes_match,
-            verification_status,
-            generated_files: generated_files.clone(),
-            audit_anchor: audit_anchor.clone(),
-            error_handling_note: None,
-            incomplete: None,
+        let digests = ewf_digest_list(selection, true).unwrap_or_default();
+        let method = format!("ewfverify -d {digests} (image re-read)");
+        let result = if v_status.success() && ewfverify_success {
+            compare_digests(selection, &source_hashes, &destination_hashes, &method)
+        } else {
+            VerificationResult::Failed {
+                reason: format!("ewfverify exited with status {:?}", v_status.code()),
+            }
         };
 
-        // Write .info sidecar report atomically and propagate errors
-        let info_filename = case.generate_filename(&device.display_serial(), "info");
-        let info_path = config.output_dir.join(&info_filename);
-        let tmp_info_path = config.output_dir.join(format!("{}.tmp", info_filename));
-        std::fs::write(&tmp_info_path, report.render_text()).map_err(|e| {
-            format!(
-                "Failed to write forensic report to temporary file {}: {}",
-                tmp_info_path.display(),
-                e
-            )
-        })?;
-        std::fs::rename(&tmp_info_path, &info_path).map_err(|e| {
-            format!(
-                "Failed to finalize forensic report {}: {}",
-                info_path.display(),
-                e
-            )
-        })?;
+        let mut report = legacy::new_report(
+            EngineKind::Ewf,
+            &device,
+            &case,
+            &config,
+            &base_name,
+            &run,
+            &audit_anchor,
+        );
+        // ewfacquire finished successfully; this engine version does not yet
+        // cross-check the media size with ewfinfo
+        report.bytes_acquired = device.size_bytes;
+        if bad_sectors > 0 {
+            report.stop_reason = Some(format!(
+                "ewfacquire reported {bad_sectors} unreadable sectors whose positions this engine version does not record"
+            ));
+        }
+        report.acquisition_hashes = source_hashes;
+        report.image_hashes = destination_hashes;
+        report.verification = VerificationInfo {
+            result,
+            method,
+            source_reread: None,
+        };
+        report.image_files = generated_files.clone();
+        legacy::finish_report(&mut report, &run, device.size_bytes);
+        let files = legacy::write_reports(&report, &config.output_dir, &base_name)?;
         telemetry.push_log(format!(
-            "Forensic certificate saved to: {}",
-            info_path.display()
+            "Forensic report saved to: {}",
+            files.text.display()
         ));
+        let hashes_match = report.outcome == Outcome::Verified;
 
         telemetry.status = AcquisitionStatus::Completed;
         telemetry.percentage = 100.0;
@@ -611,10 +593,7 @@ SHA256 hash calculated over data:\tb0a771d9cfebc5f2609d54de66263a89b45139a01e6ab
 ewfacquire: SUCCESS";
         let src = parse_all(acquire);
         let dst = parse_all(EWFVERIFY_SHA256_ONLY);
-        assert_eq!(
-            compare_selected(sel, &src, &dst),
-            VerificationStatus::Verified
-        );
+        assert!(compare_digests(sel, &src, &dst, "ewfverify").is_matched());
     }
 
     #[test]
@@ -645,10 +624,7 @@ ewfacquire: SUCCESS";
             sha1: Some("b".repeat(40)),
             sha256: Some("c".repeat(64)),
         };
-        assert_eq!(
-            compare_selected(sel, &src, &dst),
-            VerificationStatus::Verified
-        );
+        assert!(compare_digests(sel, &src, &dst, "ewfverify").is_matched());
 
         let md5_only = AcquisitionConfig {
             calc_sha1: false,

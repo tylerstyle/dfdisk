@@ -1,13 +1,13 @@
 use crate::engines::hasher::MultiHasher;
-use crate::engines::preflight;
+use crate::engines::{legacy, preflight};
 use crate::models::{
     case::CaseMetadata,
-    config::AcquisitionConfig,
+    config::{AcquisitionConfig, EngineKind},
     device::BlockDevice,
-    info_report::{ForensicInfoReport, VerificationStatus},
+    info_report::{FileDigest, ForensicInfoReport, VerificationInfo},
+    outcome::VerificationResult,
     telemetry::{AcquisitionStatus, ProgressTelemetry},
 };
-use chrono::Utc;
 use regex::Regex;
 use std::fs;
 use std::process::Stdio;
@@ -51,8 +51,8 @@ impl RescueAcquireEngine {
         abort_flag: Arc<AtomicBool>,
         audit_anchor: Option<String>,
     ) -> Result<ForensicInfoReport, String> {
-        let start_time = Utc::now();
-        let instant_start = Instant::now();
+        let run = legacy::RunClock::start();
+        let instant_start = run.instant;
 
         let base_name = case.base_filename_checked(&device.display_serial())?;
         let raw_filename = format!("{}.raw", base_name);
@@ -297,67 +297,43 @@ impl RescueAcquireEngine {
         )
         .await?;
 
-        let end_time = Utc::now();
-        let elapsed_seconds = instant_start.elapsed().as_secs();
-        let avg_speed = if elapsed_seconds > 0 {
-            device.size_bytes as f64 / elapsed_seconds as f64
-        } else {
-            0.0
+        let image_len = fs::metadata(&raw_path).map(|m| m.len()).unwrap_or(0);
+        let (bytes_acquired, stop_reason) =
+            rescue_extent(bad_sectors, image_len, device.size_bytes);
+
+        let mut report = legacy::new_report(
+            EngineKind::Rescue,
+            &device,
+            &case,
+            &config,
+            &base_name,
+            &run,
+            &audit_anchor,
+        );
+        report.bytes_acquired = bytes_acquired;
+        report.stop_reason = stop_reason;
+        report.read_errors.source =
+            "ddrescue screen output (map not parsed by this engine version)".into();
+        // ddrescue does not hash what it reads: there is no acquisition stream
+        // digest to compare the image with
+        report.image_hashes = hashes;
+        report.verification = VerificationInfo {
+            result: VerificationResult::NotPossible {
+                reason: "ddrescue computes no digest while reading and the source was not read a second time".into(),
+            },
+            method: "image digests computed by dfdisk after ddrescue finished".into(),
+            source_reread: None,
         };
-
-        let generated_files = vec![
-            raw_path.to_string_lossy().to_string(),
-            map_path.to_string_lossy().to_string(),
-        ];
-
-        // Record effective engine settings: ddrescue always outputs RAW with no compression or splitting
-        let mut effective_config = config.clone();
-        effective_config.format = crate::models::config::ImageFormat::Raw;
-        effective_config.compression = crate::models::config::CompressionLevel::None;
-        effective_config.split_size = crate::models::config::SplitSize::None;
-
-        let report = ForensicInfoReport {
-            tool_name: "dfdisk (ddrescue engine)".to_string(),
-            tool_version: env!("CARGO_PKG_VERSION").to_string(),
-            case_metadata: case.clone(),
-            device: device.clone(),
-            config: effective_config,
-            started_at: start_time,
-            ended_at: end_time,
-            elapsed_seconds,
-            average_speed_bytes_sec: avg_speed,
-            bad_sectors_count: bad_sectors,
-            // Source hashes cannot be computed over damaged media containing bad/unreadable sectors.
-            // Truthful forensic practice reports source_hashes as uncomputed (None) and destination_hashes
-            // as the integrity hashes of the resulting image file.
-            source_hashes: crate::models::info_report::HashResults::default(),
-            destination_hashes: hashes,
-            verification_passed: false,
-            verification_status: VerificationStatus::DamagedMedia,
-            generated_files,
-            audit_anchor: audit_anchor.clone(),
-            error_handling_note: None,
-            incomplete: None,
-        };
-
-        // Write court certificate sidecar atomically and propagate errors
-        let info_filename = case.generate_filename(&device.display_serial(), "info");
-        let info_path = config.output_dir.join(&info_filename);
-        let tmp_info_path = config.output_dir.join(format!("{}.tmp", info_filename));
-        std::fs::write(&tmp_info_path, report.render_text()).map_err(|e| {
-            format!(
-                "Failed to write forensic report to temporary file {}: {}",
-                tmp_info_path.display(),
-                e
-            )
-        })?;
-        std::fs::rename(&tmp_info_path, &info_path).map_err(|e| {
-            format!(
-                "Failed to finalize forensic report {}: {}",
-                info_path.display(),
-                e
-            )
-        })?;
+        report.image_files = vec![raw_path.to_string_lossy().to_string()];
+        match FileDigest::compute(&map_path) {
+            Ok(d) => report.auxiliary_files.push(d),
+            Err(e) => report.notes.push(format!(
+                "ddrescue map {} not hashed: {e}",
+                map_path.display()
+            )),
+        }
+        legacy::finish_report(&mut report, &run, bytes_acquired);
+        legacy::write_reports(&report, &config.output_dir, &base_name)?;
 
         telemetry.status = AcquisitionStatus::Completed;
         telemetry.percentage = 100.0;
@@ -366,6 +342,24 @@ impl RescueAcquireEngine {
 
         Ok(report)
     }
+}
+
+/// Bytes this engine version can claim for a rescue, and why it is not the
+/// whole source: it reads unreadable sectors from ddrescue's screen output,
+/// not their ranges from the map, so any reported bad sector makes the
+/// acquisition count as incomplete rather than as complete.
+pub fn rescue_extent(bad_sectors: u64, image_len: u64, expected: u64) -> (u64, Option<String>) {
+    let acquired = image_len.min(expected);
+    let stop = if bad_sectors > 0 {
+        Some(format!(
+            "ddrescue reported {bad_sectors} unreadable sectors; this engine version does not read their ranges from the map file"
+        ))
+    } else if acquired < expected {
+        Some(format!("the image holds {acquired} of {expected} bytes"))
+    } else {
+        None
+    };
+    (acquired, stop)
 }
 
 pub fn parse_size_to_bytes(val: f64, unit: &str) -> u64 {
@@ -415,71 +409,68 @@ mod tests {
     }
 
     #[test]
+    fn rescue_never_claims_more_than_it_knows() {
+        // Clean and full length: complete, but without a source digest
+        assert_eq!(rescue_extent(0, 1000, 1000), (1000, None));
+        // Bad sectors without ranges: not complete
+        let (n, stop) = rescue_extent(5, 1000, 1000);
+        assert_eq!(n, 1000);
+        assert!(stop.unwrap().contains("5 unreadable sectors"));
+        // Short image
+        let (n, stop) = rescue_extent(0, 600, 1000);
+        assert_eq!(n, 600);
+        assert!(stop.unwrap().contains("600 of 1000 bytes"));
+    }
+
+    #[test]
     fn test_rescue_report_hash_truthfulness() {
-        let hashes = crate::models::info_report::HashResults {
+        use crate::models::{
+            config::EffectiveConfig, identity::SourceIdentity, info_report::HashResults,
+            outcome::Outcome,
+        };
+        let device = BlockDevice {
+            name: "sdc".to_string(),
+            path: "/dev/dfdisk-test-sdc".to_string(),
+            size_bytes: 1000,
+            logical_sector_size: 512,
+            physical_sector_size: 512,
+            ..Default::default()
+        };
+        let config = AcquisitionConfig {
+            rescue_mode: true,
+            ..Default::default()
+        };
+        let source = SourceIdentity::from_block_device(&device);
+        let mut report = ForensicInfoReport::new(
+            EngineKind::Rescue,
+            &CaseMetadata::default(),
+            source.clone(),
+            EffectiveConfig::build(&config, Some(&source)),
+        );
+        report.bytes_acquired = 1000;
+        report.image_hashes = HashResults {
             md5: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
             sha1: None,
-            sha256: Some(
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
-            ),
+            sha256: None,
         };
-
-        let report = ForensicInfoReport {
-            tool_name: "dfdisk (ddrescue engine)".to_string(),
-            tool_version: "0.1.1".to_string(),
-            case_metadata: CaseMetadata::default(),
-            device: BlockDevice {
-                name: "sdc".to_string(),
-                path: "/dev/sdc".to_string(),
-                devlinks: vec![],
-                size_bytes: 1000,
-                model: None,
-                vendor: None,
-                serial: None,
-                wwn: None,
-                revision: None,
-                bus_type: "USB".to_string(),
-                is_rotational: Some(true),
-                is_removable: true,
-                is_read_only: false,
-                logical_sector_size: 512,
-                physical_sector_size: 512,
-                partition_table_type: None,
-                partitions: vec![],
-                mountpoints: vec![],
-                safety: crate::models::device::DeviceSafety::Safe,
-                smart: None,
-                ..Default::default()
-            },
-            config: AcquisitionConfig::default(),
-            started_at: Utc::now(),
-            ended_at: Utc::now(),
-            elapsed_seconds: 10,
-            average_speed_bytes_sec: 100.0,
-            bad_sectors_count: 5,
-            source_hashes: crate::models::info_report::HashResults::default(),
-            destination_hashes: hashes,
-            verification_passed: false,
-            verification_status: VerificationStatus::DamagedMedia,
-            generated_files: vec!["test.raw".to_string()],
-            audit_anchor: None,
-            error_handling_note: None,
-            incomplete: None,
+        report.verification.result = VerificationResult::NotPossible {
+            reason: "ddrescue computes no digest".into(),
         };
+        report.apply_classification();
 
-        // Source hashes must be empty (cannot be computed over damaged media)
-        assert!(report.source_hashes.md5.is_none());
-        assert!(report.source_hashes.sha1.is_none());
-        assert!(report.source_hashes.sha256.is_none());
-
-        // Destination hashes are present
-        assert!(report.destination_hashes.md5.is_some());
-        assert!(!report.verification_passed);
-        assert_eq!(report.verification_status, VerificationStatus::DamagedMedia);
-
-        // Rendered text must state warning / verification incomplete
+        // No acquisition digest is invented; the verdict says unverified
+        assert!(report.acquisition_hashes.is_empty());
+        assert_eq!(report.outcome, Outcome::CompleteUnverified);
+        assert_eq!(report.exit_code, 9);
         let text = report.render_text();
-        assert!(text.contains("WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE"));
+        assert!(text.contains("COMPLETE, NOT VERIFIED"), "{text}");
+        assert!(text.contains("--verify-source"), "{text}");
+        assert!(!text.contains("ALL HASHES MATCH"));
+
+        let (_, stop) = rescue_extent(5, 1000, 1000);
+        report.stop_reason = stop;
+        report.apply_classification();
+        assert_eq!(report.outcome, Outcome::Incomplete);
     }
 
     #[test]

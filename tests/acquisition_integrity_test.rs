@@ -6,7 +6,8 @@ use dfdisk::{
     models::{
         self,
         config::{AcquisitionConfig, ImageFormat},
-        info_report::VerificationStatus,
+        info_report::ForensicInfoReport,
+        outcome::Outcome,
     },
 };
 use digest::Digest;
@@ -79,6 +80,14 @@ async fn raw_short_source_keeps_partial_image_and_reports_incomplete() {
     assert!(!text.contains("Zero-fill"), "{text}");
     assert!(text.contains(engines::raw::RAW_ERROR_HANDLING), "{text}");
     assert!(!text.contains("VERIFIED - ALL HASHES MATCH"), "{text}");
+    // The JSON twin carries the same verdict and facts
+    let json = std::fs::read_to_string(info.with_extension("info.json")).unwrap();
+    let report = ForensicInfoReport::from_json(&json).unwrap();
+    assert_eq!(report.outcome, Outcome::Incomplete);
+    assert_eq!(report.exit_code, 6);
+    assert_eq!(report.bytes_acquired, 10);
+    assert_eq!(report.expected_bytes, 1000);
+    assert!(report.stop_reason.unwrap().contains("after 10 bytes"));
 }
 
 #[tokio::test]
@@ -107,15 +116,15 @@ async fn raw_complete_report_states_real_error_handling() {
     .unwrap();
 
     // Disabling SHA-1 must not turn into a mismatch
-    assert_eq!(report.verification_status, VerificationStatus::Verified);
-    assert!(report.source_hashes.sha1.is_none());
+    assert_eq!(report.outcome, Outcome::Verified);
+    assert!(report.acquisition_hashes.sha1.is_none());
     assert_eq!(
-        report.source_hashes.sha256,
+        report.acquisition_hashes.sha256,
         Some(hex::encode(sha2::Sha256::digest(&data)))
     );
     let text = report.render_text();
     assert!(!text.contains("Zero-fill"), "{text}");
-    assert!(report.incomplete.is_none());
+    assert!(report.stop_reason.is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -202,20 +211,20 @@ async fn ewf_all_digests_in_one_pass_verify() {
     let Some((data, report)) = run_ewf("all", true, true).await else {
         return;
     };
-    assert_eq!(report.verification_status, VerificationStatus::Verified);
+    assert_eq!(report.outcome, Outcome::Verified);
     assert_eq!(
-        report.source_hashes.md5,
+        report.acquisition_hashes.md5,
         Some(hex::encode(md5::Md5::digest(&data)))
     );
     assert_eq!(
-        report.source_hashes.sha1,
+        report.acquisition_hashes.sha1,
         Some(hex::encode(sha1::Sha1::digest(&data)))
     );
     assert_eq!(
-        report.source_hashes.sha256,
+        report.acquisition_hashes.sha256,
         Some(hex::encode(sha2::Sha256::digest(&data)))
     );
-    assert_eq!(report.source_hashes.sha1, report.destination_hashes.sha1);
+    assert_eq!(report.acquisition_hashes.sha1, report.image_hashes.sha1);
 }
 
 #[tokio::test]
@@ -223,10 +232,10 @@ async fn ewf_without_sha1_has_no_false_mismatch() {
     let Some((data, report)) = run_ewf("nosha1", false, true).await else {
         return;
     };
-    assert_eq!(report.verification_status, VerificationStatus::Verified);
-    assert!(report.source_hashes.sha1.is_none());
+    assert_eq!(report.outcome, Outcome::Verified);
+    assert!(report.acquisition_hashes.sha1.is_none());
     assert_eq!(
-        report.source_hashes.sha256,
+        report.acquisition_hashes.sha256,
         Some(hex::encode(sha2::Sha256::digest(&data)))
     );
 }
@@ -236,8 +245,8 @@ async fn ewf_without_sha256_has_no_false_mismatch() {
     let Some((_, report)) = run_ewf("nosha256", true, false).await else {
         return;
     };
-    assert_eq!(report.verification_status, VerificationStatus::Verified);
-    assert!(report.source_hashes.sha256.is_none());
+    assert_eq!(report.outcome, Outcome::Verified);
+    assert!(report.acquisition_hashes.sha256.is_none());
 }
 
 // ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@ use crate::models::{
     case::CaseMetadata,
     config::{AcquisitionConfig, CompressionLevel, ImageFormat, SplitSize},
     device::{BlockDevice, DeviceSafety},
-    info_report::VerificationStatus,
+    outcome::Outcome,
     telemetry::AcquisitionStatus,
 };
 use std::path::Path;
@@ -389,42 +389,27 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
     match report_res {
         Ok(report) => {
             println!("{}", report.render_text());
-            match report.verification_status {
-                VerificationStatus::Verified => {
-                    println!("[+] Acquisition and verification completed successfully!");
-                    Ok(())
-                }
-                VerificationStatus::DamagedMedia => {
-                    println!(
-                        "[!] Resilient acquisition completed with {} bad/unreadable sectors.",
-                        report.bad_sectors_count
-                    );
-                    println!(
-                        "    Destination image hashes recorded. Live source verification skipped due to media defects."
-                    );
-                    Ok(())
-                }
-                VerificationStatus::Mismatch => {
-                    eprintln!("[!] CRITICAL FORENSIC ERROR: Cryptographic verification failed!");
-                    eprintln!("    Destination image hashes do NOT match source hashes. Evidence integrity compromised.");
-                    Err("Cryptographic verification failed: hash mismatch detected.".into())
-                }
-                VerificationStatus::Failed => {
-                    eprintln!("[!] Acquisition finished, but cryptographic verification failed or could not be completed.");
-                    Err("Verification failed.".into())
-                }
-                VerificationStatus::Incomplete => {
-                    eprintln!("[!] Acquisition stopped before the end of the source; the image is partial.");
-                    Err("Acquisition incomplete.".into())
-                }
-                VerificationStatus::NotVerified => {
-                    if report.verification_passed {
-                        println!("[+] Acquisition and verification completed successfully!");
+            // The verdict comes from the report (classify); only VERIFIED is success
+            for line in report.verdict_lines() {
+                println!(
+                    "[{}] {}",
+                    if report.outcome == Outcome::Verified {
+                        "+"
                     } else {
-                        println!("[+] Acquisition completed (verification not requested).");
-                    }
-                    Ok(())
-                }
+                        "!"
+                    },
+                    line
+                );
+            }
+            if report.outcome == Outcome::Verified {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} (exit code {} once the 0.2.0 exit codes are wired up)",
+                    report.outcome.label(),
+                    report.exit_code
+                )
+                .into())
             }
         }
         Err(e) => {

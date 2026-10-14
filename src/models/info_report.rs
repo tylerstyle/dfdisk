@@ -1,522 +1,1527 @@
-use crate::models::{
-    case::CaseMetadata,
-    config::AcquisitionConfig,
-    device::{format_bytes, BlockDevice},
+//! The forensic report of an acquisition (schema 2, §3): `<base>.info` for
+//! people and its machine-readable twin `<base>.info.json`, both written
+//! atomically and fsynced ([`ForensicInfoReport::write_reports`]).
+//!
+//! The text starts with the verdict, which comes only from
+//! [`classify`](crate::models::outcome::classify) over the facts in the report
+//! (P1). Every value is sanitised for terminals; "ALL HASHES MATCH" appears
+//! only for [`Outcome::Verified`]; timestamps say whether the clock was
+//! NTP-synchronised (R9).
+
+use crate::models::capacity::CapacityInfo;
+use crate::models::case::CaseMetadata;
+use crate::models::config::{EffectiveConfig, EngineKind, HashAlgorithm};
+use crate::models::device::SmartSnapshot;
+use crate::models::identity::SourceIdentity;
+use crate::models::outcome::{
+    classify_detailed, AcquisitionFacts, Outcome, RangeKind, ReadErrorTable, VerificationResult,
 };
+use crate::models::protection::WriteProtection;
+use crate::models::provenance::{ClockInfo, ToolProvenance};
+use crate::models::text::{format_iec, sanitize_line};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub use crate::models::config::HashSelection;
+
+/// Schema of `<base>.info.json`.
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
+/// Suffix of the text report.
+pub const INFO_SUFFIX: &str = ".info";
+/// Suffix of the JSON report.
+pub const INFO_JSON_SUFFIX: &str = ".info.json";
+/// Suffix of the space reservation file deleted right before the reports are
+/// written, so a full destination still gets its report (§3, R11).
+pub const RESERVE_SUFFIX: &str = ".info.reserve";
+/// Size of the reservation file.
+pub const RESERVE_BYTES: u64 = 1 << 20;
+/// Read-error ranges listed in the text report; the JSON has all of them.
+pub const TEXT_RANGE_LIMIT: usize = 200;
+
+const RULE: &str =
+    "================================================================================\n";
+const LABEL_WIDTH: usize = 22;
+
+/// Digests of one byte stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HashResults {
     pub md5: Option<String>,
     pub sha1: Option<String>,
     pub sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum VerificationStatus {
-    /// Source and destination hashes strictly match
-    Verified,
-    /// Hashes were computed for both source and destination, but do not match
-    Mismatch,
-    /// Damaged media rescue: live source hashing not possible due to bad sectors; destination image hashes recorded
-    DamagedMedia,
-    /// Verification failed due to read/write errors or incomplete execution
-    Failed,
-    /// Verification was not requested or skipped
-    #[default]
-    NotVerified,
-    /// Acquisition stopped before the end of the source; the image and its
-    /// hashes cover only the bytes that were read
-    Incomplete,
+impl HashResults {
+    pub fn get(&self, algorithm: HashAlgorithm) -> Option<&str> {
+        match algorithm {
+            HashAlgorithm::MD5 => self.md5.as_deref(),
+            HashAlgorithm::SHA1 => self.sha1.as_deref(),
+            HashAlgorithm::SHA256 => self.sha256.as_deref(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.md5.is_none() && self.sha1.is_none() && self.sha256.is_none()
+    }
+
+    /// (label, digest) of the digests present.
+    pub fn present(&self) -> Vec<(&'static str, &str)> {
+        [
+            HashAlgorithm::MD5,
+            HashAlgorithm::SHA1,
+            HashAlgorithm::SHA256,
+        ]
+        .into_iter()
+        .filter_map(|a| self.get(a).map(|d| (a.label(), d)))
+        .collect()
+    }
 }
 
-pub use crate::models::config::HashSelection;
-
-/// Compare source and destination digests for the selected algorithms only.
-/// Digests that were not selected are ignored, so disabling an algorithm can
-/// never produce a mismatch. A selected digest missing on either side fails.
-pub fn compare_selected(
+/// Compare the selected digests of the acquisition stream with those
+/// recomputed by `method`. Unselected digests are ignored (so disabling one
+/// never causes a mismatch); a selected digest missing on either side, or no
+/// selected digest at all, is `Failed`; any difference is `Mismatched`.
+pub fn compare_digests(
     selection: HashSelection,
-    source: &HashResults,
-    destination: &HashResults,
-) -> VerificationStatus {
-    let pairs = [
-        (selection.md5, &source.md5, &destination.md5),
-        (selection.sha1, &source.sha1, &destination.sha1),
-        (selection.sha256, &source.sha256, &destination.sha256),
-    ];
-    let mut compared = 0;
-    let mut missing = false;
-    for (selected, s, d) in pairs {
-        if !selected {
-            continue;
-        }
-        match (s, d) {
-            (Some(s), Some(d)) if !s.eq_ignore_ascii_case(d) => {
-                return VerificationStatus::Mismatch
-            }
-            (Some(_), Some(_)) => compared += 1,
-            _ => missing = true,
+    acquisition: &HashResults,
+    image: &HashResults,
+    method: &str,
+) -> VerificationResult {
+    if selection.is_empty() {
+        return VerificationResult::Failed {
+            reason: "no digest was selected".into(),
+        };
+    }
+    let mut mismatches = Vec::new();
+    let mut missing = Vec::new();
+    for alg in selection.algorithms() {
+        match (acquisition.get(alg), image.get(alg)) {
+            (Some(a), Some(b)) if !a.eq_ignore_ascii_case(b) => mismatches.push(format!(
+                "{} acquisition {} but recomputed {}",
+                alg.label(),
+                a,
+                b
+            )),
+            (Some(_), Some(_)) => {}
+            (None, _) => missing.push(format!(
+                "{} was not computed during the acquisition",
+                alg.label()
+            )),
+            (_, None) => missing.push(format!("{} was not recomputed", alg.label())),
         }
     }
-    if missing || compared == 0 {
-        VerificationStatus::Failed
+    if !mismatches.is_empty() {
+        VerificationResult::Mismatched {
+            method: method.to_string(),
+            details: mismatches.join("; "),
+        }
+    } else if !missing.is_empty() {
+        VerificationResult::Failed {
+            reason: missing.join("; "),
+        }
     } else {
-        VerificationStatus::Verified
+        VerificationResult::Matched {
+            method: method.to_string(),
+        }
     }
 }
 
-/// Why and where an acquisition stopped before the end of the source.
+/// How the acquisition was verified.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationInfo {
+    /// Image digests (re-read) against acquisition digests, or why not
+    pub result: VerificationResult,
+    /// e.g. "ewfverify -d md5,sha256 after flush and cache eviction"
+    pub method: String,
+    /// Second read of the source (`--verify-source`) against the acquisition
+    pub source_reread: Option<VerificationResult>,
+}
+
+/// Piecewise SHA-256 of a RAW acquisition (R5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IncompleteAcquisition {
-    pub bytes_acquired: u64,
-    pub expected_bytes: u64,
-    pub reason: String,
+pub struct PiecewiseInfo {
+    pub piece_size: u64,
+    /// `<base>.pieces.tsv`
+    pub file: String,
+    pub file_sha256: String,
+    pub count: u64,
+}
+
+/// A file with its SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDigest {
+    pub path: String,
+    pub sha256: String,
+}
+
+impl FileDigest {
+    /// SHA-256 of the file at `path` (streamed).
+    pub fn compute(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            path: path.to_string_lossy().into_owned(),
+            sha256: sha256_file(path)?,
+        })
+    }
+}
+
+/// SHA-256 (hex) of a file's content.
+pub fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut f = File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        h.update(&buf[..n]);
+    }
+    Ok(hex::encode(h.finalize()))
+}
+
+/// SHA-256 (hex) of bytes.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Whether the source was the selected device at the start and the end.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityCheck {
+    /// Probe at the start matched the selected device (and `--expect-*`)
+    pub start_ok: bool,
+    /// Probe at the end matched the start; `None`: not checked
+    pub end_ok: Option<bool>,
+    pub details: Vec<String>,
+}
+
+/// Whether the audit records of this run were written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AuditStatus {
+    Written,
+    NotWritten { reason: String },
+}
+
+impl Default for AuditStatus {
+    fn default() -> Self {
+        AuditStatus::NotWritten {
+            reason: "no audit record was written".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditInfo {
+    /// Hash of the "started" record; the "finished" record names this report
+    pub anchor: Option<String>,
+    pub status: AuditStatus,
+    /// Copy of the audit log in the case directory (`audit-<boot_id>.jsonl`)
+    pub export_file: Option<String>,
+}
+
+/// An earlier session of a resumed rescue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub session: u32,
+    /// The preserved report, `<base>.info.session-N`
+    pub report_file: String,
+    pub report_sha256: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub outcome: Option<Outcome>,
+}
+
+/// Paths and digests of the written reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportFiles {
+    pub text: PathBuf,
+    pub json: PathBuf,
+    pub text_sha256: String,
+    pub json_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForensicInfoReport {
+    /// [`REPORT_SCHEMA_VERSION`]
+    pub schema_version: u32,
     pub tool_name: String,
     pub tool_version: String,
+    pub engine: EngineKind,
+    /// Derived by `classify` from the facts below; never set by an engine
+    pub outcome: Outcome,
+    pub exit_code: i32,
+    /// Why the verdict is what it is, one sentence
+    pub outcome_reason: String,
+    /// Recorded (sanitised) case values
     pub case_metadata: CaseMetadata,
-    pub device: BlockDevice,
-    pub config: AcquisitionConfig,
+    /// Identity probed at the start
+    pub source: SourceIdentity,
+    /// Identity probed at the end
+    pub identity_at_end: Option<SourceIdentity>,
+    pub identity_check: IdentityCheck,
+    pub capacity: Option<CapacityInfo>,
+    pub write_protection: Option<WriteProtection>,
+    pub smart_before: Option<SmartSnapshot>,
+    pub smart_after: Option<SmartSnapshot>,
+    pub effective_config: EffectiveConfig,
+    pub output_dir: String,
+    pub base_name: String,
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     pub elapsed_seconds: u64,
     pub average_speed_bytes_sec: f64,
-    pub bad_sectors_count: u64,
-    pub source_hashes: HashResults,
-    pub destination_hashes: HashResults,
-    pub verification_passed: bool,
-    #[serde(default)]
-    pub verification_status: VerificationStatus,
-    pub generated_files: Vec<String>,
-    /// Hash of the audit-log record written when this acquisition started; the
-    /// matching "finished" record carries this report's SHA-256
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audit_anchor: Option<String>,
-    /// How read errors were actually handled, when it differs from what the
-    /// configuration's retry / wipe settings would suggest
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_handling_note: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub incomplete: Option<IncompleteAcquisition>,
+    /// Source size when the acquisition started
+    pub expected_bytes: u64,
+    /// Bytes of the source represented in the image (read or substituted)
+    pub bytes_acquired: u64,
+    pub stop_reason: Option<String>,
+    /// Stopped by the examiner or a signal
+    pub aborted: bool,
+    pub read_errors: ReadErrorTable,
+    /// Computed while reading the source stream
+    pub acquisition_hashes: HashResults,
+    /// Recomputed from the written image
+    pub image_hashes: HashResults,
+    pub verification: VerificationInfo,
+    pub piecewise: Option<PiecewiseInfo>,
+    pub image_files: Vec<String>,
+    /// ddrescue map, ewfacquire log, SMART JSON, pieces file, ...
+    pub auxiliary_files: Vec<FileDigest>,
+    pub provenance: ToolProvenance,
+    pub clock: ClockInfo,
+    pub audit: AuditInfo,
+    pub resume_sessions: Vec<SessionInfo>,
+    pub notes: Vec<String>,
+}
+
+fn sanitize(s: &str) -> String {
+    sanitize_line(s)
+}
+
+fn row(out: &mut String, label: &str, value: impl AsRef<str>) {
+    out.push_str(&format!(
+        "{:<width$}: {}\n",
+        label,
+        sanitize(value.as_ref()),
+        width = LABEL_WIDTH
+    ));
+}
+
+fn yes_no(v: bool) -> &'static str {
+    if v {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn opt_bool(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
 }
 
 impl ForensicInfoReport {
+    /// A report for an acquisition that has just started: nothing acquired
+    /// yet, so its verdict is `Incomplete` until the facts are filled in and
+    /// [`apply_classification`](Self::apply_classification) runs.
+    pub fn new(
+        engine: EngineKind,
+        case: &CaseMetadata,
+        source: SourceIdentity,
+        effective_config: EffectiveConfig,
+    ) -> Self {
+        let now = Utc::now();
+        let mut report = Self {
+            schema_version: REPORT_SCHEMA_VERSION,
+            tool_name: "dfdisk".into(),
+            tool_version: env!("CARGO_PKG_VERSION").into(),
+            engine,
+            outcome: Outcome::Incomplete,
+            exit_code: Outcome::Incomplete.exit_code(),
+            outcome_reason: String::new(),
+            case_metadata: case.sanitized(),
+            expected_bytes: source.size_bytes,
+            read_errors: ReadErrorTable::new(source.logical_sector_size, ""),
+            source,
+            identity_at_end: None,
+            identity_check: IdentityCheck::default(),
+            capacity: None,
+            write_protection: None,
+            smart_before: None,
+            smart_after: None,
+            effective_config,
+            output_dir: String::new(),
+            base_name: String::new(),
+            started_at: now,
+            ended_at: now,
+            elapsed_seconds: 0,
+            average_speed_bytes_sec: 0.0,
+            bytes_acquired: 0,
+            stop_reason: None,
+            aborted: false,
+            acquisition_hashes: HashResults::default(),
+            image_hashes: HashResults::default(),
+            verification: VerificationInfo::default(),
+            piecewise: None,
+            image_files: Vec::new(),
+            auxiliary_files: Vec::new(),
+            provenance: ToolProvenance::default(),
+            clock: ClockInfo::from_parts(
+                now,
+                &crate::models::provenance::TimedatectlInfo::default(),
+                None,
+                None,
+                None,
+            ),
+            audit: AuditInfo::default(),
+            resume_sessions: Vec::new(),
+            notes: Vec::new(),
+        };
+        report.apply_classification();
+        report
+    }
+
+    /// The facts the verdict is derived from, as recorded in this report.
+    /// The identity counts as changed when the start check failed or the end
+    /// check found a different device.
+    pub fn facts(&self) -> AcquisitionFacts {
+        AcquisitionFacts {
+            expected_bytes: self.expected_bytes,
+            bytes_acquired: self.bytes_acquired,
+            read_errors: self.read_errors.clone(),
+            stop_reason: self.stop_reason.clone(),
+            aborted: self.aborted,
+            verification: self.verification.result.clone(),
+            identity_changed: self.identity_check.end_ok == Some(false),
+        }
+    }
+
+    /// Record `facts` in the report and classify them.
+    pub fn apply_facts(&mut self, facts: &AcquisitionFacts) {
+        self.expected_bytes = facts.expected_bytes;
+        self.bytes_acquired = facts.bytes_acquired;
+        self.read_errors = facts.read_errors.clone();
+        self.stop_reason = facts.stop_reason.clone();
+        self.aborted = facts.aborted;
+        self.verification.result = facts.verification.clone();
+        if facts.identity_changed {
+            self.identity_check.end_ok = Some(false);
+        }
+        self.apply_classification();
+    }
+
+    /// Set `outcome`, `exit_code` and `outcome_reason` from [`facts`](Self::facts).
+    pub fn apply_classification(&mut self) {
+        let c = classify_detailed(&self.facts());
+        self.outcome = c.outcome;
+        self.exit_code = c.outcome.exit_code();
+        self.outcome_reason = c.reason;
+    }
+
+    /// The verdict banner as lines (label with exit code, explanation, key
+    /// numbers, timestamp basis), shared by the report, CLI and TUI.
+    pub fn verdict_lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("{} (exit code {})", self.outcome.label(), self.exit_code),
+            self.outcome.explanation_for(self.engine).to_string(),
+        ];
+        lines.extend(self.key_numbers());
+        lines.push(format!("Timestamps: {}", self.clock.label()));
+        lines
+    }
+
+    /// The numbers behind the verdict, one sentence each.
+    pub fn key_numbers(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let pct = if self.expected_bytes > 0 {
+            format!(
+                "{:.1}%, ",
+                self.bytes_acquired as f64 * 100.0 / self.expected_bytes as f64
+            )
+        } else {
+            String::new()
+        };
+        out.push(format!(
+            "Acquired {} of {} bytes ({}{}).",
+            self.bytes_acquired,
+            self.expected_bytes,
+            pct,
+            format_iec(self.bytes_acquired)
+        ));
+        if let Some(s) = self.read_errors.summary(RangeKind::Substituted) {
+            out.push(format!(
+                "{s} were unreadable and replaced by zeros; the digests below describe the image including the substituted sectors, not the original medium."
+            ));
+        }
+        if let Some(s) = self.read_errors.summary(RangeKind::Unread) {
+            out.push(format!("{s} were not read and are not in the image."));
+        }
+        if let Some(stop) = &self.stop_reason {
+            out.push(format!("Stopped: {stop}."));
+        }
+        if self.identity_check.end_ok == Some(false) {
+            out.push("The source changed or disappeared during the acquisition.".into());
+        }
+        out.push(format!(
+            "Verification: {}.",
+            self.verification.result.describe()
+        ));
+        if let Some(r) = &self.verification.source_reread {
+            out.push(format!("Second source read: {}.", r.describe()));
+        }
+        out
+    }
+
+    /// The human-readable report (`<base>.info`).
     pub fn render_text(&self) -> String {
         let mut out = String::new();
-        out.push_str(
-            "================================================================================\n",
-        );
-        out.push_str("                         DFDISK FORENSIC ACQUISITION REPORT\n");
-        out.push_str(
-            "================================================================================\n\n",
-        );
+        out.push_str(RULE);
+        out.push_str("                       DFDISK FORENSIC ACQUISITION REPORT\n");
+        out.push_str(RULE);
+        self.render_verdict(&mut out);
+        out.push_str(RULE);
+        out.push('\n');
 
-        // Case Information
         out.push_str("[CASE INFORMATION]\n");
-        out.push_str(&format!(
-            "{:<20}: {}\n",
-            "Case Number", self.case_metadata.case_number
-        ));
-        out.push_str(&format!(
-            "{:<20}: {}\n",
-            "Location / EA", self.case_metadata.location_ea
-        ));
-        out.push_str(&format!(
-            "{:<20}: {}\n",
-            "Evidence Number", self.case_metadata.evidence_number
-        ));
-        out.push_str(&format!(
-            "{:<20}: {}\n",
-            "Authority / Agency", self.case_metadata.authority
-        ));
-        out.push_str(&format!(
-            "{:<20}: {}\n",
-            "Examiner", self.case_metadata.examiner
-        ));
-        out.push_str(&format!(
-            "{:<20}: {}\n",
-            "Description", self.case_metadata.description
-        ));
-        if !self.case_metadata.notes.trim().is_empty() {
-            out.push_str(&format!(
-                "{:<20}: {}\n",
-                "Examiner Notes",
-                self.case_metadata.notes.trim()
-            ));
+        for (label, value) in self.case_metadata.report_rows() {
+            row(&mut out, label, value);
         }
         out.push('\n');
 
-        // Source Hardware Specifications
-        out.push_str("[SOURCE HARDWARE SPECIFICATIONS]\n");
-        out.push_str(&format!("{:<20}: {}\n", "Device Node", self.device.path));
-        out.push_str(&format!(
-            "{:<20}: {}\n",
-            "Vendor / Model",
-            self.device.display_name()
-        ));
-        out.push_str(&format!(
-            "{:<20}: {}\n",
-            "Serial Number",
-            self.device.display_serial()
-        ));
-        if let Some(rev) = &self.device.revision {
-            out.push_str(&format!("{:<20}: {}\n", "Firmware / Revision", rev));
-        }
-        if let Some(wwn) = &self.device.wwn {
-            out.push_str(&format!("{:<20}: {}\n", "WWN / EUI", wwn));
-        }
-        out.push_str(&format!(
-            "{:<20}: {}\n",
-            "Bus Interface", self.device.bus_type
-        ));
-        out.push_str(&format!(
-            "{:<20}: {}\n",
-            "Media Type",
-            self.device.media_type_str()
-        ));
-        out.push_str(&format!(
-            "{:<20}: Logical: {} bytes | Physical: {} bytes\n",
-            "Sector Size", self.device.logical_sector_size, self.device.physical_sector_size
-        ));
-        let total_sectors = if self.device.logical_sector_size > 0 {
-            self.device.size_bytes / self.device.logical_sector_size as u64
-        } else {
-            0
-        };
-        out.push_str(&format!(
-            "{:<20}: {} sectors\n",
-            "Total Sectors", total_sectors
-        ));
-        out.push_str(&format!(
-            "{:<20}: {} bytes ({})\n",
-            "Total Capacity",
-            self.device.size_bytes,
-            format_bytes(self.device.size_bytes)
-        ));
-        if let Some(pt) = &self.device.partition_table_type {
-            out.push_str(&format!(
-                "{:<20}: {}\n",
-                "Partition Scheme",
-                pt.to_uppercase()
-            ));
-        }
-        if !self.device.devlinks.is_empty() {
-            out.push_str(&format!(
-                "{:<20}: {}\n",
-                "Device Link", self.device.devlinks[0]
-            ));
-        }
+        self.render_source(&mut out);
+        self.render_protection(&mut out);
+        self.render_capacity_and_smart(&mut out);
 
-        // SMART Information
-        if let Some(smart) = &self.device.smart {
-            out.push_str(&format!(
-                "{:<20}: {}\n",
-                "SMART Overall",
-                if smart.passed {
-                    "PASSED"
-                } else {
-                    "FAILED / WARNING"
-                }
-            ));
-            if let Some(realloc) = smart.reallocated_sectors {
-                out.push_str(&format!("{:<20}: {}\n", "Reallocated Sectors", realloc));
-            }
-            if let Some(pending) = smart.pending_sectors {
-                out.push_str(&format!("{:<20}: {}\n", "Pending Sectors", pending));
-            }
-            if let Some(temp) = smart.temperature_celsius {
-                out.push_str(&format!("{:<20}: {} °C\n", "Temperature", temp));
-            }
-            if let Some(poh) = smart.power_on_hours {
-                out.push_str(&format!("{:<20}: {} hours\n", "Power-on Hours", poh));
-            }
+        out.push_str("[ACQUISITION SETTINGS (APPLIED)]\n");
+        for (label, value) in self.effective_config.rows() {
+            row(&mut out, &label, value);
         }
+        for note in &self.effective_config.notes {
+            row(&mut out, "Note", note);
+        }
+        row(&mut out, "Output Directory", &self.output_dir);
+        row(&mut out, "Base Name", &self.base_name);
         out.push('\n');
 
-        // Acquisition Configuration
-        out.push_str("[ACQUISITION CONFIGURATION]\n");
-        out.push_str(&format!(
-            "{:<20}: {} v{}\n",
-            "Acquisition Tool", self.tool_name, self.tool_version
-        ));
-        out.push_str(&format!(
-            "{:<20}: {}\n",
-            "Output Format",
-            self.config.format.display_name()
-        ));
-        out.push_str(&format!(
-            "{:<20}: {:?}\n",
-            "Compression", self.config.compression
-        ));
-        out.push_str(&format!(
-            "{:<20}: {}\n",
-            "Segment Split Size",
-            self.config.split_size.display_name()
-        ));
-        match &self.error_handling_note {
-            Some(note) => out.push_str(&format!("{:<20}: {}\n", "Error Handling", note)),
-            None => out.push_str(&format!(
-                "{:<20}: Retries: {} | Wipe bad sectors: {}\n",
-                "Error Handling",
-                self.config.error_retries,
-                if self.config.wipe_bad_sectors {
-                    "Yes (Zero-fill)"
-                } else {
-                    "No"
-                }
-            )),
-        }
-        out.push('\n');
-
-        // Timestamps & Performance
-        out.push_str("[ACQUISITION TIMESTAMPS & PERFORMANCE]\n");
-        out.push_str(&format!(
-            "{:<20}: {} UTC\n",
-            "Started",
-            self.started_at.format("%Y-%m-%d %H:%M:%S")
-        ));
-        out.push_str(&format!(
-            "{:<20}: {} UTC\n",
-            "Ended",
-            self.ended_at.format("%Y-%m-%d %H:%M:%S")
-        ));
-        let elapsed_formatted = crate::models::telemetry::format_duration(self.elapsed_seconds);
-        out.push_str(&format!("{:<20}: {}\n", "Elapsed Time", elapsed_formatted));
-        let mbs = self.average_speed_bytes_sec / (1024.0 * 1024.0);
-        out.push_str(&format!("{:<20}: {:.2} MB/s\n", "Average Speed", mbs));
-        out.push_str(&format!(
-            "{:<20}: {} sectors\n",
-            "Bad / Error Sectors", self.bad_sectors_count
-        ));
-        out.push('\n');
-
-        if let Some(inc) = &self.incomplete {
-            out.push_str("[ACQUISITION RESULT]\n");
-            out.push_str(&format!("{:<20}: INCOMPLETE\n", "Status"));
-            out.push_str(&format!(
-                "{:<20}: {} of {} bytes ({})\n",
-                "Acquired",
-                inc.bytes_acquired,
-                inc.expected_bytes,
-                format_bytes(inc.bytes_acquired)
-            ));
-            out.push_str(&format!("{:<20}: {}\n", "Stopped Because", inc.reason));
-            out.push_str(&format!(
-                "{:<20}: The image holds source bytes 0..{} only; nothing was zero-filled and all hashes below cover only that range.\n",
-                "Note", inc.bytes_acquired
-            ));
+        self.render_time(&mut out);
+        self.render_read_errors(&mut out);
+        self.render_hashes(&mut out);
+        self.render_files(&mut out);
+        self.render_provenance(&mut out);
+        self.render_audit(&mut out);
+        if !self.notes.is_empty() {
+            out.push_str("[NOTES]\n");
+            for n in &self.notes {
+                out.push_str(&format!(" - {}\n", sanitize(n)));
+            }
             out.push('\n');
         }
+        out.push_str(RULE);
+        out
+    }
 
-        // Cryptographic Hashes & Verification
-        out.push_str("[CRYPTOGRAPHIC INTEGRITY & VERIFICATION]\n");
-        if let Some(h) = &self.source_hashes.md5 {
-            out.push_str(&format!("{:<20}: {}\n", "Source MD5", h));
+    fn render_verdict(&self, out: &mut String) {
+        // One sentence per line, never wrapped: phrases stay searchable
+        let indent = " ".repeat(LABEL_WIDTH + 2);
+        let lines = self.verdict_lines();
+        let (head, rest) = lines.split_first().expect("verdict has a label");
+        out.push_str(&format!(
+            "{:<LABEL_WIDTH$}: {}\n",
+            "VERDICT",
+            sanitize(head)
+        ));
+        // The last verdict line is the timestamp basis, printed as its own row
+        for line in &rest[..rest.len().saturating_sub(1)] {
+            out.push_str(&indent);
+            out.push_str(&sanitize(line));
+            out.push('\n');
         }
-        if let Some(h) = &self.source_hashes.sha1 {
-            out.push_str(&format!("{:<20}: {}\n", "Source SHA-1", h));
+        row(out, "Timestamps", self.clock.label());
+        row(
+            out,
+            "Report Schema",
+            format!(
+                "{} (machine-readable twin: {}{})",
+                self.schema_version, self.base_name, INFO_JSON_SUFFIX
+            ),
+        );
+    }
+
+    fn render_source(&self, out: &mut String) {
+        let s = &self.source;
+        out.push_str("[SOURCE IDENTITY]\n");
+        row(out, "Device Node", &s.path);
+        if s.canonical_path != s.path && !s.canonical_path.is_empty() {
+            row(out, "Resolved Path", &s.canonical_path);
         }
-        if let Some(h) = &self.source_hashes.sha256 {
-            out.push_str(&format!("{:<20}: {}\n", "Source SHA-256", h));
+        row(out, "Kind", s.kind.label());
+        let mut kernel = s.kernel_name.clone();
+        if let Some(mm) = &s.maj_min {
+            kernel.push_str(&format!(" ({mm})"));
+        }
+        if let Some(seq) = s.diskseq {
+            kernel.push_str(&format!(", diskseq {seq}"));
+        }
+        row(out, "Kernel Device", kernel);
+        if !s.parent_disks.is_empty() {
+            row(out, "Stored On", s.parent_disks.join(", "));
+        }
+        if let Some(start) = s.partition_start_sector {
+            row(
+                out,
+                "Partition Start",
+                format!("sector {start} (512-byte units)"),
+            );
+        }
+        if let Some(uuid) = &s.dm_uuid {
+            row(out, "DM UUID", uuid);
+        }
+        row(out, "Vendor / Model", s.display_name());
+        row(
+            out,
+            "Firmware Revision",
+            s.firmware_rev.as_deref().unwrap_or("(not reported)"),
+        );
+        row(out, "Serial Number", s.serial_with_provenance());
+        if s.serial_candidates.len() > 1 {
+            row(
+                out,
+                "Serial Sources",
+                s.serial_candidates
+                    .iter()
+                    .map(|c| format!("{}: {}", c.source.label(), c.value))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+        }
+        if let Some(note) = s.serial_note() {
+            row(out, "Serial Note", note);
+        }
+        if let Some(hw) = &s.hardware_of {
+            row(
+                out,
+                "Hardware Identity",
+                format!("model, serial and WWN are those of /dev/{hw}"),
+            );
+        }
+        row(
+            out,
+            "WWN / EUI",
+            s.wwn.as_deref().unwrap_or("(not reported)"),
+        );
+        let mut attach = s
+            .transport
+            .as_deref()
+            .map(str::to_uppercase)
+            .unwrap_or_else(|| "(unknown)".into());
+        if s.hotplug {
+            attach.push_str(", hot-pluggable");
+        }
+        row(out, "Attachment", attach);
+        row(out, "Removable Media", yes_no(s.removable));
+        row(out, "Rotational", opt_bool(s.rotational));
+        row(
+            out,
+            "Sector Size",
+            format!(
+                "logical {} bytes, physical {} bytes",
+                s.logical_sector_size, s.physical_sector_size
+            ),
+        );
+        let sectors = s.size_bytes / u64::from(s.logical_sector_size.max(1));
+        row(
+            out,
+            "Size",
+            format!(
+                "{} bytes = {} sectors of {} bytes ({})",
+                s.size_bytes,
+                sectors,
+                s.logical_sector_size.max(1),
+                format_iec(s.size_bytes)
+            ),
+        );
+        for n in &s.probe_notes {
+            row(out, "Probe Note", n);
+        }
+        let check = &self.identity_check;
+        row(
+            out,
+            "Identity at Start",
+            if check.start_ok {
+                "matches the selected device"
+            } else {
+                "NOT confirmed"
+            },
+        );
+        row(
+            out,
+            "Identity at End",
+            match check.end_ok {
+                Some(true) => "same device attachment",
+                Some(false) => "CHANGED OR LOST",
+                None => "not checked",
+            },
+        );
+        for d in &check.details {
+            row(out, "Identity Detail", d);
         }
         out.push('\n');
+    }
 
-        if let Some(h) = &self.destination_hashes.md5 {
-            out.push_str(&format!("{:<20}: {}\n", "Image MD5", h));
-        }
-        if let Some(h) = &self.destination_hashes.sha1 {
-            out.push_str(&format!("{:<20}: {}\n", "Image SHA-1", h));
-        }
-        if let Some(h) = &self.destination_hashes.sha256 {
-            out.push_str(&format!("{:<20}: {}\n", "Image SHA-256", h));
-        }
-        out.push('\n');
-
-        let status_str = match self.verification_status {
-            VerificationStatus::Verified => {
-                "VERIFIED - ALL HASHES MATCH (Acquisition Integrity Confirmed)"
-            }
-            VerificationStatus::DamagedMedia => {
-                "WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE (Damaged Media / Unreadable Sectors Present)"
-            }
-            VerificationStatus::Mismatch => {
-                "CRITICAL ERROR - HASH MISMATCH (Evidence Invalidation / Cryptographic Disparity)"
-            }
-            VerificationStatus::Failed => {
-                "WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE (Verification Failed)"
-            }
-            VerificationStatus::Incomplete => {
-                "INCOMPLETE - ACQUISITION STOPPED EARLY (Image covers only the acquired range)"
-            }
-            VerificationStatus::NotVerified => {
-                if self.verification_passed {
-                    "VERIFIED - ALL HASHES MATCH (Acquisition Integrity Confirmed)"
-                } else {
-                    "WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE"
+    fn render_protection(&self, out: &mut String) {
+        out.push_str("[WRITE PROTECTION]\n");
+        match &self.write_protection {
+            Some(wp) => {
+                for (label, value) in wp.rows() {
+                    row(out, &label, value);
+                }
+                for n in &wp.notes {
+                    row(out, "Note", n);
                 }
             }
-        };
-        out.push_str(&format!("{:<20}: {}\n", "Verification Result", status_str));
-        if let Some(anchor) = &self.audit_anchor {
-            out.push_str(&format!(
-                "{:<20}: {} (dfnix audit log)\n",
-                "Audit Anchor", anchor
-            ));
+            None => row(out, "State", "(not recorded)"),
         }
+        out.push('\n');
+    }
 
-        if !self.generated_files.is_empty() {
-            out.push_str("\n[GENERATED EVIDENCE FILES]\n");
-            for f in &self.generated_files {
-                out.push_str(&format!(" - {}\n", f));
+    fn render_capacity_and_smart(&self, out: &mut String) {
+        out.push_str("[CAPACITY / HIDDEN AREAS]\n");
+        match &self.capacity {
+            Some(c) => {
+                row(out, "Reported Size", format!("{} bytes", c.reported_bytes));
+                row(out, "Hidden Areas", c.summary());
+                if let Some(dev) = &c.probed_device {
+                    row(out, "Probed Device", dev);
+                }
+                row(out, "Method", &c.method);
+                for e in &c.errors {
+                    row(out, "Probe Error", e);
+                }
+            }
+            None => row(out, "Hidden Areas", "(not probed)"),
+        }
+        out.push('\n');
+
+        for (title, snap) in [
+            ("SMART BEFORE", &self.smart_before),
+            ("SMART AFTER", &self.smart_after),
+        ] {
+            let Some(snap) = snap else { continue };
+            out.push_str(&format!("[{title}]\n"));
+            let s = &snap.summary;
+            row(out, "Policy", snap.policy.label());
+            row(out, "Command", snap.command.join(" "));
+            row(
+                out,
+                "Overall Health",
+                format!("{} ({})", s.health.label(), s.assessment),
+            );
+            if let Some(v) = s.reallocated_sectors {
+                row(out, "Reallocated Sectors", v.to_string());
+            }
+            if let Some(v) = s.pending_sectors {
+                row(out, "Pending Sectors", v.to_string());
+            }
+            if let Some(v) = s.uncorrectable_errors {
+                row(out, "Uncorrectable Errors", v.to_string());
+            }
+            if let Some(v) = s.temperature_celsius {
+                row(out, "Temperature", format!("{v} °C"));
+            }
+            if let Some(v) = s.power_on_hours {
+                row(out, "Power-on Hours", v.to_string());
+            }
+            if let Some(v) = s.wear_percentage {
+                row(out, "Endurance Used", format!("{v} %"));
+            }
+            if let Some(f) = &snap.json_file {
+                row(out, "Raw Output", f);
+            }
+            if let Some(n) = &snap.note {
+                row(out, "Note", n);
+            }
+            out.push('\n');
+        }
+    }
+
+    fn render_time(&self, out: &mut String) {
+        let c = &self.clock;
+        out.push_str("[TIMESTAMPS & CLOCK]\n");
+        let basis = if c.ntp_synchronized == Some(true) {
+            "NTP synchronized"
+        } else {
+            crate::models::provenance::LABEL_NOT_SYNCHRONIZED
+        };
+        row(
+            out,
+            "Started",
+            format!(
+                "{} UTC ({basis})",
+                self.started_at.format("%Y-%m-%d %H:%M:%S")
+            ),
+        );
+        row(
+            out,
+            "Ended",
+            format!(
+                "{} UTC ({basis})",
+                self.ended_at.format("%Y-%m-%d %H:%M:%S")
+            ),
+        );
+        row(
+            out,
+            "Elapsed",
+            format!(
+                "{} (monotonic clock)",
+                crate::models::telemetry::format_duration(self.elapsed_seconds)
+            ),
+        );
+        row(
+            out,
+            "Average Speed",
+            format!(
+                "{:.2} MiB/s",
+                self.average_speed_bytes_sec / (1024.0 * 1024.0)
+            ),
+        );
+        row(
+            out,
+            "Time Zone",
+            format!(
+                "{} (UTC offset {})",
+                c.timezone.as_deref().unwrap_or("unknown"),
+                c.utc_offset.as_deref().unwrap_or("unknown")
+            ),
+        );
+        row(out, "NTP Synchronized", opt_bool(c.ntp_synchronized));
+        if let Some(off) = c.rtc_offset_seconds {
+            row(
+                out,
+                "RTC Offset",
+                format!("{off:+} s (RTC minus system clock)"),
+            );
+        }
+        if let Some(note) = &c.note {
+            row(out, "Clock Note", note);
+        }
+        out.push('\n');
+    }
+
+    fn render_read_errors(&self, out: &mut String) {
+        let t = &self.read_errors;
+        out.push_str("[READ ERRORS]\n");
+        if t.is_empty() {
+            row(out, "Unreadable Ranges", "none recorded");
+        } else {
+            for kind in [RangeKind::Substituted, RangeKind::Unread] {
+                if let Some(s) = t.summary(kind) {
+                    row(out, kind.label(), s);
+                }
+            }
+            out.push_str(&format!(
+                "  {:>5}  {:>20}  {:>16}  {:>12}  {}\n",
+                "#", "offset (bytes)", "length (bytes)", "sectors", "status"
+            ));
+            let sector = t.effective_sector_size();
+            for (i, r) in t.ranges.iter().take(TEXT_RANGE_LIMIT).enumerate() {
+                out.push_str(&format!(
+                    "  {:>5}  {:>20}  {:>16}  {:>12}  {}\n",
+                    i + 1,
+                    r.offset,
+                    r.length,
+                    r.sectors(sector),
+                    r.kind.label()
+                ));
+            }
+            if t.ranges.len() > TEXT_RANGE_LIMIT {
+                out.push_str(&format!(
+                    "  ... {} more ranges not listed here; see {}{} for the complete list\n",
+                    t.ranges.len() - TEXT_RANGE_LIMIT,
+                    self.base_name,
+                    INFO_JSON_SUFFIX
+                ));
             }
         }
-
-        out.push_str(
-            "================================================================================\n",
+        if !t.source.is_empty() {
+            row(out, "Error List Source", &t.source);
+        }
+        row(
+            out,
+            "Sector Size",
+            format!("{} bytes", t.effective_sector_size()),
         );
-        out
+        out.push('\n');
+    }
+
+    fn render_hashes(&self, out: &mut String) {
+        out.push_str("[HASHES]\n");
+        out.push_str("Acquisition stream (computed while reading the source):\n");
+        if self.acquisition_hashes.is_empty() {
+            out.push_str("  (none: no digest was computed while reading the source)\n");
+        }
+        for (label, digest) in self.acquisition_hashes.present() {
+            out.push_str(&format!("  {:<8}: {}\n", label, sanitize(digest)));
+        }
+        out.push_str("Image re-read (recomputed from the written image):\n");
+        if self.image_hashes.is_empty() {
+            out.push_str("  (none: the image was not re-read)\n");
+        }
+        for (label, digest) in self.image_hashes.present() {
+            out.push_str(&format!("  {:<8}: {}\n", label, sanitize(digest)));
+        }
+        out.push('\n');
+
+        out.push_str("[VERIFICATION]\n");
+        let result = if self.outcome == Outcome::Verified {
+            format!(
+                "VERIFIED - ALL HASHES MATCH ({})",
+                match &self.verification.result {
+                    VerificationResult::Matched { method } => method.as_str(),
+                    _ => self.verification.method.as_str(),
+                }
+            )
+        } else {
+            format!(
+                "{} (overall verdict: {})",
+                self.verification.result.describe(),
+                self.outcome.label()
+            )
+        };
+        row(out, "Result", result);
+        if !self.verification.method.is_empty() {
+            row(out, "Method", &self.verification.method);
+        }
+        if let Some(r) = &self.verification.source_reread {
+            row(out, "Second Source Read", r.describe());
+        }
+        if let Some(p) = &self.piecewise {
+            row(
+                out,
+                "Piecewise SHA-256",
+                format!(
+                    "{} pieces of {} in {} (SHA-256 {})",
+                    p.count,
+                    format_iec(p.piece_size),
+                    p.file,
+                    p.file_sha256
+                ),
+            );
+        }
+        out.push('\n');
+    }
+
+    fn render_files(&self, out: &mut String) {
+        out.push_str("[FILES]\n");
+        if self.image_files.is_empty() {
+            row(out, "Image Files", "(none)");
+        }
+        for f in &self.image_files {
+            row(out, "Image File", f);
+        }
+        for f in &self.auxiliary_files {
+            row(
+                out,
+                "Auxiliary File",
+                format!("{} (SHA-256 {})", f.path, f.sha256),
+            );
+        }
+        out.push('\n');
+    }
+
+    fn render_provenance(&self, out: &mut String) {
+        let p = &self.provenance;
+        out.push_str("[TOOL PROVENANCE]\n");
+        row(
+            out,
+            "dfdisk",
+            format!("{} (git {})", p.dfdisk_version, p.dfdisk_git_rev),
+        );
+        row(
+            out,
+            "dfcore",
+            format!("{} (git {})", p.dfcore_version, p.dfcore_git_rev),
+        );
+        row(
+            out,
+            "dfnix Revision",
+            p.dfnix_revision.as_deref().unwrap_or("(not dfnix)"),
+        );
+        row(out, "Kernel", p.kernel.as_deref().unwrap_or("unknown"));
+        row(out, "Host", p.hostname.as_deref().unwrap_or("unknown"));
+        for (tool, version) in &p.tools {
+            row(out, &format!("Tool {tool}"), version);
+        }
+        if !p.commands.is_empty() {
+            out.push_str("Commands run:\n");
+            for c in &p.commands {
+                out.push_str(&format!("  $ {}\n", sanitize(&c.command_line())));
+                out.push_str(&format!(
+                    "    {} .. {}  {}\n",
+                    c.started.format("%H:%M:%S"),
+                    c.ended.format("%H:%M:%S"),
+                    sanitize(&c.status_text())
+                ));
+            }
+        }
+        out.push('\n');
+    }
+
+    fn render_audit(&self, out: &mut String) {
+        out.push_str("[AUDIT]\n");
+        row(
+            out,
+            "Audit Log",
+            match &self.audit.status {
+                AuditStatus::Written => "written".to_string(),
+                AuditStatus::NotWritten { reason } => format!("NOT WRITTEN: {reason}"),
+            },
+        );
+        if let Some(anchor) = &self.audit.anchor {
+            row(out, "Audit Anchor", format!("{anchor} (dfnix audit log)"));
+        }
+        if let Some(f) = &self.audit.export_file {
+            row(out, "Audit Log Copy", f);
+        }
+        for s in &self.resume_sessions {
+            row(
+                out,
+                &format!("Earlier Session {}", s.session),
+                format!(
+                    "{}{}",
+                    s.report_file,
+                    s.report_sha256
+                        .as_deref()
+                        .map(|h| format!(" (SHA-256 {h})"))
+                        .unwrap_or_default()
+                ),
+            );
+        }
+        out.push('\n');
+    }
+
+    /// The machine-readable report (`<base>.info.json`), pretty-printed.
+    pub fn to_json(&self) -> String {
+        let mut copy = self.clone();
+        copy.clock.refresh_basis();
+        serde_json::to_string_pretty(&copy).expect("a report always serialises")
+    }
+
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    /// Write `<base>.info` and `<base>.info.json` into `dir`: the reserve
+    /// file `<base>.info.reserve` is removed first (so a full destination has
+    /// room), each report is written to `<name>.tmp`, fsynced and renamed,
+    /// then the directory is fsynced.
+    pub fn write_reports(&self, dir: &Path, base: &str) -> io::Result<ReportFiles> {
+        remove_reserve_file(dir, base)?;
+        let text = self.render_text();
+        let json = self.to_json();
+        let text_path = dir.join(format!("{base}{INFO_SUFFIX}"));
+        let json_path = dir.join(format!("{base}{INFO_JSON_SUFFIX}"));
+        write_atomic(&text_path, text.as_bytes())?;
+        write_atomic(&json_path, json.as_bytes())?;
+        sync_dir(dir)?;
+        Ok(ReportFiles {
+            text: text_path,
+            json: json_path,
+            text_sha256: sha256_hex(text.as_bytes()),
+            json_sha256: sha256_hex(json.as_bytes()),
+        })
+    }
+}
+
+fn with_path(path: &Path, e: io::Error, what: &str) -> io::Error {
+    io::Error::new(e.kind(), format!("cannot {what} {}: {e}", path.display()))
+}
+
+/// Write `bytes` to `<path>.tmp`, fsync, and rename it to `path`.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let tmp = path.with_file_name(format!("{}.tmp", name.to_string_lossy()));
+    let result = (|| {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| with_path(&tmp, e, "create"))?;
+        f.write_all(bytes)
+            .map_err(|e| with_path(&tmp, e, "write"))?;
+        f.sync_all().map_err(|e| with_path(&tmp, e, "sync"))?;
+        std::fs::rename(&tmp, path).map_err(|e| with_path(path, e, "rename into"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// fsync a directory so renames and new entries in it are durable.
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| with_path(dir, e, "sync directory"))
+}
+
+/// Path of the reservation file of `base` in `dir`.
+pub fn reserve_path(dir: &Path, base: &str) -> PathBuf {
+    dir.join(format!("{base}{RESERVE_SUFFIX}"))
+}
+
+/// Create `<base>.info.reserve` ([`RESERVE_BYTES`], allocated and fsynced)
+/// so the reports still fit when the image fills the destination. Fails on
+/// ENOSPC, EDQUOT or an existing file; a failure must refuse the acquisition
+/// before anything else is written (R11).
+pub fn create_reserve_file(dir: &Path, base: &str) -> io::Result<PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    let path = reserve_path(dir, base);
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|e| with_path(&path, e, "create"))?;
+    let result = (|| {
+        // SAFETY: posix_fallocate on a file descriptor we own
+        let rc = unsafe { libc::posix_fallocate(f.as_raw_fd(), 0, RESERVE_BYTES as libc::off_t) };
+        match rc {
+            0 => {}
+            libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL => {
+                // Filesystem without fallocate: write the bytes
+                let zeros = vec![0u8; RESERVE_BYTES as usize];
+                f.write_all(&zeros)?;
+            }
+            errno => return Err(io::Error::from_raw_os_error(errno)),
+        }
+        f.sync_all()
+    })();
+    if let Err(e) = result {
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+        return Err(with_path(&path, e, "reserve space for the report in"));
+    }
+    Ok(path)
+}
+
+/// Remove `<base>.info.reserve` if present; `Ok(true)` when one was removed.
+pub fn remove_reserve_file(dir: &Path, base: &str) -> io::Result<bool> {
+    let path = reserve_path(dir, base);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(with_path(&path, e, "remove")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::config::{AcquisitionConfig, ImageFormat, SplitSize};
+    use crate::models::identity::SerialSource;
+    use crate::models::provenance::{CommandRecord, TimedatectlInfo, LABEL_NOT_SYNCHRONIZED};
 
-    #[test]
-    fn test_verification_status_rendering() {
-        let mut report = ForensicInfoReport {
-            tool_name: "dfdisk".to_string(),
-            tool_version: env!("CARGO_PKG_VERSION").to_string(),
-            case_metadata: CaseMetadata::default(),
-            device: BlockDevice::default(),
-            config: AcquisitionConfig::default(),
-            started_at: Utc::now(),
-            ended_at: Utc::now(),
-            elapsed_seconds: 10,
-            average_speed_bytes_sec: 1000.0,
-            bad_sectors_count: 0,
-            source_hashes: HashResults::default(),
-            destination_hashes: HashResults::default(),
-            verification_passed: true,
-            verification_status: VerificationStatus::Verified,
-            generated_files: vec![],
-            audit_anchor: None,
-            error_handling_note: None,
-            incomplete: None,
-        };
-
-        assert!(report.render_text().contains("VERIFIED - ALL HASHES MATCH"));
-
-        report.verification_status = VerificationStatus::DamagedMedia;
-        report.verification_passed = false;
-        let txt = report.render_text();
-        assert!(txt.contains("WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE (Damaged Media"));
-
-        report.verification_status = VerificationStatus::Mismatch;
-        assert!(report
-            .render_text()
-            .contains("CRITICAL ERROR - HASH MISMATCH"));
-    }
-
-    #[test]
-    fn test_incomplete_rendering_never_claims_zero_fill() {
-        let config = AcquisitionConfig {
-            wipe_bad_sectors: true,
+    fn source() -> SourceIdentity {
+        let mut s = SourceIdentity {
+            path: "/dev/sdb".into(),
+            canonical_path: "/dev/sdb".into(),
+            kernel_name: "sdb".into(),
+            maj_min: Some("8:16".into()),
+            diskseq: Some(5),
+            size_bytes: 1 << 20,
+            logical_sector_size: 512,
+            physical_sector_size: 512,
+            model: Some("Test Disk".into()),
+            transport: Some("sata".into()),
             ..Default::default()
         };
-        let report = ForensicInfoReport {
-            tool_name: "dfdisk (raw engine)".to_string(),
-            tool_version: env!("CARGO_PKG_VERSION").to_string(),
-            case_metadata: CaseMetadata::default(),
-            device: BlockDevice::default(),
-            config,
-            started_at: Utc::now(),
-            ended_at: Utc::now(),
-            elapsed_seconds: 1,
-            average_speed_bytes_sec: 1.0,
-            bad_sectors_count: 0,
-            source_hashes: HashResults::default(),
-            destination_hashes: HashResults::default(),
-            verification_passed: false,
-            verification_status: VerificationStatus::Incomplete,
-            generated_files: vec![],
-            audit_anchor: None,
-            error_handling_note: Some("None (stops at first read error)".to_string()),
-            incomplete: Some(IncompleteAcquisition {
-                bytes_acquired: 3584,
-                expected_bytes: 5120,
-                reason: "Input/output error at byte offset 3584".to_string(),
-            }),
-        };
-        let txt = report.render_text();
-        assert!(!txt.contains("Zero-fill"), "{txt}");
-        assert!(txt.contains("INCOMPLETE"));
-        assert!(txt.contains("3584 of 5120 bytes"));
-        assert!(txt.contains("byte offset 3584"));
-        assert!(txt.contains("None (stops at first read error)"));
+        s.add_serial_candidate("SER123", SerialSource::VpdPage80);
+        s
     }
 
-    fn h(md5: Option<&str>, sha1: Option<&str>, sha256: Option<&str>) -> HashResults {
-        HashResults {
-            md5: md5.map(str::to_string),
-            sha1: sha1.map(str::to_string),
-            sha256: sha256.map(str::to_string),
+    fn case() -> CaseMetadata {
+        CaseMetadata {
+            case_number: "CASE-1".into(),
+            evidence_number: "EV1".into(),
+            examiner: "Examiner\tOne".into(),
+            ..Default::default()
         }
     }
 
+    fn raw_config() -> AcquisitionConfig {
+        AcquisitionConfig {
+            format: ImageFormat::Raw,
+            split_size: SplitSize::None,
+            ..Default::default()
+        }
+    }
+
+    fn hashes(md5: &str) -> HashResults {
+        HashResults {
+            md5: Some(md5.into()),
+            sha1: None,
+            sha256: Some("ab".repeat(32)),
+        }
+    }
+
+    /// A RAW report of a complete, clean acquisition that verified.
+    fn verified() -> ForensicInfoReport {
+        let src = source();
+        let eff = EffectiveConfig::build(&raw_config(), Some(&src));
+        let mut r = ForensicInfoReport::new(EngineKind::Raw, &case(), src, eff);
+        r.base_name = "case-1_ea01_ev1_SER123".into();
+        r.bytes_acquired = 1 << 20;
+        r.acquisition_hashes = hashes("aa");
+        r.image_hashes = hashes("aa");
+        r.identity_check.start_ok = true;
+        r.identity_check.end_ok = Some(true);
+        r.verification = VerificationInfo {
+            result: VerificationResult::Matched {
+                method: "image re-read by dfdisk".into(),
+            },
+            method: "image re-read by dfdisk after fsync".into(),
+            source_reread: None,
+        };
+        r.apply_classification();
+        r
+    }
+
     #[test]
-    fn test_compare_selected_ignores_unselected_digests() {
+    fn a_new_report_claims_nothing() {
+        let r = ForensicInfoReport::new(
+            EngineKind::Raw,
+            &case(),
+            source(),
+            EffectiveConfig::build(&raw_config(), None),
+        );
+        assert_eq!(r.outcome, Outcome::Incomplete);
+        assert_eq!(r.exit_code, 6);
+        assert_eq!(r.schema_version, 2);
+        assert_eq!(r.expected_bytes, 1 << 20);
+        assert_eq!(r.case_metadata.examiner, "Examiner One");
+    }
+
+    #[test]
+    fn verdict_banner_comes_first() {
+        let text = verified().render_text();
+        let verdict = text.find("VERDICT").unwrap();
+        let case = text.find("[CASE INFORMATION]").unwrap();
+        assert!(verdict < case);
+        assert!(text.contains("VERIFIED (exit code 0)"), "{text}");
+        assert!(
+            text.contains("Acquired 1048576 of 1048576 bytes (100.0%, 1 MiB)."),
+            "{text}"
+        );
+        assert!(text.contains("VERIFIED - ALL HASHES MATCH"));
+    }
+
+    #[test]
+    fn all_hashes_match_only_when_verified() {
+        let base = verified();
+        let mut variants = Vec::new();
+        let mut r = base.clone();
+        r.read_errors.push(4096, 1024, RangeKind::Substituted);
+        variants.push(r);
+        let mut r = base.clone();
+        r.bytes_acquired = 512;
+        variants.push(r);
+        let mut r = base.clone();
+        r.verification.result = VerificationResult::Mismatched {
+            method: "x".into(),
+            details: "MD5 differs".into(),
+        };
+        variants.push(r);
+        let mut r = base.clone();
+        r.verification.result = VerificationResult::Failed { reason: "x".into() };
+        variants.push(r);
+        let mut r = base.clone();
+        r.verification.result = VerificationResult::NotPossible { reason: "x".into() };
+        variants.push(r);
+        let mut r = base.clone();
+        r.aborted = true;
+        variants.push(r);
+        let mut seen = std::collections::BTreeSet::new();
+        for mut r in variants {
+            r.apply_classification();
+            assert_ne!(r.outcome, Outcome::Verified);
+            seen.insert(r.exit_code);
+            let text = r.render_text();
+            assert!(
+                !text.contains("ALL HASHES MATCH"),
+                "{:?}\n{text}",
+                r.outcome
+            );
+            assert!(text.contains(r.outcome.label()), "{text}");
+        }
+        assert_eq!(seen.len(), 6);
+        assert!(base.render_text().contains("ALL HASHES MATCH"));
+    }
+
+    #[test]
+    fn read_errors_are_explained_and_tabled() {
+        let mut r = verified();
+        r.read_errors.push(0, 32768, RangeKind::Substituted);
+        r.read_errors.push(1 << 19, 32768, RangeKind::Substituted);
+        r.read_errors.source = "raw engine".into();
+        r.apply_classification();
+        assert_eq!(r.outcome, Outcome::CompletedWithReadErrors);
+        assert_eq!(r.exit_code, 7);
+        let text = r.render_text();
+        assert!(
+            text.contains("128 sectors (64 KiB) in 2 ranges were unreadable and replaced by zeros; the digests below describe the image including the substituted sectors, not the original medium."),
+            "{text}"
+        );
+        assert!(text.contains("524288"), "{text}");
+        assert!(text.contains("unreadable, zero-filled"));
+        assert!(text.contains("Error List Source"));
+    }
+
+    #[test]
+    fn long_error_tables_point_to_the_json() {
+        let mut r = verified();
+        for i in 0..250u64 {
+            r.read_errors.push(i * 4096, 512, RangeKind::Substituted);
+        }
+        r.apply_classification();
+        let text = r.render_text();
+        assert!(
+            text.contains("50 more ranges not listed here; see case-1_ea01_ev1_SER123.info.json"),
+            "{text}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert_eq!(json["read_errors"]["ranges"].as_array().unwrap().len(), 250);
+    }
+
+    #[test]
+    fn empty_case_values_and_hash_labels() {
+        let text = verified().render_text();
+        assert!(
+            text.contains("Authority / Agency    : (not provided)"),
+            "{text}"
+        );
+        assert!(text.contains("Location / EA         : 01"), "{text}");
+        assert!(text.contains("Acquisition stream (computed while reading the source)"));
+        assert!(text.contains("Image re-read (recomputed from the written image)"));
+        // RAW settings never mention compression or segments
+        assert!(!text.contains("Compression"));
+        assert!(!text.contains("Segment"));
+    }
+
+    #[test]
+    fn values_are_sanitised_in_text_but_exact_in_json() {
+        let mut r = verified();
+        r.source.model = Some("Evil\u{1b}[2J\nModel".into());
+        r.notes.push("line1\nline2\ttab".into());
+        let text = r.render_text();
+        assert!(!text.contains('\u{1b}'));
+        assert!(text.contains("Evil [2J Model"), "{text}");
+        assert!(text.contains(" - line1 line2 tab"));
+        for line in text.lines() {
+            assert!(!line.chars().any(|c| c.is_control()), "{line:?}");
+        }
+        let back = ForensicInfoReport::from_json(&r.to_json()).unwrap();
+        assert_eq!(back.source.model, r.source.model);
+    }
+
+    #[test]
+    fn unsynchronised_clock_is_labelled() {
+        let mut r = verified();
+        let text = r.render_text();
+        assert!(
+            text.contains(&format!("Timestamps            : {LABEL_NOT_SYNCHRONIZED}")),
+            "{text}"
+        );
+        assert!(text.contains(&format!("UTC ({LABEL_NOT_SYNCHRONIZED})")));
+        let json: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert_eq!(json["clock"]["timestamp_basis"], LABEL_NOT_SYNCHRONIZED);
+
+        r.clock = ClockInfo::from_parts(
+            Utc::now(),
+            &TimedatectlInfo {
+                ntp_synchronized: Some(true),
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+        );
+        let text = r.render_text();
+        assert!(!text.contains("NOT synchronized"), "{text}");
+        assert!(text.contains("UTC (NTP synchronized)"));
+    }
+
+    #[test]
+    fn json_twin_round_trips_and_carries_schema_and_outcome() {
+        let mut r = verified();
+        r.provenance.commands.push(CommandRecord {
+            argv: vec!["ewfverify".into(), "-d".into(), "md5".into()],
+            started: Utc::now(),
+            ended: Utc::now(),
+            exit_code: Some(0),
+            signal: None,
+            stop: None,
+            error: None,
+            stdout_tail: vec![],
+            stderr_tail: vec![],
+        });
+        let json: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["outcome"], "verified");
+        assert_eq!(json["exit_code"], 0);
+        assert_eq!(json["verification"]["result"]["status"], "matched");
+        assert_eq!(json["source"]["serial"], "SER123");
+        assert_eq!(json["effective_config"]["engine"], "raw");
+        let back = ForensicInfoReport::from_json(&r.to_json()).unwrap();
+        assert_eq!(back.outcome, Outcome::Verified);
+        assert_eq!(back.render_text(), r.render_text());
+        assert!(r.render_text().contains("$ ewfverify -d md5"));
+    }
+
+    #[test]
+    fn apply_facts_records_and_classifies() {
+        let mut r = verified();
+        let mut facts = r.facts();
+        facts.identity_changed = true;
+        facts.stop_reason = Some("source lost at offset 4096".into());
+        r.apply_facts(&facts);
+        assert_eq!(r.outcome, Outcome::Incomplete);
+        assert_eq!(r.identity_check.end_ok, Some(false));
+        assert!(r.outcome_reason.contains("source lost at offset 4096"));
+        let text = r.render_text();
+        assert!(text.contains("CHANGED OR LOST"));
+        assert!(text.contains("Stopped: source lost at offset 4096."));
+    }
+
+    #[test]
+    fn rescue_wording_follows_r12() {
+        let src = source();
+        let config = AcquisitionConfig {
+            rescue_mode: true,
+            ..raw_config()
+        };
+        let mut r = ForensicInfoReport::new(
+            EngineKind::Rescue,
+            &case(),
+            src.clone(),
+            EffectiveConfig::build(&config, Some(&src)),
+        );
+        r.bytes_acquired = r.expected_bytes;
+        r.read_errors.push(8192, 4096, RangeKind::Unread);
+        r.verification.result = VerificationResult::NotPossible {
+            reason: "ddrescue does not hash the source".into(),
+        };
+        r.apply_classification();
+        assert_eq!(r.outcome, Outcome::Incomplete);
+        let text = r.render_text();
+        assert!(text.contains("run the rescue again"), "{text}");
+        assert!(
+            text.contains("8 sectors (4 KiB) in 1 range were not read"),
+            "{text}"
+        );
+        assert!(text.contains("ddrescue Retries"));
+    }
+
+    #[test]
+    fn compare_digests_semantics() {
         let all = HashSelection {
             md5: true,
             sha1: true,
             sha256: true,
         };
-        let no_sha1 = HashSelection {
+        let md5_sha256 = HashSelection {
             md5: true,
             sha1: false,
             sha256: true,
         };
-        let no_sha256 = HashSelection {
-            md5: true,
-            sha1: true,
-            sha256: false,
+        let a = hashes("aa");
+        let upper = HashResults {
+            md5: Some("AA".into()),
+            ..hashes("aa")
         };
+        assert!(compare_digests(md5_sha256, &a, &upper, "m").is_matched());
+        // A selected digest missing on one side is a failure, never a pass
+        assert!(matches!(
+            compare_digests(all, &a, &a, "m"),
+            VerificationResult::Failed { .. }
+        ));
+        // An unselected extra digest is ignored
+        let extra = HashResults {
+            sha1: Some("ff".repeat(20)),
+            ..hashes("aa")
+        };
+        assert!(compare_digests(md5_sha256, &a, &extra, "m").is_matched());
+        let VerificationResult::Mismatched { details, method } =
+            compare_digests(md5_sha256, &a, &hashes("bb"), "ewfverify")
+        else {
+            panic!()
+        };
+        assert_eq!(method, "ewfverify");
+        assert!(
+            details.contains("MD5 acquisition aa but recomputed bb"),
+            "{details}"
+        );
+        assert!(matches!(
+            compare_digests(HashSelection::default(), &a, &a, "m"),
+            VerificationResult::Failed { .. }
+        ));
+    }
 
-        let src = h(Some("aa"), None, Some("cc"));
-        // Destination carries an extra SHA-1 (e.g. recomputed by ewfverify): not a mismatch
-        let dst = h(Some("AA"), Some("bb"), Some("cc"));
-        assert_eq!(
-            compare_selected(no_sha1, &src, &dst),
-            VerificationStatus::Verified
-        );
+    #[test]
+    fn reports_are_written_atomically_and_the_reserve_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = "case-1_ea01_ev1_SER123";
+        let reserve = create_reserve_file(dir.path(), base).unwrap();
+        assert_eq!(std::fs::metadata(&reserve).unwrap().len(), RESERVE_BYTES);
+        // A second reservation for the same base is refused
+        assert!(create_reserve_file(dir.path(), base).is_err());
 
-        let src = h(Some("aa"), Some("bb"), None);
-        let dst = h(Some("aa"), Some("bb"), Some("zz"));
-        assert_eq!(
-            compare_selected(no_sha256, &src, &dst),
-            VerificationStatus::Verified
-        );
+        let r = verified();
+        let files = r.write_reports(dir.path(), base).unwrap();
+        assert!(!reserve.exists());
+        assert_eq!(files.text, dir.path().join(format!("{base}.info")));
+        assert_eq!(files.json, dir.path().join(format!("{base}.info.json")));
+        let text = std::fs::read(&files.text).unwrap();
+        let json = std::fs::read(&files.json).unwrap();
+        assert_eq!(files.text_sha256, sha256_hex(&text));
+        assert_eq!(files.json_sha256, sha256_hex(&json));
+        assert_eq!(text, r.render_text().into_bytes());
+        // No temporary files are left behind
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(!remove_reserve_file(dir.path(), base).unwrap());
+        // Rewriting replaces both reports
+        let mut r2 = r.clone();
+        r2.notes.push("second".into());
+        let again = r2.write_reports(dir.path(), base).unwrap();
+        assert_ne!(again.text_sha256, files.text_sha256);
+        // An unwritable destination is an error
+        assert!(r.write_reports(&dir.path().join("missing"), base).is_err());
+    }
 
-        // Selected but missing on one side
+    #[test]
+    fn file_digests() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("map");
+        std::fs::write(&p, b"hello world").unwrap();
+        let d = FileDigest::compute(&p).unwrap();
         assert_eq!(
-            compare_selected(all, &src, &dst),
-            VerificationStatus::Failed
+            d.sha256,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
-        // Real disagreement
-        let dst = h(Some("aa"), Some("XX"), None);
-        assert_eq!(
-            compare_selected(no_sha256, &src, &dst),
-            VerificationStatus::Mismatch
-        );
-        // Nothing selected is never a pass
-        assert_eq!(
-            compare_selected(HashSelection::default(), &src, &src),
-            VerificationStatus::Failed
-        );
+        assert!(FileDigest::compute(&dir.path().join("none")).is_err());
     }
 }

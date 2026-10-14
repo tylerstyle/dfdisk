@@ -1,24 +1,30 @@
 mod common;
 
-use chrono::Utc;
 use common::{audit_sandbox, file_device};
 use dfdisk::engines;
 use dfdisk::models::{
     self,
     case::CaseMetadata,
-    config::AcquisitionConfig,
-    device::{BlockDevice, DeviceSafety},
-    info_report::{
-        compare_selected, ForensicInfoReport, HashResults, HashSelection, VerificationStatus,
-    },
+    config::{AcquisitionConfig, EffectiveConfig, EngineKind},
+    identity::SourceIdentity,
+    info_report::{compare_digests, ForensicInfoReport, HashResults, HashSelection},
+    outcome::{Outcome, RangeKind, VerificationResult},
 };
 
 fn verified(sel: HashSelection, src: &HashResults, dst: &HashResults) -> bool {
-    compare_selected(sel, src, dst) == VerificationStatus::Verified
+    compare_digests(sel, src, dst, "test").is_matched()
+}
+
+fn is_mismatch(r: VerificationResult) -> bool {
+    matches!(r, VerificationResult::Mismatched { .. })
+}
+
+fn is_failed(r: VerificationResult) -> bool {
+    matches!(r, VerificationResult::Failed { .. })
 }
 
 #[test]
-fn test_compare_selected_comprehensive_matrix() {
+fn test_compare_digests_comprehensive_matrix() {
     let md5_good = "5eb63bbbe01eeed093cb22bb8f5acdc3".to_string();
     let md5_bad = "00000000000000000000000000000000".to_string();
     let sha1_good = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed".to_string();
@@ -62,11 +68,13 @@ fn test_compare_selected_comprehensive_matrix() {
     // 1. Only the selected digests are compared
     assert!(verified(md5_sha256, &source_all, &dest_md5_sha256));
     assert!(verified(all, &source_all, &source_all));
-    // A selected digest the destination lacks is a failure, not a pass
-    assert_eq!(
-        compare_selected(all, &source_all, &dest_md5_sha256),
-        VerificationStatus::Failed
-    );
+    // A selected digest the image lacks is a failure, not a pass
+    assert!(is_failed(compare_digests(
+        all,
+        &source_all,
+        &dest_md5_sha256,
+        "t"
+    )));
 
     // 2. Case insensitivity (lowercase vs uppercase hex)
     let dest_uppercase = HashResults {
@@ -86,28 +94,34 @@ fn test_compare_selected_comprehensive_matrix() {
         sha1: None,
         sha256: Some(sha256_good.clone()),
     };
-    assert_eq!(
-        compare_selected(md5_sha256, &source_all, &dest_md5_mismatch),
-        VerificationStatus::Mismatch
-    );
+    assert!(is_mismatch(compare_digests(
+        md5_sha256,
+        &source_all,
+        &dest_md5_mismatch,
+        "t"
+    )));
     let dest_sha256_mismatch = HashResults {
         md5: Some(md5_good.clone()),
         sha1: None,
         sha256: Some(sha256_bad),
     };
-    assert_eq!(
-        compare_selected(md5_sha256, &source_all, &dest_sha256_mismatch),
-        VerificationStatus::Mismatch
-    );
+    assert!(is_mismatch(compare_digests(
+        md5_sha256,
+        &source_all,
+        &dest_sha256_mismatch,
+        "t"
+    )));
     let dest_sha1_mismatch = HashResults {
         md5: Some(md5_good.clone()),
         sha1: Some(sha1_bad),
         sha256: Some(sha256_good.clone()),
     };
-    assert_eq!(
-        compare_selected(all, &source_all, &dest_sha1_mismatch),
-        VerificationStatus::Mismatch
-    );
+    assert!(is_mismatch(compare_digests(
+        all,
+        &source_all,
+        &dest_sha1_mismatch,
+        "t"
+    )));
     // ...but a mismatch in an unselected digest is ignored
     assert!(verified(md5_sha256, &source_all, &dest_sha1_mismatch));
 
@@ -122,7 +136,7 @@ fn test_compare_selected_comprehensive_matrix() {
         &source_all
     ));
 
-    // 6. Disabling SHA-1 while the destination still reports one is not a mismatch
+    // 6. Disabling SHA-1 while the image still reports one is not a mismatch
     let source_no_sha1 = HashResults {
         md5: Some(md5_good.clone()),
         sha1: None,
@@ -138,116 +152,77 @@ fn test_compare_selected_comprehensive_matrix() {
 
 #[test]
 fn test_truthful_forensic_reporting_damaged_media_rescue() {
-    let dest_hashes = HashResults {
+    let image_hashes = HashResults {
         md5: Some("79054025255fb1a26e4bc422aef54eb4".to_string()),
         sha1: None,
         sha256: Some(
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".to_string(),
         ),
     };
-
-    let bad_sectors = 142;
-    let report = ForensicInfoReport {
-        tool_name: "dfdisk (ddrescue engine)".to_string(),
-        tool_version: "0.1.1".to_string(),
-        case_metadata: CaseMetadata {
-            case_number: "CRIME-2026/RESQ".to_string(),
-            location_ea: "EA-01".to_string(),
-            evidence_number: "BAD-DISK-01".to_string(),
-            authority: "State Police Forensic Lab".to_string(),
-            examiner: "Forensic Specialist".to_string(),
-            description: "Damaged HDD with bad sectors".to_string(),
-            notes: "DDRescue resilient pass".to_string(),
-            ..Default::default()
-        },
-        device: BlockDevice {
-            name: "sdd".to_string(),
-            path: "/dev/sdd".to_string(),
-            devlinks: vec![],
-            size_bytes: 500107862016,
-            model: Some("Damaged Western Digital".to_string()),
-            vendor: Some("WDC".to_string()),
-            serial: Some("WD-WCC4M0000000".to_string()),
-            wwn: None,
-            revision: None,
-            bus_type: "SATA".to_string(),
-            is_rotational: Some(true),
-            is_removable: false,
-            is_read_only: false,
-            logical_sector_size: 512,
-            physical_sector_size: 4096,
-            partition_table_type: Some("gpt".to_string()),
-            partitions: vec![],
-            mountpoints: vec![],
-            safety: DeviceSafety::Safe,
-            smart: None,
-            ..Default::default()
-        },
-        config: AcquisitionConfig {
-            rescue_mode: true,
-            error_retries: 3,
-            wipe_bad_sectors: true,
-            ..Default::default()
-        },
-        started_at: Utc::now(),
-        ended_at: Utc::now(),
-        elapsed_seconds: 7200,
-        average_speed_bytes_sec: 69459425.0,
-        bad_sectors_count: bad_sectors,
-        // Crucial forensic truthfulness:
-        // Source hashes over damaged media CANNOT be genuinely computed.
-        // Therefore source_hashes must be None, and verification_passed must be false.
-        source_hashes: HashResults::default(),
-        destination_hashes: dest_hashes.clone(),
-        verification_passed: false,
-        verification_status: VerificationStatus::DamagedMedia,
-        generated_files: vec![
-            "crime_2026_resq_eaea_01_bad_disk_01_WD-WCC4M0000000.raw".to_string(),
-            "crime_2026_resq_eaea_01_bad_disk_01_WD-WCC4M0000000.map".to_string(),
-        ],
-        audit_anchor: None,
-        error_handling_note: None,
-        incomplete: None,
+    let device = file_device(
+        std::path::Path::new("/dev/dfdisk-test-sdd"),
+        500107862016,
+        Some("WD-WCC4M0000000"),
+    );
+    let source = SourceIdentity::from_block_device(&device);
+    let config = AcquisitionConfig {
+        rescue_mode: true,
+        error_retries: 3,
+        split_size: models::config::SplitSize::None,
+        ..Default::default()
     };
+    let case = CaseMetadata {
+        case_number: "CRIME-2026/RESQ".to_string(),
+        location_ea: "EA-01".to_string(),
+        evidence_number: "BAD-DISK-01".to_string(),
+        authority: "State Police Forensic Lab".to_string(),
+        examiner: "Forensic Specialist".to_string(),
+        description: "Damaged HDD with bad sectors".to_string(),
+        notes: "DDRescue resilient pass".to_string(),
+        ..Default::default()
+    };
+    let mut report = ForensicInfoReport::new(
+        EngineKind::Rescue,
+        &case,
+        source.clone(),
+        EffectiveConfig::build(&config, Some(&source)),
+    );
+    report.bytes_acquired = report.expected_bytes;
+    // 142 bad sectors (ddrescue '-' areas) are zeros in the image
+    report
+        .read_errors
+        .push_sectors(1_000_000, 100, RangeKind::Substituted);
+    report
+        .read_errors
+        .push_sectors(2_000_000, 42, RangeKind::Substituted);
+    report.image_hashes = image_hashes.clone();
+    report.verification.result = VerificationResult::NotPossible {
+        reason: "ddrescue computes no digest while reading".into(),
+    };
+    report.apply_classification();
 
-    // 1. Assert structured integrity
-    assert!(report.source_hashes.md5.is_none());
-    assert!(report.source_hashes.sha1.is_none());
-    assert!(report.source_hashes.sha256.is_none());
+    // 1. Structured truthfulness: no acquisition digest is invented
+    assert!(report.acquisition_hashes.is_empty());
+    assert_eq!(report.image_hashes, image_hashes);
+    assert_eq!(report.outcome, Outcome::CompletedWithReadErrors);
+    assert_eq!(report.exit_code, 7);
+    assert_eq!(report.read_errors.substituted_sectors(), 142);
 
-    assert_eq!(report.destination_hashes.md5, dest_hashes.md5);
-    assert_eq!(report.destination_hashes.sha256, dest_hashes.sha256);
-
-    assert!(!report.verification_passed);
-    assert_eq!(report.bad_sectors_count, 142);
-
-    // 2. Render and verify court certificate text
+    // 2. The report says what the digests describe
     let cert_text = report.render_text();
-
-    // Must warn that verification is incomplete due to media damage
     assert!(
-        cert_text.contains("WARNING - HASH MISMATCH OR VERIFICATION INCOMPLETE"),
-        "Court certificate must explicitly flag incomplete verification on damaged media"
+        !cert_text.contains("ALL HASHES MATCH"),
+        "Court certificate must NOT claim a verified match over damaged sectors"
     );
-
-    // Must NEVER claim complete verification
+    assert!(cert_text.contains("COMPLETED WITH READ ERRORS (exit code 7)"));
     assert!(
-        !cert_text.contains("VERIFIED - ALL HASHES MATCH"),
-        "Court certificate must NOT claim verified match over damaged sectors"
+        cert_text
+            .contains("142 sectors (71 KiB) in 2 ranges were unreadable and replaced by zeros"),
+        "{cert_text}"
     );
-
-    // Must truthfully report bad sector count
-    assert!(
-        cert_text.contains("142 sectors"),
-        "Certificate must state bad sector count"
-    );
-
-    // Must show Image hashes but omit Source hashes
-    assert!(cert_text.contains("Image MD5"));
-    assert!(cert_text.contains("Image SHA-256"));
-    assert!(!cert_text.contains("Source MD5"));
-    assert!(!cert_text.contains("Source SHA-1"));
-    assert!(!cert_text.contains("Source SHA-256"));
+    assert!(cert_text.contains("not the original medium"));
+    assert!(cert_text.contains("(none: no digest was computed while reading the source)"));
+    assert!(cert_text.contains("MD5     : 79054025255fb1a26e4bc422aef54eb4"));
 }
 
 #[tokio::test]
@@ -292,32 +267,34 @@ async fn test_raw_acquisition_end_to_end() {
         .await
         .expect("RAW acquisition must succeed");
 
-    assert!(report.verification_passed);
-    assert_eq!(
-        report.verification_status,
-        models::info_report::VerificationStatus::Verified
-    );
-    assert_eq!(report.bad_sectors_count, 0);
-    assert_eq!(report.source_hashes.md5, report.destination_hashes.md5);
-    assert_eq!(report.source_hashes.sha1, report.destination_hashes.sha1);
-    assert_eq!(
-        report.source_hashes.sha256,
-        report.destination_hashes.sha256
-    );
+    assert_eq!(report.outcome, Outcome::Verified);
+    assert_eq!(report.exit_code, 0);
+    assert!(report.read_errors.is_empty());
+    assert!(report.verification.result.is_matched());
+    assert_eq!(report.acquisition_hashes.md5, report.image_hashes.md5);
+    assert_eq!(report.acquisition_hashes.sha1, report.image_hashes.sha1);
+    assert_eq!(report.acquisition_hashes.sha256, report.image_hashes.sha256);
 
     let cert_text = report.render_text();
     assert!(cert_text.contains("VERIFIED - ALL HASHES MATCH"));
     assert!(cert_text.contains("DFDISK FORENSIC ACQUISITION REPORT"));
 
     // Verify written raw file exists and matches source
-    let expected_raw = std::path::PathBuf::from(&report.generated_files[0]);
+    let expected_raw = std::path::PathBuf::from(&report.image_files[0]);
     assert!(expected_raw.exists());
     let written = std::fs::read(&expected_raw).unwrap();
     assert_eq!(written, test_data);
 
-    // Verify .info sidecar exists
+    // Both reports exist, and the JSON twin says the same
     let expected_info = expected_raw.with_extension("info");
     assert!(expected_info.exists());
+    let json = std::fs::read_to_string(expected_raw.with_extension("info.json")).unwrap();
+    let back = ForensicInfoReport::from_json(&json).unwrap();
+    assert_eq!(back.outcome, Outcome::Verified);
+    assert_eq!(
+        std::fs::read_to_string(&expected_info).unwrap(),
+        back.render_text()
+    );
 }
 
 #[tokio::test]

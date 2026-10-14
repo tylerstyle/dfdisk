@@ -105,7 +105,7 @@ async fn acquisition_report_and_audit_log_anchor_each_other() {
     );
 
     // The report names the record its acquisition started with ...
-    let anchor = report.audit_anchor.clone().unwrap();
+    let anchor = report.audit.anchor.clone().unwrap();
     assert_eq!(records[0]["hash"], anchor);
     assert_eq!(records[0]["device"]["serial"], "AUDIT01");
     // ... and the finished record holds the report's own digest
@@ -119,8 +119,19 @@ async fn acquisition_report_and_audit_log_anchor_each_other() {
         hex::encode(Sha256::digest(&info))
     );
     assert!(String::from_utf8_lossy(&info).contains(&anchor));
+    let json = std::fs::read(
+        dir.join("out")
+            .join(case().generate_filename("AUDIT01", "info.json")),
+    )
+    .unwrap();
     assert_eq!(
-        records[1]["details"]["source_hashes"]["sha256"],
+        records[1]["details"]["report_json_sha256"],
+        hex::encode(Sha256::digest(&json))
+    );
+    assert_eq!(records[1]["details"]["outcome"], "verified");
+    assert_eq!(records[1]["details"]["exit_code"], 0);
+    assert_eq!(
+        records[1]["details"]["acquisition_hashes"]["sha256"],
         hex::encode(Sha256::digest(vec![7u8; 8192]))
     );
 

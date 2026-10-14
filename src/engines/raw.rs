@@ -1,16 +1,15 @@
 use crate::engines::hasher::{HashProgress, MultiHasher};
-use crate::engines::preflight;
+use crate::engines::{legacy, preflight};
 use crate::models::{
     case::CaseMetadata,
-    config::AcquisitionConfig,
+    config::{AcquisitionConfig, EngineKind},
     device::BlockDevice,
     info_report::{
-        compare_selected, ForensicInfoReport, HashResults, HashSelection, IncompleteAcquisition,
-        VerificationStatus,
+        compare_digests, ForensicInfoReport, HashResults, HashSelection, VerificationInfo,
     },
+    outcome::{Outcome, RangeKind},
     telemetry::{AcquisitionStatus, ProgressTelemetry},
 };
-use chrono::Utc;
 use digest::Digest;
 use md5::Md5;
 use sha1::Sha1;
@@ -151,6 +150,14 @@ pub fn copy_and_hash<R: Read, W: Write>(
     })
 }
 
+/// Why and where an acquisition stopped before the end of the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompleteAcquisition {
+    pub bytes_acquired: u64,
+    pub expected_bytes: u64,
+    pub reason: String,
+}
+
 /// Why a finished copy does not cover the whole source, if it does not.
 pub fn incompleteness(outcome: &CopyOutcome, expected_bytes: u64) -> Option<IncompleteAcquisition> {
     let reason = if let Some(err) = &outcome.read_error {
@@ -203,8 +210,7 @@ impl RawAcquireEngine {
         abort_flag: Arc<AtomicBool>,
         audit_anchor: Option<String>,
     ) -> Result<ForensicInfoReport, String> {
-        let start_time = Utc::now();
-        let instant_start = Instant::now();
+        let run = legacy::RunClock::start();
         let selection = HashSelection::from_config(&config);
 
         let base_name = case.base_filename_checked(&device.display_serial())?;
@@ -419,62 +425,53 @@ impl RawAcquireEngine {
             }
         };
 
-        let end_time = Utc::now();
-        let elapsed_seconds = instant_start.elapsed().as_secs();
-        let avg_speed = if elapsed_seconds > 0 {
-            bytes_copied as f64 / elapsed_seconds as f64
-        } else {
-            0.0
+        let method = "image re-read by dfdisk".to_string();
+        let result = compare_digests(
+            selection,
+            &outcome.source_hashes,
+            &destination_hashes,
+            &method,
+        );
+
+        let mut report = legacy::new_report(
+            EngineKind::Raw,
+            &device,
+            &case,
+            &config,
+            &base_name,
+            &run,
+            &audit_anchor,
+        );
+        report.bytes_acquired = bytes_copied;
+        report.read_errors.source = "raw engine".into();
+        if let Some(inc) = &incomplete {
+            report.stop_reason = Some(inc.reason.clone());
+            if outcome.read_error.is_some() && total_device_bytes > bytes_copied {
+                // Everything from the unreadable sector to the end was not read
+                report.read_errors.push(
+                    bytes_copied,
+                    total_device_bytes - bytes_copied,
+                    RangeKind::Unread,
+                );
+            }
+        }
+        report.notes.push(RAW_ERROR_HANDLING.to_string());
+        report.acquisition_hashes = outcome.source_hashes.clone();
+        report.image_hashes = destination_hashes;
+        report.verification = VerificationInfo {
+            result,
+            method,
+            source_reread: None,
         };
-
-        let verification_status = if incomplete.is_some() {
-            VerificationStatus::Incomplete
-        } else {
-            compare_selected(selection, &outcome.source_hashes, &destination_hashes)
-        };
-        let verification_passed = verification_status == VerificationStatus::Verified;
-
-        let generated_files = vec![raw_path.to_string_lossy().to_string()];
-
-        let report = ForensicInfoReport {
-            tool_name: "dfdisk (raw engine)".to_string(),
-            tool_version: env!("CARGO_PKG_VERSION").to_string(),
-            case_metadata: case.clone(),
-            device: device.clone(),
-            config: config.clone(),
-            started_at: start_time,
-            ended_at: end_time,
-            elapsed_seconds,
-            average_speed_bytes_sec: avg_speed,
-            bad_sectors_count: u64::from(outcome.read_error.is_some()),
-            source_hashes: outcome.source_hashes.clone(),
-            destination_hashes,
-            verification_passed,
-            verification_status,
-            generated_files,
-            audit_anchor: audit_anchor.clone(),
-            error_handling_note: Some(RAW_ERROR_HANDLING.to_string()),
-            incomplete: incomplete.clone(),
-        };
-
-        // Write court certificate sidecar atomically and propagate errors
-        let info_filename = case.generate_filename(&device.display_serial(), "info");
-        let info_path = config.output_dir.join(&info_filename);
-        let tmp_info_path = config.output_dir.join(format!("{}.tmp", info_filename));
-        std::fs::write(&tmp_info_path, report.render_text()).map_err(|e| {
-            format!(
-                "Failed to write forensic report to temporary file {}: {}",
-                tmp_info_path.display(),
-                e
-            )
-        })?;
-        std::fs::rename(&tmp_info_path, &info_path).map_err(|e| {
-            format!(
-                "Failed to finalize forensic report {}: {}",
-                info_path.display(),
-                e
-            )
-        })?;
+        report.image_files = vec![raw_path.to_string_lossy().to_string()];
+        legacy::finish_report(&mut report, &run, bytes_copied);
+        let files = legacy::write_reports(&report, &config.output_dir, &base_name)?;
+        let info_path = files.text;
+        let verification_passed = report.outcome == Outcome::Verified;
+        debug_assert!(
+            incomplete.is_none() || report.outcome == Outcome::Incomplete,
+            "a short copy is never classified as complete"
+        );
 
         if let Some(inc) = incomplete {
             let msg = format!(
