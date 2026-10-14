@@ -367,6 +367,52 @@ impl Default for AcquisitionConfig {
 }
 
 impl AcquisitionConfig {
+    /// Defaults for `engine` writing into `output_dir`, valid as they are
+    /// ([`validate`](Self::validate) accepts them):
+    /// - `Ewf`: E01, fast compression, 2 GiB segments (= [`Default`]);
+    /// - `Raw`: RAW, one unsplit file;
+    /// - `Rescue`: rescue mode (GNU ddrescue), RAW, one unsplit file.
+    ///
+    /// Build every configuration from this (or [`ewf`](Self::ewf),
+    /// [`raw`](Self::raw), [`rescue`](Self::rescue)) and override fields with
+    /// struct update syntax; `AcquisitionConfig { format: Raw,
+    /// ..Default::default() }` keeps the E01 segment size and is refused.
+    pub fn for_engine(engine: EngineKind, output_dir: impl Into<PathBuf>) -> Self {
+        let base = Self {
+            output_dir: output_dir.into(),
+            ..Self::default()
+        };
+        match engine {
+            EngineKind::Ewf => base,
+            EngineKind::Raw => Self {
+                format: ImageFormat::Raw,
+                split_size: SplitSize::None,
+                ..base
+            },
+            EngineKind::Rescue => Self {
+                format: ImageFormat::Raw,
+                split_size: SplitSize::None,
+                rescue_mode: true,
+                ..base
+            },
+        }
+    }
+
+    /// [`for_engine`](Self::for_engine)`(EngineKind::Ewf, output_dir)`.
+    pub fn ewf(output_dir: impl Into<PathBuf>) -> Self {
+        Self::for_engine(EngineKind::Ewf, output_dir)
+    }
+
+    /// [`for_engine`](Self::for_engine)`(EngineKind::Raw, output_dir)`.
+    pub fn raw(output_dir: impl Into<PathBuf>) -> Self {
+        Self::for_engine(EngineKind::Raw, output_dir)
+    }
+
+    /// [`for_engine`](Self::for_engine)`(EngineKind::Rescue, output_dir)`.
+    pub fn rescue(output_dir: impl Into<PathBuf>) -> Self {
+        Self::for_engine(EngineKind::Rescue, output_dir)
+    }
+
     pub fn engine(&self) -> EngineKind {
         EngineKind::from_config(self)
     }
@@ -770,6 +816,40 @@ mod tests {
             ..raw()
         };
         assert!(rescue.validate().is_ok());
+    }
+
+    #[test]
+    fn engine_constructors_are_valid_as_they_are() {
+        for engine in [EngineKind::Ewf, EngineKind::Raw, EngineKind::Rescue] {
+            let c = AcquisitionConfig::for_engine(engine, "/case");
+            assert_eq!(c.engine(), engine);
+            assert_eq!(c.output_dir, PathBuf::from("/case"));
+            assert!(c.validate().is_ok(), "{engine:?}: {:?}", c.validate());
+        }
+        let e = AcquisitionConfig::ewf("/case");
+        assert_eq!(e.split_size, SplitSize::TwoGb);
+        assert_eq!(e.format, ImageFormat::E01);
+        let r = AcquisitionConfig::raw("/case");
+        assert_eq!(r.split_size, SplitSize::None);
+        assert_eq!(r.format, ImageFormat::Raw);
+        assert!(!r.rescue_mode);
+        let s = AcquisitionConfig::rescue("/case");
+        assert_eq!(s.split_size, SplitSize::None);
+        assert!(s.rescue_mode);
+        // Overrides keep the engine defaults
+        let r = AcquisitionConfig {
+            calc_sha1: false,
+            on_read_error: OnReadError::ZeroFill,
+            ..AcquisitionConfig::raw("/case")
+        };
+        assert!(r.validate().is_ok());
+        // The pitfall the constructors avoid
+        assert!(AcquisitionConfig {
+            format: ImageFormat::Raw,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
