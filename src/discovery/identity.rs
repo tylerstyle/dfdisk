@@ -224,10 +224,11 @@ impl<'a> Prober<'a> {
             block_size("queue/physical_block_size").unwrap_or(id.logical_sector_size);
 
         // Hardware identity: the disk itself, or the one disk under a
-        // partition or dm/md target
+        // partition or dm/md target. A loop device has none: the disk that
+        // holds its backing file is not the evidence
         let hw = match &id.kind {
             SourceKind::Disk => Some(kname.clone()),
-            SourceKind::Other => None,
+            SourceKind::Other | SourceKind::Loop { .. } => None,
             _ if id.parent_disks.len() == 1 => {
                 Some(id.parent_disks[0].trim_start_matches("/dev/").to_string())
             }
@@ -238,6 +239,11 @@ impl<'a> Prober<'a> {
                 id.hardware_of = Some(hw.clone());
             }
             self.read_hardware(&mut id, hw);
+        } else if let SourceKind::Loop { backing_file } = &id.kind {
+            id.probe_notes.push(format!(
+                "loop device over {}: no hardware model or serial number applies",
+                backing_file.as_deref().unwrap_or("an unknown backing file")
+            ));
         } else if !matches!(id.kind, SourceKind::Other) {
             id.probe_notes.push(format!(
                 "stored on {} disks; no single model or serial number applies",
@@ -616,6 +622,32 @@ mod tests {
         assert_eq!(lvm.serial, None);
         assert_eq!(lvm.model, None);
         assert!(lvm.probe_notes.iter().any(|n| n.contains("2 disks")));
+    }
+
+    #[test]
+    fn loop_devices_have_no_hardware_identity() {
+        let f = FakeSysfs::new();
+        f.add_virtual("loop0", (7, 0), 2048);
+        f.set("loop0", "loop/backing_file", "/images/suspect.img");
+        f.set("loop0", "diskseq", "9");
+        let id = Prober::sysfs_only(f.root())
+            .probe_block("/dev/loop0", (7, 0))
+            .unwrap();
+        assert_eq!(
+            id.kind,
+            SourceKind::Loop {
+                backing_file: Some("/images/suspect.img".into())
+            }
+        );
+        assert_eq!(id.model, None);
+        assert_eq!(id.serial, None);
+        assert_eq!(id.hardware_of, None);
+        assert!(id.parent_disks.is_empty());
+        assert!(id
+            .probe_notes
+            .iter()
+            .any(|n| n.contains("/images/suspect.img")));
+        assert_eq!(by_diskseq_name(&id).as_deref(), Some("9"));
     }
 
     #[test]

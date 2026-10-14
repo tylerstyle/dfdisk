@@ -117,11 +117,13 @@ fn kname_of_path(p: &str) -> String {
     p.trim_start_matches("/dev/").to_string()
 }
 
-/// Disks the source is stored on, by kernel name.
+/// Disks whose read-only state belongs to the source, by kernel name. A loop
+/// device has none: the disk holding its backing file is the host's, never
+/// evidence, and is never set read-only.
 fn disks_of(identity: &SourceIdentity) -> Vec<String> {
     match identity.kind {
         SourceKind::Disk | SourceKind::Other => vec![identity.kernel_name.clone()],
-        SourceKind::RegularFile => Vec::new(),
+        SourceKind::RegularFile | SourceKind::Loop { .. } => Vec::new(),
         _ => identity
             .parent_disks
             .iter()
@@ -692,6 +694,39 @@ mod tests {
         };
         enforce_in(&g.root(), &id, "", &mut off, &|_| panic!("must not set")).unwrap();
         assert!(off.notes[0].contains("policy off"));
+    }
+
+    #[test]
+    fn loop_sources_never_touch_the_disk_of_their_backing_file() {
+        let f = FakeSysfs::new();
+        sata_with_partitions(&f);
+        f.add_virtual("loop0", (7, 0), 100);
+        let id = SourceIdentity {
+            path: "/dev/loop0".into(),
+            kernel_name: "loop0".into(),
+            kind: SourceKind::Loop {
+                backing_file: Some("/srv/images/a.img".into()),
+            },
+            // Even if a probe listed the disk holding the backing file
+            parent_disks: vec!["/dev/sdb".into()],
+            ..Default::default()
+        };
+        let inputs = decision_inputs(&f.root(), &id, "");
+        assert!(inputs.disks.is_empty());
+        let WriteProtectDecision::Set { nodes, .. } = decide(WriteProtectPolicy::Auto, &inputs)
+        else {
+            panic!()
+        };
+        assert_eq!(nodes, ["loop0"]);
+        let wp = capture_in(
+            &f.root(),
+            &id,
+            "",
+            RegistryPresence::Absent,
+            WriteProtectPolicy::Auto,
+        );
+        assert!(wp.parent_disks_ro_before.is_empty());
+        assert!(wp.partitions_ro_before.is_empty());
     }
 
     #[test]
