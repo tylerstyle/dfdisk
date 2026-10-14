@@ -273,7 +273,8 @@ fn image_on_the_source_disk_is_refused_on_this_host() {
         return;
     };
     let err = engines::preflight::ensure_destination_not_on_source(&node.to_string_lossy(), &dir)
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("Critical Safety Error"), "{err}");
 
     // The whole disk that partition sits on must be refused as well
@@ -286,7 +287,8 @@ fn image_on_the_source_disk_is_refused_on_this_host() {
                     &disk_node.to_string_lossy(),
                     &dir,
                 )
-                .unwrap_err();
+                .unwrap_err()
+                .to_string();
                 assert!(err.contains(&disk), "{err}");
             }
         }

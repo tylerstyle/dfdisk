@@ -222,7 +222,8 @@ impl RawAcquireEngine {
 
         preflight::ensure_no_existing_outputs(&config.output_dir, &base_name)?;
         preflight::ensure_not_protected(&device.path)?;
-        preflight::ensure_destination_not_on_source(&device.path, &config.output_dir)?;
+        preflight::ensure_destination_not_on_source(&device.path, &config.output_dir)
+            .map_err(|e| e.message)?;
 
         let mut telemetry = ProgressTelemetry {
             status: AcquisitionStatus::Acquiring,
