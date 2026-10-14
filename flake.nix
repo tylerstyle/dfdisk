@@ -27,6 +27,10 @@
           dfdisk = dfdisk;
         };
 
+        # `nix flake check` builds the package, which runs the test suite with
+        # the real libewf and ddrescue (DFDISK_REQUIRE_TOOLS=1)
+        checks.default = dfdisk;
+
         apps = {
           default = flake-utils.lib.mkApp {
             drv = dfdisk;
@@ -36,15 +40,17 @@
           };
         };
 
+        # cargo, clippy, rustfmt, cargo-deb and every tool dfdisk runs. Cargo
+        # needs the dfcore checkout next to this one (../dfcore).
         devShells.default = pkgs.mkShell {
           inputsFrom = [ dfdisk ];
-          buildInputs = with pkgs; [
+          packages = with pkgs; [
             rustc
             cargo
             rustfmt
             clippy
             cargo-deb
-          ];
+          ] ++ dfdisk.runtimeTools;
         };
       }
     );
