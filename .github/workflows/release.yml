@@ -1,17 +1,96 @@
 name: Release
 
+# A pushed tag v<version> builds, checks and publishes a release. Started by
+# hand (workflow_dispatch) it is a dry run: every check and build runs, nothing
+# is published. See docs/RELEASING.md.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  # Same toolchain as CI; build tools pinned to exact versions
+  RUST_TOOLCHAIN: "1.98.1"
+  CROSS_VERSION: "0.2.5"
+  CARGO_DEB_VERSION: "3.8.0"
+  CARGO_TERM_COLOR: always
 
 jobs:
+  check-version:
+    name: Version check
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Tag, Cargo.toml, Cargo.lock, package.nix and CHANGELOG.md agree
+        id: version
+        run: |
+          cargo_version=$(sed -n '/^\[package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+          lock_version=$(awk '$0 == "name = \"dfdisk\"" { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)
+          nix_version=$(sed -n 's/^ *version = "\([^"]*\)";.*/\1/p' package.nix | head -n 1)
+          echo "Cargo.toml: $cargo_version  Cargo.lock: $lock_version  package.nix: $nix_version"
+          if [ -z "$cargo_version" ] || [ "$cargo_version" != "$lock_version" ] || [ "$cargo_version" != "$nix_version" ]; then
+            echo "::error::Cargo.toml ($cargo_version), Cargo.lock ($lock_version) and package.nix ($nix_version) must name the same version"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$cargo_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the version v$cargo_version"
+            exit 1
+          fi
+          if ! grep -q "^## \[$cargo_version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section \"## [$cargo_version]\""
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test & Lint
+    needs: check-version
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Checkout sibling dfcore at the locked revision
+        run: |
+          rev=$(jq -r '.nodes.dfcore.locked.rev' flake.lock)
+          git clone https://github.com/tylerstyle/dfcore.git ../dfcore
+          git -C ../dfcore checkout --detach "$rev"
+
+      - name: Set up Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+
+      - name: Install the external tools the tests run
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ewf-tools gddrescue
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run the tests (tool tests must run, not skip)
+        env:
+          DFDISK_REQUIRE_TOOLS: "1"
+        run: cargo test --locked
+
   build-binaries:
     name: Build Binary (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    needs: [check-version, test]
+    # glibc builds link against the oldest glibc of the runner images in use
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
@@ -22,7 +101,9 @@ jobs:
             use_cross: true
           - target: aarch64-unknown-linux-gnu
             use_cross: true
-
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
+      TARGET: ${{ matrix.target }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -33,30 +114,37 @@ jobs:
           git clone https://github.com/tylerstyle/dfcore.git ../dfcore
           git -C ../dfcore checkout --detach "$rev"
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tool
+      - name: Install cross ${{ env.CROSS_VERSION }}
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install --locked --version "$CROSS_VERSION" cross
 
       - name: Build release binary
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            cross build --locked --release --target "$TARGET"
           else
-            cargo build --release --target ${{ matrix.target }}
+            cargo build --locked --release --target "$TARGET"
           fi
+
+      - name: Smoke test
+        if: startsWith(matrix.target, 'x86_64-')
+        run: |
+          "target/$TARGET/release/dfdisk" --version
+          file "target/$TARGET/release/dfdisk"
 
       - name: Package tarball
         run: |
-          BIN_NAME="dfdisk"
-          PKG_NAME="dfdisk-${{ github.ref_name }}-${{ matrix.target }}"
-          mkdir "$PKG_NAME"
-          cp "target/${{ matrix.target }}/release/$BIN_NAME" "$PKG_NAME/"
-          cp README.md LICENSE LICENSE-MIT LICENSE-APACHE "$PKG_NAME/"
+          PKG_NAME="dfdisk-v${VERSION}-${TARGET}"
+          mkdir -p "$PKG_NAME/docs"
+          cp "target/$TARGET/release/dfdisk" "$PKG_NAME/"
+          cp README.md CHANGELOG.md LICENSE LICENSE-MIT LICENSE-APACHE "$PKG_NAME/"
+          cp docs/*.md "$PKG_NAME/docs/"
           tar -czvf "$PKG_NAME.tar.gz" "$PKG_NAME"
           sha256sum "$PKG_NAME.tar.gz" > "$PKG_NAME.tar.gz.sha256"
 
@@ -65,12 +153,16 @@ jobs:
         with:
           name: release-${{ matrix.target }}
           path: |
-            dfdisk-*.tar.gz
-            dfdisk-*.tar.gz.sha256
+            dfdisk-v*.tar.gz
+            dfdisk-v*.tar.gz.sha256
 
   build-deb:
     name: Build Debian Package (.deb)
-    runs-on: ubuntu-latest
+    needs: [check-version, test]
+    # Ubuntu 22.04 (glibc 2.35): the .deb also installs on Debian 12
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -81,19 +173,41 @@ jobs:
           git clone https://github.com/tylerstyle/dfcore.git ../dfcore
           git -C ../dfcore checkout --detach "$rev"
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
-      - name: Install cargo-deb
-        run: cargo install cargo-deb
+      - name: Install cargo-deb ${{ env.CARGO_DEB_VERSION }}
+        run: cargo install --locked --version "$CARGO_DEB_VERSION" cargo-deb
 
       - name: Build Debian package
-        run: cargo deb --verbose
+        run: cargo deb --locked --verbose
+
+      - name: Check the package metadata
+        run: |
+          DEB="target/debian/dfdisk_${VERSION}-1_amd64.deb"
+          test -f "$DEB" || { echo "::error::expected $DEB"; ls target/debian; exit 1; }
+          dpkg-deb --info "$DEB"
+          depends=$(dpkg-deb --field "$DEB" Depends)
+          for pkg in libc6 ewf-tools gddrescue smartmontools util-linux udev hdparm nvme-cli; do
+            if ! printf '%s\n' "$depends" | tr ',' '\n' | sed 's/^ *//' | grep -q "^$pkg\b"; then
+              echo "::error::Depends lacks $pkg: $depends"
+              exit 1
+            fi
+          done
+
+      - name: Install the package and run it
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "./target/debian/dfdisk_${VERSION}-1_amd64.deb"
+          dfdisk --version
+          dpkg -L dfdisk
 
       - name: Generate deb checksum
         run: |
           cd target/debian
-          sha256sum *.deb > dfdisk-deb.sha256
+          sha256sum "dfdisk_${VERSION}-1_amd64.deb" > "dfdisk_${VERSION}-1_amd64.deb.sha256"
 
       - name: Upload .deb artifact
         uses: actions/upload-artifact@v7
@@ -101,15 +215,29 @@ jobs:
           name: release-deb
           path: |
             target/debian/*.deb
-            target/debian/dfdisk-deb.sha256
+            target/debian/*.deb.sha256
 
   publish-release:
     name: Publish GitHub Release
-    needs: [build-binaries, build-deb]
+    needs: [check-version, build-binaries, build-deb]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check-version.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      - name: Release notes from CHANGELOG.md
+        run: |
+          awk -v want="## [$VERSION]" '
+            index($0, want) == 1 { found = 1; next }
+            found && /^## \[/ { exit }
+            found && $0 != "---" { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -119,18 +247,20 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          body_path: release-notes.md
           files: |
             release-assets/**/*.tar.gz
             release-assets/**/*.tar.gz.sha256
             release-assets/**/*.deb
-            release-assets/**/dfdisk-deb.sha256
+            release-assets/**/*.deb.sha256
           draft: false
           prerelease: false
           generate_release_notes: true
 
   update-nur:
     name: Update NUR Package
-    needs: [publish-release]
+    needs: [check-version, publish-release]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     env:
       NUR_UPDATE_TOKEN: ${{ secrets.NUR_UPDATE_TOKEN }}
@@ -150,7 +280,7 @@ jobs:
         id: hashes
         run: |
           TAG="${{ github.ref_name }}"
-          VERSION="${TAG#v}"
+          VERSION="${{ needs.check-version.outputs.version }}"
           TARBALL_URL="https://github.com/tylerstyle/dfdisk/archive/refs/tags/${TAG}.tar.gz"
 
           echo "Prefetching source hash for $TARBALL_URL..."
@@ -197,6 +327,9 @@ jobs:
           echo "cargo_hash=$CARGO_HASH" >> "$GITHUB_OUTPUT"
           echo "Computed: version=$VERSION, src_hash=$SRC_HASH, cargo_hash=$CARGO_HASH"
 
+      # Only version, hashes and the dfcore pin are rewritten. The recipe's
+      # wrapper PATH (runtime tools) and check inputs are maintained by hand:
+      # see "NUR recipe" in docs/RELEASING.md.
       - name: Update NUR derivation and push
         run: |
           if [ -z "$NUR_UPDATE_TOKEN" ]; then
@@ -221,6 +354,11 @@ jobs:
           sed -i -E "/repo = \"dfcore\";/,/hash = /{s|rev = \"[0-9a-f]+\";|rev = \"$DFCORE_REV\";|;s|hash = \"sha256-[^\"]+\";|hash = \"$DFCORE_HASH\";|}" "$TARGET_FILE"
           sed -i -E "s|cargoHash = \"sha256-[^\"]+\";|cargoHash = \"$CARGO_HASH\";|" "$TARGET_FILE"
           grep -q "rev = \"$DFCORE_REV\";" "$TARGET_FILE" || { echo "dfcore pin not updated in $TARGET_FILE"; exit 1; }
+
+          # Remind the maintainer when the recipe's tool list lags behind package.nix
+          for tool in libewf ddrescue smartmontools util-linux systemd hdparm nvme-cli; do
+            grep -q "$tool" "$TARGET_FILE" || echo "::warning::$TARGET_FILE does not mention $tool; update its wrapper PATH by hand (docs/RELEASING.md)"
+          done
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
