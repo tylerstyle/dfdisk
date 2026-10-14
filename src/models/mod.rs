@@ -5,6 +5,7 @@ pub mod device;
 pub mod identity;
 pub mod info_report;
 pub mod outcome;
+pub mod protection;
 pub mod provenance;
 pub mod telemetry;
 pub mod text;
