@@ -1,15 +1,8 @@
-#![allow(unused_imports, dead_code)]
-
 //! Acquisitions leave a verifiable trail in the dfnix audit log, and the report
 //! and the log point at each other. Own test binary: it sets DFNIX_AUDIT_LOG.
 
-#[path = "../src/models/mod.rs"]
-mod models;
-
-#[path = "../src/engines/mod.rs"]
-mod engines;
-
-use models::{
+use dfdisk::engines;
+use dfdisk::models::{
     case::CaseMetadata,
     config::{AcquisitionConfig, ImageFormat},
     device::{BlockDevice, DeviceSafety},
@@ -22,24 +15,15 @@ fn device(path: &std::path::Path, size: u64) -> BlockDevice {
     BlockDevice {
         name: "audit_dev".into(),
         path: path.to_string_lossy().into(),
-        devlinks: vec![],
         size_bytes: size,
         model: Some("Audit".into()),
-        vendor: None,
         serial: Some("AUDIT01".into()),
-        wwn: None,
-        revision: None,
         bus_type: "Virtual".into(),
         is_rotational: Some(false),
-        is_removable: false,
-        is_read_only: false,
         logical_sector_size: 512,
         physical_sector_size: 512,
-        partition_table_type: None,
-        partitions: vec![],
-        mountpoints: vec![],
         safety: DeviceSafety::Safe,
-        smart: None,
+        ..Default::default()
     }
 }
 
@@ -57,11 +41,11 @@ fn case() -> CaseMetadata {
 
 #[tokio::test]
 async fn acquisition_report_and_audit_log_anchor_each_other() {
-    let dir = std::env::temp_dir().join(format!("dfdisk_audit_trail_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let log = dir.join("audit.jsonl");
     std::env::set_var("DFNIX_AUDIT_LOG", &log);
+    std::env::set_var("DFNIX_PROTECTED_FILE", dir.join("protected.json"));
 
     let src = dir.join("src.bin");
     std::fs::write(&src, vec![7u8; 8192]).unwrap();
@@ -140,13 +124,21 @@ async fn acquisition_report_and_audit_log_anchor_each_other() {
     );
 
     // The case directory carries a verifiable copy of the log as of the successful
-    // acquisition; the refused second run wrote nothing there
-    let copy = dir.join("out").join("audit.jsonl");
-    let copied = dfcore::audit::verify(&copy).unwrap();
+    // acquisition (audit-<boot_id>.jsonl); the refused second run wrote nothing there
+    let exported: Vec<_> = std::fs::read_dir(dir.join("out"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy();
+            name.starts_with("audit-") && name.ends_with(".jsonl")
+        })
+        .collect();
+    assert_eq!(exported.len(), 1, "{exported:?}");
+    let copy = &exported[0];
+    let copied = dfcore::audit::verify(copy).unwrap();
     assert_eq!(copied.records, 2);
     assert_eq!(copied.head, records[1]["hash"].as_str().unwrap());
-    let head = std::fs::read_to_string(dir.join("out").join("audit.head")).unwrap();
+    let head = std::fs::read_to_string(copy.with_extension("head")).unwrap();
     assert!(head.starts_with(&copied.head), "{head}");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -189,8 +189,8 @@ fn test_clap_argument_validation() {
 
 #[test]
 fn test_verify_subcommand_exit_codes() {
-    let temp_dir = std::env::temp_dir();
-    let test_file = temp_dir.join("dfdisk_cli_verify_test.bin");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("verify_test.bin");
     let test_payload = b"CRIME_SCENE_FORENSIC_ACQUISITION_VERIFICATION_PAYLOAD_2026";
     {
         let mut f = File::create(&test_file).expect("Failed to create test file");
@@ -293,8 +293,9 @@ fn test_verify_subcommand_exit_codes() {
 fn test_list_json_output_structure() {
     use std::os::unix::fs::PermissionsExt;
 
-    let temp_dir = std::env::temp_dir().join("dfdisk_cli_test_mock_bin");
-    std::fs::create_dir_all(&temp_dir).expect("Failed to create mock bin dir");
+    // Every tool the scan runs is a mock on PATH: nothing touches this host's disks
+    let tmp = tempfile::tempdir().unwrap();
+    let temp_dir = tmp.path();
     let mock_lsblk = temp_dir.join("lsblk");
 
     // Hermetic mock for lsblk returning standard JSON block device structure
@@ -320,6 +321,14 @@ EOF
     std::fs::write(&mock_lsblk, mock_script).expect("Failed to write mock lsblk");
     std::fs::set_permissions(&mock_lsblk, std::fs::Permissions::from_mode(0o755))
         .expect("Failed to set executable permissions");
+    for (tool, script) in [
+        ("udevadm", "#!/bin/sh\nexit 1\n"),
+        ("smartctl", "#!/bin/sh\necho '{}'\nexit 2\n"),
+    ] {
+        let mock = temp_dir.join(tool);
+        std::fs::write(&mock, script).unwrap();
+        std::fs::set_permissions(&mock, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     let current_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", temp_dir.display(), current_path);
@@ -373,8 +382,6 @@ EOF
             "Device must have 'safety' classification"
         );
     }
-
-    let _ = std::fs::remove_dir_all(temp_dir);
 }
 
 #[test]
@@ -394,12 +401,10 @@ fn test_acquire_rejects_nonexistent() {
 
 #[test]
 fn test_acquire_rejects_directory() {
-    let temp_dir = std::env::temp_dir().join("dfdisk_test_acquire_dir");
-    let _ = std::fs::remove_dir_all(&temp_dir);
-    std::fs::create_dir_all(&temp_dir).unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
 
     let output = Command::new(BIN)
-        .args(["acquire", &temp_dir.to_string_lossy()])
+        .args(["acquire", &temp_dir.path().to_string_lossy()])
         .output()
         .expect("Failed to execute dfdisk acquire");
 
@@ -409,6 +414,4 @@ fn test_acquire_rejects_directory() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Critical Safety Error") || stderr.contains("neither a regular file"));
-
-    let _ = std::fs::remove_dir_all(&temp_dir);
 }

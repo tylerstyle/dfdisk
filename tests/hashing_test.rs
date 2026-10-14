@@ -1,12 +1,4 @@
-#![allow(unused_imports, dead_code)]
-
-#[path = "../src/models/mod.rs"]
-mod models;
-
-#[path = "../src/engines/mod.rs"]
-mod engines;
-
-use engines::hasher::{HashProgress, MultiHasher};
+use dfdisk::engines::hasher::{HashProgress, MultiHasher};
 use md5::{Digest as _, Md5};
 use sha1::Sha1;
 use sha2::Sha256;
@@ -16,8 +8,8 @@ use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn test_rfc_test_vectors_empty() {
-    let temp_dir = std::env::temp_dir();
-    let test_file = temp_dir.join("dfdisk_test_rfc_empty.dat");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("dfdisk_test_rfc_empty.dat");
     {
         let _ = File::create(&test_file).expect("Failed to create empty test file");
     }
@@ -86,9 +78,9 @@ async fn test_rfc_standard_vectors() {
         ),
     ];
 
-    let temp_dir = std::env::temp_dir();
+    let temp_dir = tempfile::tempdir().unwrap();
     for (i, (input, exp_md5, exp_sha1, exp_sha256)) in test_cases.iter().enumerate() {
-        let test_file = temp_dir.join(format!("dfdisk_rfc_vector_{}.dat", i));
+        let test_file = temp_dir.path().join(format!("dfdisk_rfc_vector_{}.dat", i));
         {
             let mut f = File::create(&test_file).unwrap();
             f.write_all(input.as_bytes()).unwrap();
@@ -139,8 +131,8 @@ async fn test_rfc_standard_vectors() {
 
 #[tokio::test]
 async fn test_streaming_progress_and_completion() {
-    let temp_dir = std::env::temp_dir();
-    let test_file = temp_dir.join("dfdisk_test_streaming_2_5mb.bin");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("dfdisk_test_streaming_2_5mb.bin");
     // Create 2.5 MB (2,621,440 bytes) to ensure multiple 1MB buffer chunks
     let total_size: usize = 2_621_440;
     let pattern = [0x5au8; 1024]; // 1 KB repeating pattern
@@ -209,8 +201,8 @@ async fn test_streaming_progress_and_completion() {
 
 #[tokio::test]
 async fn test_seek_capacity_calculation() {
-    let temp_dir = std::env::temp_dir();
-    let test_file = temp_dir.join("dfdisk_test_seek_capacity.bin");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("dfdisk_test_seek_capacity.bin");
     let target_size: u64 = 1_048_576; // 1 MB
 
     // Create file and extend via set_len and seek
@@ -254,8 +246,8 @@ async fn test_seek_capacity_calculation() {
 
 #[tokio::test]
 async fn test_selective_algorithm_hashing() {
-    let temp_dir = std::env::temp_dir();
-    let test_file = temp_dir.join("dfdisk_test_selective.bin");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let test_file = temp_dir.path().join("dfdisk_test_selective.bin");
     {
         let mut f = File::create(&test_file).unwrap();
         f.write_all(b"forensic selective algorithm test").unwrap();

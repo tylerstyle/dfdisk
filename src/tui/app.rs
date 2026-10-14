@@ -130,8 +130,13 @@ impl Default for App {
 }
 
 impl App {
+    /// App with a fresh scan of this host's block devices.
     pub fn new() -> Self {
-        let devices = DeviceScanner::scan_devices().unwrap_or_default();
+        Self::with_devices(DeviceScanner::scan_devices().unwrap_or_default())
+    }
+
+    /// App over a given device list; scans nothing (tests, or a scan already done).
+    pub fn with_devices(devices: Vec<BlockDevice>) -> Self {
         let target_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let target_dir_str = target_dir.to_string_lossy().to_string();
 
@@ -1262,7 +1267,7 @@ mod tests {
 
     #[test]
     fn test_converter_navigation_and_editing() {
-        let mut app = App::new();
+        let mut app = App::with_devices(Vec::new());
         // Switch to Converter screen
         app.handle_key(key(KeyCode::Char('c')));
         assert_eq!(app.current_screen, Screen::Converter);
@@ -1319,7 +1324,7 @@ mod tests {
 
     #[test]
     fn test_converter_mode_auto_detection() {
-        let mut app = App::new();
+        let mut app = App::with_devices(Vec::new());
         app.conv_source_path = "/tmp/suspect.E01".to_string();
         app.auto_detect_converter_mode();
         assert!(!app.conv_to_e01);
@@ -1335,15 +1340,15 @@ mod tests {
 
     #[test]
     fn test_path_autocomplete_in_app() {
-        let temp = std::env::temp_dir().join(format!("dfdisk_app_ac_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
+        let tmp = tempfile::tempdir().unwrap();
+        let temp = tmp.path();
         std::fs::create_dir_all(temp.join("subdir1")).unwrap();
         std::fs::create_dir_all(temp.join("subdir2")).unwrap();
         std::fs::File::create(temp.join("file.raw")).unwrap();
 
         let temp_str = temp.to_string_lossy().to_string();
 
-        let mut app = App::new();
+        let mut app = App::with_devices(Vec::new());
         app.current_screen = Screen::Converter;
 
         // 1. Autocomplete Destination Dir (dirs only)
@@ -1370,13 +1375,11 @@ mod tests {
 
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.conv_source_path, format!("{}/file.raw", temp_str));
-
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
     fn test_handle_key_acquisition_abort_keys() {
-        let mut app = App::new();
+        let mut app = App::with_devices(Vec::new());
         app.current_screen = Screen::AcquisitionRunning;
 
         // Test pressing 'a' aborts
@@ -1426,7 +1429,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_case_setup_navigation_and_start_button() {
-        let mut app = App::new();
+        let mut app = App::with_devices(Vec::new());
         app.devices = vec![BlockDevice::default()];
         app.selected_device_idx = 0;
         app.current_screen = Screen::CaseSetup;
@@ -1460,7 +1463,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_case_setup_f5_triggers_globally() {
-        let mut app = App::new();
+        let mut app = App::with_devices(Vec::new());
         app.devices = vec![BlockDevice::default()];
         app.selected_device_idx = 0;
         app.current_screen = Screen::CaseSetup;
@@ -1473,7 +1476,7 @@ mod tests {
 
     #[test]
     fn test_converter_busy_guard() {
-        let mut app = App::new();
+        let mut app = App::with_devices(Vec::new());
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         app.conv_rx = Some(rx);
         app.conv_source_path = "/nonexistent/test.raw".to_string();

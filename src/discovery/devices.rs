@@ -36,9 +36,10 @@ impl DeviceScanner {
         let mut devices = Vec::new();
 
         for dev_val in blockdevices {
-            if let Some(dev) =
+            if let Some(mut dev) =
                 Self::parse_device_from_json(dev_val, proc_swaps_available, &active_swaps)
             {
+                Self::enrich_device(&mut dev);
                 devices.push(dev);
             }
         }
@@ -46,7 +47,20 @@ impl DeviceScanner {
         Ok(devices)
     }
 
-    /// Parses a single block device from lsblk JSON, recursively traversing children and checking active swaps
+    /// Adds what lsblk does not report: udev serial fallback and device links,
+    /// and SMART health. Runs external tools against the device, so it is kept
+    /// apart from the pure JSON parsing that tests exercise.
+    pub fn enrich_device(dev: &mut BlockDevice) {
+        let (udev_serial, devlinks) = query_udev_props(&dev.path);
+        if dev.serial.as_deref().is_none_or(|s| s.trim().is_empty()) {
+            dev.serial = udev_serial;
+        }
+        dev.devlinks = devlinks;
+        dev.smart = SmartChecker::query_smart(&dev.path);
+    }
+
+    /// Parses a single block device from lsblk JSON, recursively traversing
+    /// children and checking active swaps. Pure: runs no external tool.
     pub fn parse_device_from_json(
         dev_val: &Value,
         proc_swaps_available: bool,
@@ -108,11 +122,9 @@ impl DeviceScanner {
             "UNKNOWN".to_string()
         };
 
-        let is_removable = dev_val.get("rm").and_then(|v| v.as_bool()).unwrap_or(false)
-            || dev_val
-                .get("hotplug")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+        // RM is removable media (card readers, floppies); HOTPLUG is the
+        // attachment (USB, eSATA). A USB-attached HDD is hot-pluggable but not removable
+        let is_removable = dev_val.get("rm").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let is_read_only = dev_val.get("ro").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -185,24 +197,17 @@ impl DeviceScanner {
             }
         }
 
-        // Fetch udev properties for hardware links and serial numbers
-        let (udev_serial, devlinks) = query_udev_props(&path);
-        let final_serial = serial_lsblk.or(udev_serial);
-
         // Safety evaluation
         let safety = SafetyChecker::evaluate_safety(&all_mountpoints, swap_active);
-
-        // Optional SMART probing
-        let smart = SmartChecker::query_smart(&path);
 
         Some(BlockDevice {
             name,
             path,
-            devlinks,
+            devlinks: Vec::new(),
             size_bytes,
             model,
             vendor,
-            serial: final_serial,
+            serial: serial_lsblk.filter(|s| !s.is_empty()),
             wwn,
             revision,
             bus_type,
@@ -215,7 +220,7 @@ impl DeviceScanner {
             partitions,
             mountpoints: all_mountpoints,
             safety,
-            smart,
+            smart: None,
         })
     }
 }

@@ -1586,7 +1586,7 @@ mod tests {
 
     #[test]
     fn test_footer_hints_and_notification_separation() {
-        let mut app = App::new();
+        let mut app = App::with_devices(Vec::new());
 
         // 1. DeviceExplorer screen hints
         app.current_screen = Screen::DeviceExplorer;
@@ -1620,7 +1620,7 @@ mod tests {
         let backend = TestBackend::new(100, 10);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut app = App::new();
+        let mut app = App::with_devices(Vec::new());
         app.current_screen = Screen::DeviceExplorer;
         app.notification_msg = Some(("Device list refreshed.".to_string(), false));
 
@@ -1651,7 +1651,7 @@ mod tests {
             let backend = TestBackend::new(w, 5);
             let mut terminal = Terminal::new(backend).unwrap();
 
-            let mut app = App::new();
+            let mut app = App::with_devices(Vec::new());
             // Test with very long notification (300 chars)
             let long_msg = "X".repeat(300);
             app.notification_msg = Some((long_msg, true));
@@ -1671,7 +1671,7 @@ mod tests {
 
     #[test]
     fn test_footer_hints_all_screens_coverage() {
-        let mut app = App::new();
+        let mut app = App::with_devices(Vec::new());
 
         // DeviceExplorer
         app.current_screen = Screen::DeviceExplorer;
@@ -1853,7 +1853,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        let mut app = App::new();
+        let mut app = App::with_devices(Vec::new());
 
         // 1. Render CaseSetup unfocused
         app.current_screen = Screen::CaseSetup;

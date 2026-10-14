@@ -1,14 +1,9 @@
-#![allow(unused_imports, dead_code)]
+//! Pure parsing of captured lsblk / smartctl output; no tool is run against
+//! this host's devices.
 
-#[path = "../src/models/mod.rs"]
-mod models;
-
-#[path = "../src/discovery/mod.rs"]
-mod discovery;
-
-use discovery::devices::DeviceScanner;
-use discovery::smart::SmartChecker;
-use models::device::DeviceSafety;
+use dfdisk::discovery::devices::DeviceScanner;
+use dfdisk::discovery::smart::SmartChecker;
+use dfdisk::models::device::DeviceSafety;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;

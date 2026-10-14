@@ -86,29 +86,26 @@ mod tests {
 
     #[test]
     fn existing_outputs_are_detected_and_refused() {
-        let dir = std::env::temp_dir().join(format!("dfdisk_preflight_out_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let base = "case_ea01_cf01_NOSERIAL";
 
-        assert!(ensure_no_existing_outputs(&dir, base).is_ok());
+        assert!(ensure_no_existing_outputs(dir, base).is_ok());
         // Different acquisition sharing a prefix is not a collision
         fs::write(dir.join(format!("{}2.E01", base)), b"x").unwrap();
-        assert!(ensure_no_existing_outputs(&dir, base).is_ok());
+        assert!(ensure_no_existing_outputs(dir, base).is_ok());
 
         for name in ["E01", "E02", "raw", "map", "info"] {
             let f = dir.join(format!("{}.{}", base, name));
             fs::write(&f, b"x").unwrap();
-            let e = ensure_no_existing_outputs(&dir, base).unwrap_err();
+            let e = ensure_no_existing_outputs(dir, base).unwrap_err();
             assert!(e.contains("already exists"), "{e}");
             assert!(e.contains("no serial number"), "{e}");
             fs::remove_file(&f).unwrap();
         }
 
         fs::write(dir.join("case_ea01_cf01_SER1.E01"), b"x").unwrap();
-        let e = ensure_no_existing_outputs(&dir, "case_ea01_cf01_SER1").unwrap_err();
+        let e = ensure_no_existing_outputs(dir, "case_ea01_cf01_SER1").unwrap_err();
         assert!(!e.contains("no serial number"), "{e}");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }

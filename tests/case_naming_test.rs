@@ -1,9 +1,4 @@
-#![allow(unused_imports, dead_code)]
-
-#[path = "../src/models/mod.rs"]
-mod models;
-
-use models::case::CaseMetadata;
+use dfdisk::models::case::CaseMetadata;
 
 #[test]
 fn test_evidence_filename_generation_format() {

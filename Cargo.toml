@@ -47,7 +47,9 @@ digest = "0.11"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
-thiserror = "2.0"
 regex = "1.13"
 futures = "0.3"
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

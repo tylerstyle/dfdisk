@@ -1,11 +1,6 @@
-mod cli;
-mod discovery;
-mod engines;
-mod models;
-mod tui;
-
 use clap::Parser;
-use cli::{handle_acquire, handle_convert, handle_list, handle_verify, Cli, Commands};
+use dfdisk::cli::{handle_acquire, handle_convert, handle_list, handle_verify, Cli, Commands};
+use dfdisk::tui;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

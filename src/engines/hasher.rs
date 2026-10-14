@@ -224,8 +224,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_hash_stream_known_vector() {
-        let temp_dir = std::env::temp_dir();
-        let test_file = temp_dir.join("dfdisk_test_known_vector.txt");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_file = temp_dir.path().join("known_vector.txt");
         {
             let mut f = File::create(&test_file).unwrap();
             f.write_all(b"hello world").unwrap();
@@ -254,14 +254,12 @@ mod tests {
         let final_prog = last_progress.expect("Should have received progress");
         assert_eq!(final_prog.percentage, 100.0);
         assert_eq!(final_prog.bytes_hashed, 11);
-
-        let _ = std::fs::remove_file(test_file);
     }
 
     #[tokio::test]
     async fn test_hash_stream_empty_file() {
-        let temp_dir = std::env::temp_dir();
-        let test_file = temp_dir.join("dfdisk_test_empty.txt");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_file = temp_dir.path().join("empty.txt");
         {
             let _ = File::create(&test_file).unwrap();
         }
@@ -282,7 +280,5 @@ mod tests {
         let final_prog = last_progress.expect("Should have received progress");
         assert_eq!(final_prog.percentage, 100.0);
         assert_eq!(final_prog.bytes_hashed, 0);
-
-        let _ = std::fs::remove_file(test_file);
     }
 }

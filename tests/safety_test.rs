@@ -1,13 +1,5 @@
-#![allow(unused_imports, dead_code)]
-
-#[path = "../src/models/mod.rs"]
-mod models;
-
-#[path = "../src/discovery/mod.rs"]
-mod discovery;
-
-use discovery::safety::SafetyChecker;
-use models::device::DeviceSafety;
+use dfdisk::discovery::safety::SafetyChecker;
+use dfdisk::models::device::DeviceSafety;
 
 #[test]
 fn test_critical_os_directories_categorization() {

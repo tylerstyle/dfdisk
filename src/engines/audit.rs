@@ -21,6 +21,7 @@ fn identity(device: &BlockDevice) -> DeviceIdentity {
         wwn: device.wwn.clone().filter(|s| !s.trim().is_empty()),
         model: Some(device.display_name()),
         size: Some(device.size_bytes.to_string()),
+        diskseq: None,
     }
 }
 

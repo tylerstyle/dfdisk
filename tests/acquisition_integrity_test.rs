@@ -1,69 +1,18 @@
-#![allow(unused_imports, dead_code)]
+mod common;
 
-#[path = "../src/models/mod.rs"]
-mod models;
-
-#[path = "../src/engines/mod.rs"]
-mod engines;
-
-use digest::Digest;
-use models::{
-    case::CaseMetadata,
-    config::{AcquisitionConfig, ImageFormat},
-    device::{BlockDevice, DeviceSafety},
-    info_report::VerificationStatus,
+use common::{audit_sandbox, case, file_device, sample, scratch};
+use dfdisk::{
+    engines,
+    models::{
+        self,
+        config::{AcquisitionConfig, ImageFormat},
+        info_report::VerificationStatus,
+    },
 };
+use digest::Digest;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-
-fn scratch(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("dfdisk_integrity_{}_{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("out")).unwrap();
-    dir
-}
-
-fn case() -> CaseMetadata {
-    CaseMetadata {
-        case_number: "CASE42".to_string(),
-        location_ea: "01".to_string(),
-        evidence_number: "CF01".to_string(),
-        authority: "DFIR".to_string(),
-        examiner: "Examiner".to_string(),
-        description: "Integrity test".to_string(),
-        notes: "".to_string(),
-    }
-}
-
-fn file_device(path: &Path, size_bytes: u64, serial: Option<&str>) -> BlockDevice {
-    BlockDevice {
-        name: "test_dev".to_string(),
-        path: path.to_string_lossy().to_string(),
-        devlinks: vec![],
-        size_bytes,
-        model: Some("Test".to_string()),
-        vendor: Some("Test".to_string()),
-        serial: serial.map(str::to_string),
-        wwn: None,
-        revision: None,
-        bus_type: "Virtual".to_string(),
-        is_rotational: Some(false),
-        is_removable: false,
-        is_read_only: false,
-        logical_sector_size: 512,
-        physical_sector_size: 512,
-        partition_table_type: None,
-        partitions: vec![],
-        mountpoints: vec![],
-        safety: DeviceSafety::Safe,
-        smart: None,
-    }
-}
-
-fn sample(len: usize) -> Vec<u8> {
-    (0..len).map(|i| (i * 7 % 253) as u8).collect()
-}
 
 fn channel() -> (
     tokio::sync::mpsc::Sender<models::telemetry::ProgressTelemetry>,
@@ -89,7 +38,9 @@ fn have_libewf() -> bool {
 
 #[tokio::test]
 async fn raw_short_source_keeps_partial_image_and_reports_incomplete() {
-    let dir = scratch("raw_incomplete");
+    audit_sandbox();
+    let tmp = scratch();
+    let dir = tmp.path();
     let src = dir.join("src.bin");
     std::fs::write(&src, sample(10)).unwrap();
     let out = dir.join("out");
@@ -128,13 +79,13 @@ async fn raw_short_source_keeps_partial_image_and_reports_incomplete() {
     assert!(!text.contains("Zero-fill"), "{text}");
     assert!(text.contains(engines::raw::RAW_ERROR_HANDLING), "{text}");
     assert!(!text.contains("VERIFIED - ALL HASHES MATCH"), "{text}");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn raw_complete_report_states_real_error_handling() {
-    let dir = scratch("raw_complete");
+    audit_sandbox();
+    let tmp = scratch();
+    let dir = tmp.path();
     let data = sample(64 * 1024);
     let src = dir.join("src.bin");
     std::fs::write(&src, &data).unwrap();
@@ -165,8 +116,6 @@ async fn raw_complete_report_states_real_error_handling() {
     let text = report.render_text();
     assert!(!text.contains("Zero-fill"), "{text}");
     assert!(report.incomplete.is_none());
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +124,9 @@ async fn raw_complete_report_states_real_error_handling() {
 
 #[tokio::test]
 async fn ewf_refuses_existing_segment_before_running_ewfacquire() {
-    let dir = scratch("ewf_exists");
+    audit_sandbox();
+    let tmp = scratch();
+    let dir = tmp.path();
     let src = dir.join("src.bin");
     std::fs::write(&src, sample(4096)).unwrap();
     let out = dir.join("out");
@@ -204,8 +155,6 @@ async fn ewf_refuses_existing_segment_before_running_ewfacquire() {
         std::fs::read(&existing).unwrap(),
         b"earlier acquisition of another drive"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 async fn run_ewf(
@@ -217,7 +166,9 @@ async fn run_ewf(
         eprintln!("skipping: ewfacquire/ewfverify not installed");
         return None;
     }
-    let dir = scratch(tag);
+    audit_sandbox();
+    let tmp = scratch();
+    let dir = tmp.path();
     let data = sample(2 * 1024 * 1024);
     let src = dir.join("src.bin");
     std::fs::write(&src, &data).unwrap();
@@ -243,7 +194,6 @@ async fn run_ewf(
     .await
     .unwrap();
     let _ = drain.await;
-    let _ = std::fs::remove_dir_all(&dir);
     Some((data, report))
 }
 
