@@ -1,6 +1,7 @@
 pub mod capacity;
 pub mod case;
 pub mod config;
+pub mod conversion;
 pub mod device;
 pub mod identity;
 pub mod info_report;

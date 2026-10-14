@@ -1,8 +1,11 @@
+use crate::engines::AcquisitionError;
+use crate::models::conversion::{ConversionReport, ConversionRequest};
 use crate::models::{
     case::CaseMetadata,
     config::{CompressionLevel, SplitSize},
     telemetry::{AcquisitionStatus, ProgressTelemetry},
 };
+use crate::signals::StopFlags;
 use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -11,6 +14,24 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
+
+/// Converts an image as described by `req` (§13 Converter) and writes the
+/// conversion report. The CLI (`convert`, `--rescue-to-e01`) and the TUI call
+/// this.
+///
+/// CONVERTER AGENT: placeholder with its final signature; implement it here
+/// and retire [`FormatConverter`] once nothing calls it.
+pub async fn convert(
+    req: ConversionRequest,
+    progress_tx: mpsc::Sender<ProgressTelemetry>,
+    stop: StopFlags,
+) -> Result<ConversionReport, AcquisitionError> {
+    let _ = (progress_tx, stop);
+    Err(AcquisitionError::failed(format!(
+        "converting {} is not implemented in this build",
+        req.source.display()
+    )))
+}
 
 pub struct FormatConverter;
 

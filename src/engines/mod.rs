@@ -3,6 +3,7 @@ pub mod converter;
 pub mod error;
 pub mod ewf;
 pub mod hasher;
+pub mod pieces;
 pub mod preflight;
 pub mod process;
 pub mod progress;

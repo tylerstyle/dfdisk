@@ -1,5 +1,34 @@
+use crate::engines::AcquisitionError;
 use crate::models::device::DeviceSafety;
+use crate::models::identity::SourceIdentity;
+use serde::Serialize;
 use std::process::Command;
+
+/// What [`unmount_source_tree`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct UnmountResult {
+    /// Mount points unmounted, deepest first
+    pub unmounted: Vec<String>,
+    /// Holders of the source tree (open LUKS/LVM/md), reported, never closed
+    pub holders: Vec<String>,
+    /// Hash of the audit `unmount` record, when it was written
+    pub audit_hash: Option<String>,
+}
+
+/// Unmounts every filesystem of the source and its descendants (§10, R8):
+/// registry check first, system mounts and active swap refused, deepest
+/// first, verified afterwards, audited, never lazy or forced. The CLI
+/// (`unmount`, `--auto-unmount`) and the TUI call this.
+///
+/// DISCOVERY AGENT: placeholder with its final signature; implement it here
+/// (an injectable variant for tests is yours to add) and retire
+/// [`SafetyChecker::unmount_all`].
+pub fn unmount_source_tree(identity: &SourceIdentity) -> Result<UnmountResult, AcquisitionError> {
+    Err(AcquisitionError::failed(format!(
+        "unmounting the source tree of {} is not implemented in this build",
+        identity.kernel_name
+    )))
+}
 
 pub struct SafetyChecker;
 
