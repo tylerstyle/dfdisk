@@ -96,6 +96,49 @@ pub enum ErrorHandling {
     NoWipe,
 }
 
+/// The acquisition engine a configuration selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineKind {
+    /// Expert Witness Format through ewfacquire
+    Ewf,
+    /// Native RAW copy
+    Raw,
+    /// Damaged-media rescue through GNU ddrescue
+    Rescue,
+}
+
+impl EngineKind {
+    /// Rescue mode wins over the image format: ddrescue always writes RAW.
+    pub fn from_config(config: &AcquisitionConfig) -> Self {
+        if config.rescue_mode {
+            EngineKind::Rescue
+        } else {
+            match config.format {
+                ImageFormat::E01 => EngineKind::Ewf,
+                ImageFormat::Raw => EngineKind::Raw,
+            }
+        }
+    }
+
+    /// Short machine name used in audit records ("e01", "raw", "rescue").
+    pub fn tag(&self) -> &'static str {
+        match self {
+            EngineKind::Ewf => "e01",
+            EngineKind::Raw => "raw",
+            EngineKind::Rescue => "rescue",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            EngineKind::Ewf => "E01 (ewfacquire)",
+            EngineKind::Raw => "RAW (native dfdisk engine)",
+            EngineKind::Rescue => "RAW rescue (GNU ddrescue)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcquisitionConfig {
     pub format: ImageFormat,
