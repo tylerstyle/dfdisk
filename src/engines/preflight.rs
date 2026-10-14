@@ -535,8 +535,8 @@ pub fn check_existing_outputs(
 }
 
 /// A resumed rescue needs its map (not empty) and its image. Returns the bytes
-/// the existing image occupies on disk (allocated blocks), for the free space
-/// rule.
+/// the existing image occupies on disk ([`occupied_bytes`]), for the free
+/// space rule.
 pub fn check_resume_files(output_dir: &Path, base_name: &str) -> Result<u64, AcquisitionError> {
     use std::os::unix::fs::MetadataExt;
     let find = |suffix: &str| {
@@ -569,8 +569,22 @@ pub fn check_resume_files(output_dir: &Path, base_name: &str) -> Result<u64, Acq
         ))
     })?;
     Ok(fs::metadata(&image)
-        .map(|m| m.blocks().saturating_mul(512))
+        .map(|m| occupied_bytes(m.len(), m.blocks()))
         .unwrap_or(0))
+}
+
+/// Bytes a file of `len` bytes with `blocks` 512-byte blocks allocated already
+/// uses on the destination: the allocation (a ddrescue image is sparse where
+/// nothing was rescued yet), never more than the length (cluster rounding),
+/// and the length when the filesystem reports no allocation at all (some
+/// FUSE and network filesystems leave st_blocks at 0).
+pub fn occupied_bytes(len: u64, blocks: u64) -> u64 {
+    let allocated = blocks.saturating_mul(512);
+    if allocated == 0 {
+        len
+    } else {
+        allocated.min(len)
+    }
 }
 
 /// Directories `create_dir_all(dir)` would create, outermost first.
@@ -921,7 +935,18 @@ mod tests {
             .message
             .contains("image"));
         fs::write(dir.join(format!("{base}.RAW")), vec![1u8; 8192]).unwrap();
-        assert!(check_resume_files(dir, base).unwrap() >= 8192);
+        assert_eq!(check_resume_files(dir, base).unwrap(), 8192);
+    }
+
+    #[test]
+    fn occupied_bytes_of_sparse_rounded_and_unreported_files() {
+        // Sparse image: only the allocation counts
+        assert_eq!(occupied_bytes(1 << 30, 16), 8192);
+        // Cluster rounding never counts more than the length
+        assert_eq!(occupied_bytes(1000, 8), 1000);
+        // No allocation reported (FUSE, network filesystems): the length
+        assert_eq!(occupied_bytes(4096, 0), 4096);
+        assert_eq!(occupied_bytes(0, 0), 0);
     }
 
     #[test]
