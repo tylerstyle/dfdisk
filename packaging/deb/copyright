@@ -2,6 +2,10 @@ Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: dfdisk
 Upstream-Contact: tylerstyle <tylerstyle@users.noreply.github.com>
 Source: https://github.com/tylerstyle/dfdisk
+Comment: cargo-deb installs this file as /usr/share/doc/dfdisk/copyright
+ ([package.metadata.deb] license-file in Cargo.toml). The package also ships
+ the full license texts as /usr/share/doc/dfdisk/LICENSE-MIT and
+ /usr/share/doc/dfdisk/LICENSE-APACHE.
 
 Files: *
 Copyright: 2026 tylerstyle <tylerstyle@users.noreply.github.com>
