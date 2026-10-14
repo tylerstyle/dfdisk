@@ -125,7 +125,7 @@ impl EwfAcquireEngine {
         let mut reader_out = BufReader::new(stdout).lines();
 
         let mut telemetry = ProgressTelemetry {
-            status: AcquisitionStatus::Imaging,
+            status: AcquisitionStatus::Acquiring,
             total_bytes: device.size_bytes,
             current_segment: format!("{}.E01", base_name),
             status_message: "Starting E01 acquisition...".to_string(),
@@ -195,7 +195,7 @@ impl EwfAcquireEngine {
                                 telemetry.compression_ratio = Some(processed as f64 / written_bytes as f64);
                             }
 
-                            let _ = progress_tx.send(telemetry.clone()).await;
+                            let _ = progress_tx.send(telemetry.take_update()).await;
                         }
                     }
                 }
@@ -211,7 +211,7 @@ impl EwfAcquireEngine {
                                     }
                                 }
                                 telemetry.push_log(text);
-                                let _ = progress_tx.send(telemetry.clone()).await;
+                                let _ = progress_tx.send(telemetry.take_update()).await;
                             }
                         }
                         Ok(None) | Err(_) => {
@@ -287,7 +287,7 @@ impl EwfAcquireEngine {
         telemetry.status_message = "Verifying written E01 image via ewfverify...".to_string();
         telemetry
             .push_log("Beginning post-acquisition destination verification pass via ewfverify...");
-        let _ = progress_tx.send(telemetry.clone()).await;
+        let _ = progress_tx.send(telemetry.take_update()).await;
 
         let first_segment = &generated_files[0];
         let mut v_cmd = Command::new("ewfverify");
@@ -350,7 +350,7 @@ impl EwfAcquireEngine {
                             let text = l.trim();
                             if !text.is_empty() {
                                 telemetry.push_log(text);
-                                let _ = progress_tx.send(telemetry.clone()).await;
+                                let _ = progress_tx.send(telemetry.take_update()).await;
                             }
                         }
                         Ok(None) | Err(_) => v_err_closed = true,

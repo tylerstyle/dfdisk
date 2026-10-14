@@ -158,7 +158,7 @@ fn test_smart_diagnostics_healthy_nvme() {
     assert_eq!(info.assessment, "PASSED (Healthy)");
     assert_eq!(info.power_on_hours, Some(3450));
     assert_eq!(info.temperature_celsius, Some(38));
-    assert_eq!(info.wear_percentage, Some(0)); // 100 - 100% available spare
+    assert_eq!(info.wear_percentage, Some(0)); // NVMe percentage_used
     assert_eq!(info.uncorrectable_errors, Some(0));
 }
 

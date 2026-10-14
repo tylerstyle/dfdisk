@@ -148,7 +148,7 @@ impl RescueAcquireEngine {
         let mut reader = BufReader::new(stdout).lines();
 
         let mut telemetry = ProgressTelemetry {
-            status: AcquisitionStatus::Imaging,
+            status: AcquisitionStatus::Acquiring,
             total_bytes: device.size_bytes,
             current_segment: raw_filename.clone(),
             status_message: "Starting resilient ddrescue acquisition...".to_string(),
@@ -205,7 +205,7 @@ impl RescueAcquireEngine {
                                 telemetry.eta_secs = Some((rem as f64 / telemetry.avg_speed_bps) as u64);
                             }
 
-                            let _ = progress_tx.send(telemetry.clone()).await;
+                            let _ = progress_tx.send(telemetry.take_update()).await;
                         }
                     }
                 }
@@ -257,7 +257,7 @@ impl RescueAcquireEngine {
                                 }
 
                                 telemetry.status_message = text.to_string();
-                                let _ = progress_tx.send(telemetry.clone()).await;
+                                let _ = progress_tx.send(telemetry.take_update()).await;
                             }
                         }
                         Ok(None) => break,
@@ -285,7 +285,7 @@ impl RescueAcquireEngine {
         // Post-acquisition verification hashing
         telemetry.status = AcquisitionStatus::Verifying;
         telemetry.status_message = "Computing cryptographic integrity hashes...".to_string();
-        let _ = progress_tx.send(telemetry.clone()).await;
+        let _ = progress_tx.send(telemetry.take_update()).await;
 
         let hashes = MultiHasher::hash_stream_with_abort(
             &raw_path,
@@ -449,6 +449,7 @@ mod tests {
                 mountpoints: vec![],
                 safety: crate::models::device::DeviceSafety::Safe,
                 smart: None,
+                ..Default::default()
             },
             config: AcquisitionConfig::default(),
             started_at: Utc::now(),

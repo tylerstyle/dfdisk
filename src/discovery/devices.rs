@@ -1,5 +1,6 @@
 use crate::discovery::{safety::SafetyChecker, smart::SmartChecker};
 use crate::models::device::{BlockDevice, Partition};
+use crate::models::identity::SourceKind;
 use serde_json::Value;
 use std::fs;
 use std::process::Command;
@@ -200,6 +201,17 @@ impl DeviceScanner {
         // Safety evaluation
         let safety = SafetyChecker::evaluate_safety(&all_mountpoints, swap_active);
 
+        let maj_min = json_str(dev_val, "maj:min");
+        let hotplug = dev_val
+            .get("hotplug")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let transport = Some(tran.to_ascii_lowercase()).filter(|t| !t.is_empty());
+        let diskseq = dev_val
+            .get("disk-seq")
+            .map(|v| parse_u64(Some(v)))
+            .filter(|&n| n > 0);
+
         Some(BlockDevice {
             name,
             path,
@@ -221,6 +233,12 @@ impl DeviceScanner {
             mountpoints: all_mountpoints,
             safety,
             smart: None,
+            maj_min,
+            diskseq,
+            hotplug,
+            transport,
+            kind: SourceKind::from_lsblk_type(dev_type),
+            ..Default::default()
         })
     }
 }
@@ -306,6 +324,9 @@ pub fn collect_partitions_recursive(
         uuid,
         mountpoint: part_mp,
         is_read_only: part_ro,
+        maj_min: json_str(child, "maj:min"),
+        kind: json_str(child, "type"),
+        start_sector: child.get("start").map(|v| parse_u64(Some(v))),
     });
 
     if let Some(nested_children) = child.get("children").and_then(|v| v.as_array()) {
@@ -338,6 +359,13 @@ fn get_active_swaps() -> (bool, std::collections::HashSet<String>) {
         }
         Err(_) => (false, swaps),
     }
+}
+
+fn json_str(val: &Value, key: &str) -> Option<String> {
+    val.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn parse_u64(val: Option<&Value>) -> u64 {

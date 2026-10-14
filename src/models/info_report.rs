@@ -31,23 +31,7 @@ pub enum VerificationStatus {
     Incomplete,
 }
 
-/// Digests an acquisition was asked to produce and must verify.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct HashSelection {
-    pub md5: bool,
-    pub sha1: bool,
-    pub sha256: bool,
-}
-
-impl HashSelection {
-    pub fn from_config(config: &AcquisitionConfig) -> Self {
-        Self {
-            md5: config.calc_md5,
-            sha1: config.calc_sha1,
-            sha256: config.calc_sha256,
-        }
-    }
-}
+pub use crate::models::config::HashSelection;
 
 /// Compare source and destination digests for the selected algorithms only.
 /// Digests that were not selected are ignored, so disabling an algorithm can

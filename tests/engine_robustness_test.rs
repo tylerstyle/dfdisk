@@ -181,6 +181,7 @@ fn test_truthful_forensic_reporting_damaged_media_rescue() {
             mountpoints: vec![],
             safety: DeviceSafety::Safe,
             smart: None,
+            ..Default::default()
         },
         config: AcquisitionConfig {
             rescue_mode: true,

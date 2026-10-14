@@ -219,7 +219,7 @@ impl RawAcquireEngine {
         preflight::ensure_destination_not_on_source(&device.path, &config.output_dir)?;
 
         let mut telemetry = ProgressTelemetry {
-            status: AcquisitionStatus::Imaging,
+            status: AcquisitionStatus::Acquiring,
             total_bytes: device.size_bytes,
             current_segment: raw_filename.clone(),
             status_message: format!(
@@ -228,7 +228,7 @@ impl RawAcquireEngine {
             ),
             ..Default::default()
         };
-        let _ = progress_tx.send(telemetry.clone()).await;
+        let _ = progress_tx.send(telemetry.take_update()).await;
 
         // Perform streaming block copy on a blocking task
         let src_path = device.path.clone();
@@ -301,7 +301,7 @@ impl RawAcquireEngine {
                     };
 
                     let _ = copy_prog_tx.blocking_send(ProgressTelemetry {
-                        status: AcquisitionStatus::Imaging,
+                        status: AcquisitionStatus::Acquiring,
                         bytes_processed,
                         total_bytes: total_device_bytes,
                         speed_bps: speed,
@@ -314,6 +314,7 @@ impl RawAcquireEngine {
                         bad_sectors: 0,
                         compression_ratio: None,
                         log_messages: vec![],
+                        ..Default::default()
                     });
                     last_report = Instant::now();
                 },
@@ -343,7 +344,7 @@ impl RawAcquireEngine {
         // Forward progress events during copying
         while let Some(prog) = copy_prog_rx.recv().await {
             telemetry = prog;
-            let _ = progress_tx.send(telemetry.clone()).await;
+            let _ = progress_tx.send(telemetry.take_update()).await;
         }
 
         let outcome = match copy_task.await {
@@ -372,7 +373,7 @@ impl RawAcquireEngine {
         telemetry.status_message =
             "Verifying written RAW image cryptographic hashes...".to_string();
         telemetry.push_log("Beginning post-acquisition destination verification pass...");
-        let _ = progress_tx.send(telemetry.clone()).await;
+        let _ = progress_tx.send(telemetry.take_update()).await;
 
         let (v_tx, mut v_rx) = mpsc::channel::<HashProgress>(50);
         let raw_path_clone = raw_path.clone();
@@ -400,7 +401,7 @@ impl RawAcquireEngine {
             telemetry.percentage = hp.percentage;
             telemetry.speed_bps = hp.speed_bps;
             telemetry.status_message = format!("Verifying RAW image: {:.1}%", hp.percentage);
-            let _ = progress_tx.send(telemetry.clone()).await;
+            let _ = progress_tx.send(telemetry.take_update()).await;
         }
 
         let destination_hashes = match verif_handle.await {

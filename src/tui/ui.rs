@@ -334,10 +334,17 @@ fn render_device_explorer(frame: &mut Frame, app: &mut App, area: Rect) {
                 Span::styled("SMART Health   : ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     &smart.assessment,
-                    if smart.passed {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::Red)
+                    // Unreadable SMART is UNKNOWN, never shown as a failure
+                    match smart.health {
+                        crate::models::device::SmartHealth::Passed => {
+                            Style::default().fg(Color::Green)
+                        }
+                        crate::models::device::SmartHealth::Failed => {
+                            Style::default().fg(Color::Red)
+                        }
+                        crate::models::device::SmartHealth::Unknown => {
+                            Style::default().fg(Color::Yellow)
+                        }
                     },
                 ),
             ]));

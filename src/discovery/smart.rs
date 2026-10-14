@@ -1,4 +1,4 @@
-use crate::models::device::SmartInfo;
+use crate::models::device::{SmartHealth, SmartInfo};
 use serde_json::Value;
 use std::process::Command;
 
@@ -37,13 +37,15 @@ impl SmartChecker {
             false
         };
 
-        let (passed, assessment) = match smart_status {
-            Some(true) if !is_inaccessible => (true, "PASSED (Healthy)".to_string()),
-            Some(false) => (false, "WARNING / FAILED".to_string()),
-            _ => (
-                false,
-                "UNKNOWN (Inaccessible / Permission Denied)".to_string(),
+        // Whatever could not be read is UNKNOWN, never FAILED
+        let (health, assessment) = match smart_status {
+            _ if is_inaccessible => (
+                SmartHealth::Unknown,
+                "UNKNOWN (Inaccessible / Permission Denied)",
             ),
+            Some(true) => (SmartHealth::Passed, "PASSED (Healthy)"),
+            Some(false) => (SmartHealth::Failed, "WARNING / FAILED"),
+            None => (SmartHealth::Unknown, "UNKNOWN (no SMART status reported)"),
         };
 
         let power_on_hours = val.pointer("/power_on_time/hours").and_then(|v| v.as_u64());
@@ -86,10 +88,11 @@ impl SmartChecker {
             }
         }
 
-        // Check NVMe health log if present
+        // Check NVMe health log if present; wear is the endurance used
+        // (percentage_used, may exceed 100), not the spare capacity left
         if let Some(nvme) = val.pointer("/nvme_smart_health_information_log") {
-            if let Some(spare) = nvme.get("available_spare").and_then(|v| v.as_u64()) {
-                wear = Some(100u32.saturating_sub(spare as u32));
+            if let Some(used) = nvme.get("percentage_used").and_then(|v| v.as_u64()) {
+                wear = Some(used.min(u64::from(u32::MAX)) as u32);
             }
             if let Some(errs) = nvme
                 .get("media_and_data_integrity_errors")
@@ -105,14 +108,15 @@ impl SmartChecker {
         }
 
         SmartInfo {
-            passed,
+            health,
+            passed: health == SmartHealth::Passed,
             power_on_hours,
             temperature_celsius,
             reallocated_sectors: reallocated,
             pending_sectors: pending,
             uncorrectable_errors: uncorrectable,
             wear_percentage: wear,
-            assessment,
+            assessment: assessment.to_string(),
         }
     }
 }
@@ -179,6 +183,7 @@ mod tests {
         });
         let info = SmartChecker::parse_smart_json(&val);
         assert!(!info.passed);
+        assert_eq!(info.health, SmartHealth::Unknown);
         assert_eq!(
             info.assessment,
             "UNKNOWN (Inaccessible / Permission Denied)"
@@ -192,10 +197,8 @@ mod tests {
         });
         let info = SmartChecker::parse_smart_json(&val);
         assert!(!info.passed);
-        assert_eq!(
-            info.assessment,
-            "UNKNOWN (Inaccessible / Permission Denied)"
-        );
+        assert_eq!(info.health, SmartHealth::Unknown);
+        assert_eq!(info.assessment, "UNKNOWN (no SMART status reported)");
     }
 
     #[test]
@@ -205,14 +208,16 @@ mod tests {
             "smart_status": { "passed": true },
             "nvme_smart_health_information_log": {
                 "available_spare": 95,
+                "percentage_used": 3,
                 "media_and_data_integrity_errors": 0,
                 "temperature": 310
             }
         });
         let info = SmartChecker::parse_smart_json(&val);
         assert!(info.passed);
+        assert_eq!(info.health, SmartHealth::Passed);
         assert_eq!(info.temperature_celsius, Some(37)); // 310 - 273 = 37
-        assert_eq!(info.wear_percentage, Some(5)); // 100 - 95 = 5
+        assert_eq!(info.wear_percentage, Some(3)); // percentage_used, not spare
         assert_eq!(info.uncorrectable_errors, Some(0));
     }
 

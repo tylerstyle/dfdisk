@@ -913,7 +913,7 @@ impl App {
         // Poll for progress updates
         if let Some(ref mut rx) = self.progress_rx {
             while let Ok(prog) = rx.try_recv() {
-                self.telemetry = prog;
+                self.telemetry.apply_update(prog);
             }
         }
 

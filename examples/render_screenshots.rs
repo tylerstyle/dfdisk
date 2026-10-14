@@ -328,6 +328,7 @@ fn build_case_setup_app() -> App {
         wipe_bad_sectors: false,
         rescue_mode: false,
         resume: false,
+        ..Default::default()
     };
 
     let dev = BlockDevice {
@@ -351,6 +352,7 @@ fn build_case_setup_app() -> App {
         mountpoints: vec![],
         safety: DeviceSafety::Safe,
         smart: None,
+        ..Default::default()
     };
     app.devices = vec![dev];
     app.selected_device_idx = 0;

@@ -170,6 +170,18 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
                         mountpoints: part_mounts,
                         safety,
                         smart: dev.smart.clone(),
+                        maj_min: part.maj_min.clone(),
+                        diskseq: dev.diskseq,
+                        hotplug: dev.hotplug,
+                        transport: dev.transport.clone(),
+                        kind: part
+                            .kind
+                            .as_deref()
+                            .map(crate::models::identity::SourceKind::from_lsblk_type)
+                            .unwrap_or(crate::models::identity::SourceKind::Partition),
+                        parent: Some(dev.path.clone()),
+                        start_sector: part.start_sector,
+                        ..Default::default()
                     });
                     break;
                 }
@@ -224,6 +236,8 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
             mountpoints: Vec::new(),
             safety: DeviceSafety::Safe,
             smart: None,
+            kind: crate::models::identity::SourceKind::RegularFile,
+            ..Default::default()
         }
     };
 
@@ -304,6 +318,8 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
         wipe_bad_sectors: true,
         rescue_mode: args.rescue,
         resume: args.resume,
+        auto_unmount: args.auto_unmount,
+        ..Default::default()
     };
 
     std::fs::create_dir_all(&config.output_dir)?;

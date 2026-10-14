@@ -80,7 +80,7 @@ impl FormatConverter {
             let text = line.trim();
             if let Some(ref tx) = progress_tx {
                 let mut tel = ProgressTelemetry {
-                    status: AcquisitionStatus::Imaging,
+                    status: AcquisitionStatus::Acquiring,
                     status_message: text.to_string(),
                     ..Default::default()
                 };
@@ -161,7 +161,7 @@ impl FormatConverter {
             let text = line.trim();
             if let Some(ref tx) = progress_tx {
                 let mut tel = ProgressTelemetry {
-                    status: AcquisitionStatus::Imaging,
+                    status: AcquisitionStatus::Acquiring,
                     status_message: text.to_string(),
                     ..Default::default()
                 };
