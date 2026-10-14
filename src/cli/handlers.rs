@@ -2,14 +2,15 @@ use crate::cli::args::{
     AcquireArgs, CliCompression, CliImageFormat, CliSplitSize, ConvertArgs, ListArgs, VerifyArgs,
 };
 use crate::discovery::{DeviceScanner, SafetyChecker};
+use crate::engines::session::{self, AcquisitionRequest};
 use crate::engines::verify::{self, CheckStatus, ExpectedHashes, VerifyEvent, VerifyOptions};
-use crate::engines::{EwfAcquireEngine, FormatConverter, RawAcquireEngine, RescueAcquireEngine};
+use crate::engines::{AcquisitionError, FormatConverter};
 use crate::models::{
     case::CaseMetadata,
-    config::{AcquisitionConfig, CompressionLevel, ImageFormat, SplitSize},
+    config::{AcquisitionConfig, CompressionLevel, EngineKind, ImageFormat, SplitSize},
     device::{BlockDevice, DeviceSafety},
-    outcome::{Outcome, VerificationResult},
-    telemetry::AcquisitionStatus,
+    outcome::{exit_code, Outcome, VerificationResult},
+    telemetry::ProgressTelemetry,
 };
 use crate::signals::StopFlags;
 use std::path::Path;
@@ -17,12 +18,17 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-pub async fn handle_list(args: ListArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let devices = DeviceScanner::scan_devices()?;
+pub async fn handle_list(args: ListArgs) -> Result<i32, AcquisitionError> {
+    let devices = DeviceScanner::scan_devices()
+        .map_err(|e| AcquisitionError::failed(format!("cannot list the block devices: {e}")))?;
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&devices)?);
-        return Ok(());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&devices)
+                .map_err(|e| AcquisitionError::failed(e.to_string()))?
+        );
+        return Ok(exit_code::VERIFIED);
     }
 
     println!("\n╔════════════════════════════════════════════════════════════════════════════════════════════════════╗");
@@ -50,25 +56,30 @@ pub async fn handle_list(args: ListArgs) -> Result<(), Box<dyn std::error::Error
     }
 
     println!("╚══════════════╩══════════════╩═════════════════════════════╩════════════════════╩══════════╩════════════╝\n");
-    Ok(())
+    Ok(exit_code::VERIFIED)
 }
 
-pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error::Error>> {
+/// `dfdisk acquire`: resolve the device, run the session, print the report.
+/// Returns the outcome's exit code; refusals and usage errors are `Err`.
+pub async fn handle_acquire(args: AcquireArgs) -> Result<i32, AcquisitionError> {
     let target_path = Path::new(&args.device);
     let canonical_path =
         std::fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
     let canonical_str = canonical_path.to_string_lossy().to_string();
 
     if !target_path.exists() && !canonical_path.exists() {
-        return Err(format!("Target device or file not found: {}", args.device).into());
+        return Err(AcquisitionError::usage(format!(
+            "Target device or file not found: {}",
+            args.device
+        )));
     }
 
     let meta = std::fs::symlink_metadata(&canonical_path).map_err(|e| {
-        format!(
+        AcquisitionError::usage(format!(
             "Failed to inspect target {}: {}",
             canonical_path.display(),
             e
-        )
+        ))
     })?;
 
     #[cfg(unix)]
@@ -76,21 +87,10 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
         use std::os::unix::fs::FileTypeExt;
         let ft = meta.file_type();
         if !ft.is_file() && !ft.is_block_device() {
-            return Err(format!(
+            return Err(AcquisitionError::usage(format!(
                 "Critical Safety Error: Target {} is neither a regular file nor a recognized block device.",
                 args.device
-            ).into());
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        if !meta.is_file() {
-            return Err(format!(
-                "Critical Safety Error: Target {} is not a regular file.",
-                args.device
-            )
-            .into());
+            )));
         }
     }
 
@@ -199,10 +199,10 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
             use std::os::unix::fs::FileTypeExt;
             let ft = meta.file_type();
             if ft.is_block_device() {
-                return Err(format!(
+                return Err(AcquisitionError::refused(format!(
                     "Critical Safety Error: Block device {} could not be verified by system discovery. Refusing to acquire unverified block device in CLI mode.",
                     args.device
-                ).into());
+                )));
             }
         }
 
@@ -245,31 +245,29 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
     println!("    Serial Number: {}", target_dev.display_serial());
     println!("    Total Size   : {}", target_dev.human_size());
 
-    // Safety checks
+    // Safety checks (the session repeats them against the probed device)
+    let mut unmounted: Vec<String> = Vec::new();
     match &target_dev.safety {
         DeviceSafety::SystemDisk(mounts) => {
-            eprintln!(
-                "\n[!] CRITICAL SAFETY WARNING: {} is a SYSTEM DISK!",
-                target_dev.path
-            );
-            eprintln!("    Active system mountpoints: {}", mounts.join(", "));
-            eprintln!("    Acquiring live system disks can cause evidence corruption. Refusing in CLI mode.");
-            return Err("Safety check failed: System disk detected.".into());
+            return Err(AcquisitionError::refused(format!(
+                "Safety check failed: {} is a SYSTEM DISK (active system mountpoints: {}); acquiring live system disks can corrupt evidence. Refusing in CLI mode.",
+                target_dev.path,
+                mounts.join(", ")
+            )));
         }
         DeviceSafety::Mounted(mounts) => {
             if args.auto_unmount {
                 println!("[*] Auto-unmounting partitions: {}", mounts.join(", "));
                 SafetyChecker::unmount_all(&target_dev.mountpoints)
-                    .map_err(|e| format!("Unmount failed: {}", e))?;
+                    .map_err(|e| AcquisitionError::failed(format!("Unmount failed: {}", e)))?;
                 println!("[+] Successfully unmounted all partitions.");
+                unmounted = mounts.clone();
             } else {
-                eprintln!(
-                    "\n[!] WARNING: Device {} has mounted partitions: {}",
+                return Err(AcquisitionError::refused(format!(
+                    "Safety check failed: device {} has mounted partitions ({}). Pass --auto-unmount or use the TUI to unmount safely.",
                     target_dev.path,
                     mounts.join(", ")
-                );
-                eprintln!("    Pass --auto-unmount or use the TUI interface to safely unmount.");
-                return Err("Safety check failed: Partitions are mounted.".into());
+                )));
             }
         }
         DeviceSafety::Safe => {
@@ -304,24 +302,31 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
         CliImageFormat::E01 => ImageFormat::E01,
         CliImageFormat::Raw => ImageFormat::Raw,
     };
+    let engine = if args.rescue {
+        EngineKind::Rescue
+    } else if format == ImageFormat::Raw {
+        EngineKind::Raw
+    } else {
+        EngineKind::Ewf
+    };
 
     let config = AcquisitionConfig {
-        format,
-        output_dir: args.output_dir,
         compression,
-        split_size,
+        // RAW and rescue images are one file (strict validation)
+        split_size: if engine == EngineKind::Ewf {
+            split_size
+        } else {
+            SplitSize::None
+        },
         calc_md5: true,
         calc_sha1: true,
         calc_sha256: true,
         error_retries: args.retries,
         wipe_bad_sectors: true,
-        rescue_mode: args.rescue,
         resume: args.resume,
         auto_unmount: args.auto_unmount,
-        ..Default::default()
+        ..AcquisitionConfig::for_engine(engine, args.output_dir)
     };
-
-    std::fs::create_dir_all(&config.output_dir)?;
 
     let base_name = case.generate_base_filename(&target_dev.display_serial());
     println!("[+] Output Base Name: {}", base_name);
@@ -329,101 +334,60 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
 
     let (prog_tx, mut prog_rx) = mpsc::channel(100);
     let abort_flag = Arc::new(AtomicBool::new(false));
+    let mut request = AcquisitionRequest::new(target_dev, case, config);
+    request.unmounted_by_dfdisk = unmounted;
+    let join_handle = tokio::spawn(session::run(request, prog_tx, abort_flag));
 
-    let dev_clone = target_dev.clone();
-    let case_clone = case.clone();
-    let cfg_clone = config.clone();
-    let abort_clone = abort_flag.clone();
-
-    let join_handle = tokio::spawn(async move {
-        if cfg_clone.rescue_mode {
-            RescueAcquireEngine::run_rescue(dev_clone, case_clone, cfg_clone, prog_tx, abort_clone)
-                .await
-        } else {
-            match cfg_clone.format {
-                ImageFormat::E01 => {
-                    EwfAcquireEngine::run_acquisition(
-                        dev_clone,
-                        case_clone,
-                        cfg_clone,
-                        prog_tx,
-                        abort_clone,
-                    )
-                    .await
-                }
-                ImageFormat::Raw => {
-                    RawAcquireEngine::run_acquisition(
-                        dev_clone,
-                        case_clone,
-                        cfg_clone,
-                        prog_tx,
-                        abort_clone,
-                    )
-                    .await
-                }
+    // Until every sender is gone (the session ended)
+    let mut seen = 0usize;
+    let mut log = ProgressTelemetry::default();
+    while let Some(update) = prog_rx.recv().await {
+        log.apply_update(update);
+        for line in log.log_messages.iter().skip(seen) {
+            if line.starts_with("WARNING:") {
+                eprintln!("\n[!] {line}");
             }
         }
-    });
-
-    while let Some(prog) = prog_rx.recv().await {
+        seen = log.log_messages.len();
         print!(
             "\r[*] Phase: {:<10} │ Progress: {:>5.1}% │ Speed: {:>10} │ ETA: {:>8} │ Errors: {:<4}",
-            prog.status.display_str(),
-            prog.percentage,
-            prog.human_speed(),
-            prog.human_eta(),
-            prog.bad_sectors
+            log.status.display_str(),
+            log.percentage,
+            log.human_speed(),
+            log.human_eta(),
+            log.bad_sectors
         );
         let _ = std::io::Write::flush(&mut std::io::stdout());
-
-        if prog.status == AcquisitionStatus::Completed
-            || matches!(prog.status, AcquisitionStatus::Failed(_))
-        {
-            break;
-        }
     }
     println!("\n");
 
-    let report_res = join_handle.await?;
-    match report_res {
-        Ok(report) => {
-            println!("{}", report.render_text());
-            // The verdict comes from the report (classify); only VERIFIED is success
-            for line in report.verdict_lines() {
-                println!(
-                    "[{}] {}",
-                    if report.outcome == Outcome::Verified {
-                        "+"
-                    } else {
-                        "!"
-                    },
-                    line
-                );
-            }
+    let report = join_handle
+        .await
+        .map_err(|e| AcquisitionError::failed(format!("the acquisition task failed: {e}")))??;
+    println!("{}", report.render_text());
+    // The verdict comes from the report (classify)
+    for line in report.verdict_lines() {
+        println!(
+            "[{}] {}",
             if report.outcome == Outcome::Verified {
-                Ok(())
+                "+"
             } else {
-                Err(format!(
-                    "{} (exit code {} once the 0.2.0 exit codes are wired up)",
-                    report.outcome.label(),
-                    report.exit_code
-                )
-                .into())
-            }
-        }
-        Err(e) => {
-            eprintln!("[!] Acquisition failed: {}", e);
-            Err(e.into())
-        }
+                "!"
+            },
+            line
+        );
     }
+    Ok(report.exit_code)
 }
 
-pub async fn handle_convert(args: ConvertArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn handle_convert(args: ConvertArgs) -> Result<i32, AcquisitionError> {
     println!("\n[*] Forensic Format Converter");
     println!("    Source: {}", args.source.display());
     println!("    Target: {:?}", args.to);
 
-    std::fs::create_dir_all(&args.output_dir)?;
+    std::fs::create_dir_all(&args.output_dir).map_err(|e| {
+        AcquisitionError::failed(format!("cannot create {}: {e}", args.output_dir.display()))
+    })?;
 
     let (prog_tx, mut prog_rx) = mpsc::channel(50);
     let abort = Arc::new(AtomicBool::new(false));
@@ -473,15 +437,18 @@ pub async fn handle_convert(args: ConvertArgs) -> Result<(), Box<dyn std::error:
     }
     println!("\n");
 
-    let out_path = join_handle.await??;
+    let out_path = join_handle
+        .await
+        .map_err(|e| AcquisitionError::failed(format!("the conversion task failed: {e}")))?
+        .map_err(AcquisitionError::failed)?;
     println!("[+] Converted file saved to: {}", out_path.display());
-    Ok(())
+    Ok(exit_code::VERIFIED)
 }
 
 /// Re-verify an image (engines::verify): computed digests, each expected
 /// digest's check and the verdict, as in 0.1; plus the addendum and the audit
 /// record the verification writes.
-pub async fn handle_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn handle_verify(args: VerifyArgs) -> Result<i32, AcquisitionError> {
     let expected = ExpectedHashes::given(args.md5.clone(), args.sha1.clone(), args.sha256.clone());
     let ewf = verify::is_ewf_image_file(&args.image);
     if ewf {
@@ -551,23 +518,18 @@ pub async fn handle_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::E
     }
 
     match &v.result {
-        VerificationResult::Matched { .. } => {
-            println!("\n[+] VERIFICATION RESULT: PASSED");
-            Ok(())
-        }
+        VerificationResult::Matched { .. } => println!("\n[+] VERIFICATION RESULT: PASSED"),
         VerificationResult::NotPossible { .. } => {
-            println!("\n[*] HASH COMPUTATION COMPLETE (No verification hashes supplied)");
-            Ok(())
+            println!("\n[*] HASH COMPUTATION COMPLETE (No verification hashes supplied)")
         }
         VerificationResult::Mismatched { .. } => {
-            println!("\n[!] VERIFICATION RESULT: FAILED (INTEGRITY ERROR)");
-            Err("Cryptographic hash mismatch".into())
+            println!("\n[!] VERIFICATION RESULT: FAILED (INTEGRITY ERROR)")
         }
         VerificationResult::Failed { reason } => {
-            println!("\n[!] VERIFICATION RESULT: FAILED ({reason})");
-            Err(format!("Verification failed: {reason}").into())
+            println!("\n[!] VERIFICATION RESULT: FAILED ({reason})")
         }
     }
+    Ok(v.exit_code)
 }
 
 pub(crate) fn truncate(s: &str, max_len: usize) -> String {

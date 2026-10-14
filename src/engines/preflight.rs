@@ -688,42 +688,6 @@ pub fn prepare_output(
     Ok(guard)
 }
 
-/// Refuse to start if any output of this acquisition already exists
-/// (0.1 interface; the session uses [`check_existing_outputs`]).
-pub fn ensure_no_existing_outputs(output_dir: &Path, base_name: &str) -> Result<(), String> {
-    check_existing_outputs(output_dir, base_name, false, None)
-        .map(|_| ())
-        .map_err(|e| e.message)
-}
-
-/// Refuse a source listed in the dfnix boot-time registry of system disks and the
-/// live medium. Outside dfnix there is no registry and nothing to check.
-/// (0.1 interface; the session checks by device number.)
-pub fn ensure_not_protected(source_path: &str) -> Result<(), String> {
-    let registry = dfcore::protected::Registry::load(&dfcore::protected::path())
-        .map_err(|e| format!("{e:#}"))?;
-    let Some(registry) = registry else {
-        return Ok(());
-    };
-    let flat = dfcore::lsblk::scan().map_err(|e| format!("{e:#}"))?;
-    let canonical = std::fs::canonicalize(source_path)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| source_path.to_string());
-    match registry.protecting(&flat, &canonical) {
-        Some(p) => Err(format!(
-            "ABORT: {} is protected by the dfnix registry ({:?} {}): {}",
-            source_path,
-            p.role,
-            p.identity
-                .serial
-                .as_deref()
-                .unwrap_or(&p.identity.kernel_name),
-            p.reasons.join("; ")
-        )),
-        None => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,7 +860,6 @@ mod tests {
         fs::write(dir.join("CASE_EA01_CF01_SER1.E01"), b"x").unwrap();
         let e = check_existing_outputs(dir, "case_ea01_cf01_SER1", false, None).unwrap_err();
         assert!(!e.message.contains("no serial number"), "{e}");
-        assert!(ensure_no_existing_outputs(dir, "case_ea01_cf01_SER1").is_err());
     }
 
     #[test]

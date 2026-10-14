@@ -6,7 +6,9 @@
 //! ends by an error, a cancellation or a panic). Refusals are recorded by their
 //! [`ErrorKind`](crate::engines::ErrorKind), never by message text.
 //!
-//! Further records: [`unmount`], [`image_verification`],
+//! A refusal before "started" (identity, source safety, destination) is one
+//! "acquisition_refused" record ([`refused`]). Further records: [`unmount`],
+//! [`image_verification`],
 //! [`conversion_started`] / [`conversion_finished`].
 //!
 //! Every function takes the log path (normally [`log_path`], which honours
@@ -19,8 +21,7 @@ use crate::engines::error::AcquisitionError;
 use crate::engines::preflight::DestinationFacts;
 use crate::engines::progress::ProgressSink;
 use crate::models::case::CaseMetadata;
-use crate::models::config::{AcquisitionConfig, EffectiveConfig, EngineKind};
-use crate::models::device::BlockDevice;
+use crate::models::config::{EffectiveConfig, EngineKind};
 use crate::models::identity::SourceIdentity;
 use crate::models::info_report::{AuditInfo, AuditStatus, ForensicInfoReport, ReportFiles};
 use crate::models::outcome::{RangeKind, VerificationResult};
@@ -39,6 +40,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod action {
     pub const ACQUISITION_STARTED: &str = "acquisition_started";
     pub const ACQUISITION_FINISHED: &str = "acquisition_finished";
+    pub const ACQUISITION_REFUSED: &str = "acquisition_refused";
     pub const UNMOUNT: &str = "unmount";
     pub const IMAGE_VERIFICATION: &str = "image_verification";
     pub const CONVERSION_STARTED: &str = "conversion_started";
@@ -369,6 +371,24 @@ impl Drop for FinishedGuard {
     }
 }
 
+/// Record a refusal before "acquisition_started" (§4 steps 2-4: identity,
+/// source safety, destination): the attempt is in the log although nothing
+/// was written to the destination and nothing was read from the source.
+/// `device` is the probed identity when the probe succeeded, else the
+/// selected device.
+pub fn refused(
+    log: &Path,
+    device: DeviceIdentity,
+    engine: EngineKind,
+    err: &AcquisitionError,
+) -> Result<String, String> {
+    let mut event = Event::new(TOOL, VERSION, action::ACQUISITION_REFUSED)
+        .device(device)
+        .outcome(err.audit_outcome(), Some(err.message.clone()));
+    event.details = error_details(engine, err);
+    append(log, event)
+}
+
 /// Record an explicit unmount of the source tree (§10): the mounts found,
 /// those unmounted, and the result.
 pub fn unmount(
@@ -465,77 +485,6 @@ pub fn conversion_finished(
         .insert("target".into(), json!(target.to_string_lossy()));
     event.details.insert("anchor".into(), json!(anchor));
     append(log, event)
-}
-
-/// 0.1 engine records, until the engines run in `engines::session`.
-#[doc(hidden)]
-pub fn legacy_started(
-    engine: &str,
-    device: &BlockDevice,
-    config: &AcquisitionConfig,
-) -> Option<String> {
-    let event = Event::new(TOOL, VERSION, action::ACQUISITION_STARTED)
-        .device(device.device_identity())
-        .detail("engine", engine)
-        .detail(
-            "output_dir",
-            config.output_dir.to_string_lossy().to_string(),
-        );
-    append(&log_path(), event).ok()
-}
-
-/// 0.1 engine records, until the engines run in `engines::session`.
-#[doc(hidden)]
-pub fn legacy_finished(
-    engine: &str,
-    device: &BlockDevice,
-    output_dir: &Path,
-    result: &Result<ForensicInfoReport, String>,
-) {
-    use sha2::{Digest, Sha256};
-    let mut event = Event::new(TOOL, VERSION, action::ACQUISITION_FINISHED)
-        .device(device.device_identity())
-        .detail("engine", engine);
-    let mut refused = false;
-    match result {
-        Ok(report) => {
-            event = event
-                .detail(
-                    "outcome",
-                    serde_json::to_value(report.outcome).unwrap_or_default(),
-                )
-                .detail("exit_code", report.exit_code)
-                .detail(
-                    "acquisition_hashes",
-                    serde_json::to_value(&report.acquisition_hashes).unwrap_or_default(),
-                )
-                .detail(
-                    "report_sha256",
-                    hex::encode(Sha256::digest(report.render_text().as_bytes())),
-                )
-                .detail(
-                    "report_json_sha256",
-                    hex::encode(Sha256::digest(report.to_json().as_bytes())),
-                );
-        }
-        Err(e) => {
-            refused = e.contains("Refusing")
-                || e.contains("Critical Safety Error")
-                || e.contains("ABORT");
-            event = event.outcome(
-                if refused {
-                    Outcome::Refused
-                } else {
-                    Outcome::Error
-                },
-                Some(e.clone()),
-            );
-        }
-    }
-    let _ = append(&log_path(), event);
-    if !refused && output_dir.is_dir() {
-        let _ = dfcore::audit::export(&log_path(), output_dir);
-    }
 }
 
 #[cfg(test)]

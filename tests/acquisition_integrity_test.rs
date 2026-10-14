@@ -2,10 +2,15 @@ mod common;
 
 use common::{audit_sandbox, case, file_device, sample, scratch};
 use dfdisk::{
-    engines,
+    engines::{
+        self,
+        session::{self, AcquisitionRequest},
+        AcquisitionError, ErrorKind,
+    },
     models::{
         self,
-        config::{AcquisitionConfig, ImageFormat},
+        config::{AcquisitionConfig, EngineKind},
+        device::BlockDevice,
         info_report::ForensicInfoReport,
         outcome::Outcome,
     },
@@ -14,13 +19,6 @@ use digest::Digest;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-
-fn channel() -> (
-    tokio::sync::mpsc::Sender<models::telemetry::ProgressTelemetry>,
-    tokio::sync::mpsc::Receiver<models::telemetry::ProgressTelemetry>,
-) {
-    tokio::sync::mpsc::channel(1000)
-}
 
 fn have_libewf() -> bool {
     std::process::Command::new("ewfacquire")
@@ -33,90 +31,77 @@ fn have_libewf() -> bool {
             .is_ok()
 }
 
+/// Run the session on this host (regular-file sources only), draining progress.
+async fn run(
+    device: BlockDevice,
+    config: AcquisitionConfig,
+) -> Result<ForensicInfoReport, AcquisitionError> {
+    audit_sandbox();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<models::telemetry::ProgressTelemetry>(1000);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let r = session::run(
+        AcquisitionRequest::new(device, case(), config),
+        tx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+    let _ = drain.await;
+    r
+}
+
+/// Engine defaults for a test destination (which may be a tmpfs).
+fn config(engine: EngineKind, out: &Path) -> AcquisitionConfig {
+    AcquisitionConfig {
+        allow_tmpfs: true,
+        ..AcquisitionConfig::for_engine(engine, out)
+    }
+}
+
 // ---------------------------------------------------------------------------
-// RAW: truthful reporting
+// RAW: truthful reporting through the session
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn raw_short_source_keeps_partial_image_and_reports_incomplete() {
-    audit_sandbox();
+async fn a_source_that_changed_size_since_it_was_selected_is_refused() {
     let tmp = scratch();
     let dir = tmp.path();
     let src = dir.join("src.bin");
     std::fs::write(&src, sample(10)).unwrap();
-    let out = dir.join("out");
-    let config = AcquisitionConfig {
-        format: ImageFormat::Raw,
-        output_dir: out.clone(),
-        wipe_bad_sectors: true,
-        ..Default::default()
-    };
-    let device = file_device(&src, 1000, Some("SHORT01"));
-    let raw = out.join(case().generate_filename("SHORT01", "raw"));
-    let info = out.join(case().generate_filename("SHORT01", "info"));
-
-    let (tx, _rx) = channel();
-    let err = engines::raw::RawAcquireEngine::run_acquisition(
-        device,
-        case(),
-        config,
-        tx,
-        Arc::new(AtomicBool::new(false)),
+    let out = dir.join("out").join("new");
+    // Selected as 1000 bytes, now 10: not the device the examiner chose
+    let err = run(
+        file_device(&src, 1000, Some("SHORT01")),
+        config(EngineKind::Raw, &out),
     )
     .await
     .unwrap_err();
-    assert!(err.contains("Acquisition incomplete"), "{err}");
-    assert!(err.contains("10 of 1000 bytes"), "{err}");
-
-    assert_eq!(
-        std::fs::read(&raw).unwrap(),
-        sample(10),
-        "partial image must be kept"
+    assert_eq!(err.kind, ErrorKind::Refused);
+    assert_eq!(err.exit_code(), 3);
+    assert!(
+        err.message.contains("size 10 bytes, was 1000 bytes"),
+        "{err}"
     );
-    let text =
-        std::fs::read_to_string(&info).expect("report must be written for partial acquisitions");
-    assert!(text.contains("INCOMPLETE"), "{text}");
-    assert!(text.contains("10 of 1000 bytes"), "{text}");
-    assert!(!text.contains("Zero-fill"), "{text}");
-    assert!(text.contains(engines::raw::RAW_ERROR_HANDLING), "{text}");
-    assert!(!text.contains("VERIFIED - ALL HASHES MATCH"), "{text}");
-    // The JSON twin carries the same verdict and facts
-    let json = std::fs::read_to_string(info.with_extension("info.json")).unwrap();
-    let report = ForensicInfoReport::from_json(&json).unwrap();
-    assert_eq!(report.outcome, Outcome::Incomplete);
-    assert_eq!(report.exit_code, 6);
-    assert_eq!(report.bytes_acquired, 10);
-    assert_eq!(report.expected_bytes, 1000);
-    assert!(report.stop_reason.unwrap().contains("after 10 bytes"));
+    assert!(!out.exists(), "nothing may be written");
 }
 
 #[tokio::test]
 async fn raw_complete_report_states_real_error_handling() {
-    audit_sandbox();
     let tmp = scratch();
     let dir = tmp.path();
     let data = sample(64 * 1024);
     let src = dir.join("src.bin");
     std::fs::write(&src, &data).unwrap();
     let config = AcquisitionConfig {
-        format: ImageFormat::Raw,
-        output_dir: dir.join("out"),
         calc_sha1: false,
-        ..Default::default()
+        ..config(EngineKind::Raw, &dir.join("out"))
     };
-    let (tx, _rx) = channel();
-    let report = engines::raw::RawAcquireEngine::run_acquisition(
-        file_device(&src, data.len() as u64, Some("FULL01")),
-        case(),
-        config,
-        tx,
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .unwrap();
+    let report = run(file_device(&src, data.len() as u64, Some("FULL01")), config)
+        .await
+        .unwrap();
 
     // Disabling SHA-1 must not turn into a mismatch
     assert_eq!(report.outcome, Outcome::Verified);
+    assert_eq!(report.exit_code, 0);
     assert!(report.acquisition_hashes.sha1.is_none());
     assert_eq!(
         report.acquisition_hashes.sha256,
@@ -124,7 +109,16 @@ async fn raw_complete_report_states_real_error_handling() {
     );
     let text = report.render_text();
     assert!(!text.contains("Zero-fill"), "{text}");
+    assert!(text.contains(engines::raw::RAW_ERROR_HANDLING), "{text}");
     assert!(report.stop_reason.is_none());
+    // A regular file: probed, not write-protected, no capacity/SMART probes
+    assert_eq!(
+        report.source.kind,
+        dfdisk::models::identity::SourceKind::RegularFile
+    );
+    assert!(!report.write_protection.as_ref().unwrap().set_by_dfdisk);
+    assert!(report.smart_before.is_none());
+    assert_eq!(report.identity_check.end_ok, Some(true));
 }
 
 // ---------------------------------------------------------------------------
@@ -133,7 +127,6 @@ async fn raw_complete_report_states_real_error_handling() {
 
 #[tokio::test]
 async fn ewf_refuses_existing_segment_before_running_ewfacquire() {
-    audit_sandbox();
     let tmp = scratch();
     let dir = tmp.path();
     let src = dir.join("src.bin");
@@ -143,23 +136,12 @@ async fn ewf_refuses_existing_segment_before_running_ewfacquire() {
     let existing = out.join(format!("{}.E01", base));
     std::fs::write(&existing, b"earlier acquisition of another drive").unwrap();
 
-    let config = AcquisitionConfig {
-        output_dir: out.clone(),
-        ..Default::default()
-    };
-    let (tx, _rx) = channel();
-    let err = engines::ewf::EwfAcquireEngine::run_acquisition(
-        file_device(&src, 4096, None),
-        case(),
-        config,
-        tx,
-        Arc::new(AtomicBool::new(false)),
-    )
-    .await
-    .unwrap_err();
-
-    assert!(err.contains("already exists"), "{err}");
-    assert!(err.contains("no serial number"), "{err}");
+    let err = run(file_device(&src, 4096, None), config(EngineKind::Ewf, &out))
+        .await
+        .unwrap_err();
+    assert!(err.is_refusal());
+    assert!(err.message.contains("already exists"), "{err}");
+    assert!(err.message.contains("no serial number"), "{err}");
     assert_eq!(
         std::fs::read(&existing).unwrap(),
         b"earlier acquisition of another drive"
@@ -175,34 +157,26 @@ async fn run_ewf(
         eprintln!("skipping: ewfacquire/ewfverify not installed");
         return None;
     }
-    audit_sandbox();
     let tmp = scratch();
     let dir = tmp.path();
     let data = sample(2 * 1024 * 1024);
     let src = dir.join("src.bin");
     std::fs::write(&src, &data).unwrap();
     let config = AcquisitionConfig {
-        output_dir: dir.join("out"),
         calc_sha1,
         calc_sha256,
-        ..Default::default()
+        ..config(EngineKind::Ewf, &dir.join("out"))
     };
-    let (tx, mut rx) = channel();
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let report = engines::ewf::EwfAcquireEngine::run_acquisition(
+    let report = run(
         file_device(
             &src,
             data.len() as u64,
             Some(&format!("EWF{}", tag.to_uppercase())),
         ),
-        case(),
         config,
-        tx,
-        Arc::new(AtomicBool::new(false)),
     )
     .await
     .unwrap();
-    let _ = drain.await;
     Some((data, report))
 }
 
@@ -211,7 +185,12 @@ async fn ewf_all_digests_in_one_pass_verify() {
     let Some((data, report)) = run_ewf("all", true, true).await else {
         return;
     };
-    assert_eq!(report.outcome, Outcome::Verified);
+    assert_eq!(
+        report.outcome,
+        Outcome::Verified,
+        "{}",
+        report.outcome_reason
+    );
     assert_eq!(
         report.acquisition_hashes.md5,
         Some(hex::encode(md5::Md5::digest(&data)))

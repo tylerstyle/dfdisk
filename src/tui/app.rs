@@ -1,8 +1,9 @@
 use crate::discovery::{DeviceScanner, SafetyChecker};
-use crate::engines::{EwfAcquireEngine, FormatConverter, RawAcquireEngine, RescueAcquireEngine};
+use crate::engines::session::{self, AcquisitionRequest};
+use crate::engines::{AcquisitionError, ErrorKind, FormatConverter};
 use crate::models::{
     case::CaseMetadata,
-    config::{AcquisitionConfig, CompressionLevel, ImageFormat, SplitSize},
+    config::{AcquisitionConfig, CompressionLevel, EngineKind, ImageFormat, SplitSize},
     device::BlockDevice,
     info_report::ForensicInfoReport,
     telemetry::{AcquisitionStatus, ProgressTelemetry},
@@ -104,7 +105,7 @@ pub struct App {
 
     // Background workers
     pub progress_rx: Option<mpsc::Receiver<ProgressTelemetry>>,
-    pub report_rx: Option<mpsc::Receiver<Result<ForensicInfoReport, String>>>,
+    pub report_rx: Option<mpsc::Receiver<Result<ForensicInfoReport, AcquisitionError>>>,
     pub abort_flag: Arc<AtomicBool>,
 
     // Converter Screen State
@@ -505,12 +506,14 @@ impl App {
             None => return,
         };
 
+        // The session creates the directory once every check passed (P5)
         self.config.output_dir = crate::tui::autocomplete::expand_tilde(std::path::Path::new(
             self.target_dir_str.trim(),
         ));
-        if let Err(e) = std::fs::create_dir_all(&self.config.output_dir) {
-            self.set_notification(format!("Cannot create target dir: {}", e), true);
-            return;
+        let mut config = self.config.clone();
+        if config.engine() != EngineKind::Ewf {
+            // RAW and rescue images are one file (strict validation)
+            config.split_size = SplitSize::None;
         }
 
         self.clear_notification();
@@ -529,45 +532,9 @@ impl App {
             ..Default::default()
         };
 
-        let dev_clone = device.clone();
-        let case_clone = self.case_metadata.clone();
-        let cfg_clone = self.config.clone();
-
+        let request = AcquisitionRequest::new(device, self.case_metadata.clone(), config);
         tokio::spawn(async move {
-            let res = if cfg_clone.rescue_mode {
-                RescueAcquireEngine::run_rescue(
-                    dev_clone,
-                    case_clone,
-                    cfg_clone,
-                    prog_tx,
-                    abort_flag_clone,
-                )
-                .await
-            } else {
-                match cfg_clone.format {
-                    ImageFormat::E01 => {
-                        EwfAcquireEngine::run_acquisition(
-                            dev_clone,
-                            case_clone,
-                            cfg_clone,
-                            prog_tx,
-                            abort_flag_clone,
-                        )
-                        .await
-                    }
-                    ImageFormat::Raw => {
-                        RawAcquireEngine::run_acquisition(
-                            dev_clone,
-                            case_clone,
-                            cfg_clone,
-                            prog_tx,
-                            abort_flag_clone,
-                        )
-                        .await
-                    }
-                }
-            };
-
+            let res = session::run(request, prog_tx, abort_flag_clone).await;
             let _ = rep_tx.send(res).await;
         });
 
@@ -926,7 +893,13 @@ impl App {
                         self.current_screen = Screen::ReportSummary;
                     }
                     Err(e) => {
-                        self.set_notification(format!("Acquisition failed: {}", e), true);
+                        let what = match e.kind {
+                            ErrorKind::Refused => "Acquisition refused",
+                            ErrorKind::Usage => "Acquisition not started",
+                            ErrorKind::Aborted => "Acquisition aborted",
+                            ErrorKind::Failed => "Acquisition failed",
+                        };
+                        self.set_notification(format!("{what}: {e}"), true);
                         self.current_screen = Screen::DeviceExplorer;
                     }
                 }

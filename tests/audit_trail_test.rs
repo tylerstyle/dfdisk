@@ -1,10 +1,10 @@
 //! Acquisitions leave a verifiable trail in the dfnix audit log, and the report
 //! and the log point at each other. Own test binary: it sets DFNIX_AUDIT_LOG.
 
-use dfdisk::engines;
+use dfdisk::engines::session::{self, AcquisitionRequest};
 use dfdisk::models::{
     case::CaseMetadata,
-    config::{AcquisitionConfig, ImageFormat},
+    config::AcquisitionConfig,
     device::{BlockDevice, DeviceSafety},
 };
 use sha2::{Digest, Sha256};
@@ -51,35 +51,33 @@ async fn acquisition_report_and_audit_log_anchor_each_other() {
     let src = dir.join("src.bin");
     std::fs::write(&src, vec![7u8; 8192]).unwrap();
     let config = AcquisitionConfig {
-        format: ImageFormat::Raw,
-        output_dir: dir.join("out"),
-        ..Default::default()
+        allow_tmpfs: true,
+        ..AcquisitionConfig::raw(dir.join("out"))
     };
     let (tx, _rx) = tokio::sync::mpsc::channel(1000);
-    let report = engines::raw::RawAcquireEngine::run_acquisition(
-        device(&src, 8192),
-        case(),
-        config.clone(),
+    let report = session::run(
+        AcquisitionRequest::new(device(&src, 8192), case(), config.clone()),
         tx,
         Arc::new(AtomicBool::new(false)),
     )
     .await
     .unwrap();
 
-    // Second run collides with the first: refused, and recorded as such
+    // Second run collides with the first: refused before anything is written,
+    // and recorded as a refusal (typed, not by message text)
     let (tx, _rx) = tokio::sync::mpsc::channel(1000);
-    let refused = engines::raw::RawAcquireEngine::run_acquisition(
-        device(&src, 8192),
-        case(),
-        config,
+    let refused = session::run(
+        AcquisitionRequest::new(device(&src, 8192), case(), config),
         tx,
         Arc::new(AtomicBool::new(false)),
     )
-    .await;
-    assert!(refused.is_err());
+    .await
+    .unwrap_err();
+    assert!(refused.is_refusal());
+    assert_eq!(refused.exit_code(), 3);
 
     let state = dfcore::audit::verify(&log).unwrap();
-    assert_eq!(state.records, 4);
+    assert_eq!(state.records, 3);
     let records: Vec<serde_json::Value> = std::fs::read_to_string(&log)
         .unwrap()
         .lines()
@@ -99,15 +97,18 @@ async fn acquisition_report_and_audit_log_anchor_each_other() {
         [
             ("acquisition_started", "ok"),
             ("acquisition_finished", "ok"),
-            ("acquisition_started", "ok"),
-            ("acquisition_finished", "refused"),
+            ("acquisition_refused", "refused"),
         ]
     );
+    assert_eq!(records[2]["details"]["error_kind"], "refused");
 
     // The report names the record its acquisition started with ...
     let anchor = report.audit.anchor.clone().unwrap();
     assert_eq!(records[0]["hash"], anchor);
-    assert_eq!(records[0]["device"]["serial"], "AUDIT01");
+    // The record names the probed source: a regular file has no serial
+    assert_eq!(records[0]["device"]["path"], src.to_string_lossy().as_ref());
+    assert!(records[0]["device"]["serial"].is_null());
+    assert_eq!(records[0]["details"]["source"]["kind"], "regular file");
     // ... and the finished record holds the report's own digest
     let info = std::fs::read(
         dir.join("out")
@@ -136,7 +137,8 @@ async fn acquisition_report_and_audit_log_anchor_each_other() {
     );
 
     // The case directory carries a verifiable copy of the log as of the successful
-    // acquisition (audit-<boot_id>.jsonl); the refused second run wrote nothing there
+    // acquisition (audit-<boot_id>.jsonl), named in the report; the refused
+    // second run wrote nothing there
     let exported: Vec<_> = std::fs::read_dir(dir.join("out"))
         .unwrap()
         .flatten()
@@ -148,6 +150,10 @@ async fn acquisition_report_and_audit_log_anchor_each_other() {
         .collect();
     assert_eq!(exported.len(), 1, "{exported:?}");
     let copy = &exported[0];
+    assert_eq!(
+        report.audit.export_file.as_deref(),
+        Some(copy.to_string_lossy().as_ref())
+    );
     let copied = dfcore::audit::verify(copy).unwrap();
     assert_eq!(copied.records, 2);
     assert_eq!(copied.head, records[1]["hash"].as_str().unwrap());

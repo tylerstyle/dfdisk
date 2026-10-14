@@ -295,8 +295,8 @@ fn test_verify_subcommand_exit_codes() {
         .expect("Failed to run verify with mismatched MD5");
     assert_eq!(
         verify_md5_mismatch.status.code(),
-        Some(1),
-        "Expected exit code 1 on mismatched hash"
+        Some(5),
+        "Expected exit code 5 (mismatch) on mismatched hash"
     );
     let stdout_mismatch = String::from_utf8_lossy(&verify_md5_mismatch.stdout);
     assert!(stdout_mismatch.contains("MISMATCH"));
@@ -326,7 +326,7 @@ fn test_verify_subcommand_exit_codes() {
         ])
         .output()
         .expect("Failed to run verify with mismatched SHA256");
-    assert_eq!(verify_sha256_mismatch.status.code(), Some(1));
+    assert_eq!(verify_sha256_mismatch.status.code(), Some(5));
 
     // Cleanup
     let _ = std::fs::remove_file(test_file);
@@ -434,12 +434,15 @@ fn test_acquire_rejects_nonexistent() {
         .output()
         .expect("Failed to execute dfdisk acquire");
 
-    assert!(
-        !output.status.success(),
-        "Must exit non-zero for non-existent target"
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a non-existent target is a usage error"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Target device or file not found") || stderr.contains("not found"));
+    // Printed once
+    assert_eq!(stderr.matches("not found").count(), 1, "{stderr}");
 }
 
 #[test]
@@ -451,10 +454,100 @@ fn test_acquire_rejects_directory() {
         .output()
         .expect("Failed to execute dfdisk acquire");
 
-    assert!(
-        !output.status.success(),
-        "Must exit non-zero when target is a directory"
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "Must exit 2 when target is a directory"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Critical Safety Error") || stderr.contains("neither a regular file"));
+}
+
+/// PATH with mock lsblk/udevadm/smartctl: the device scan touches no host disk.
+fn mock_tools() -> (tempfile::TempDir, String) {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    for (tool, script) in [
+        ("lsblk", "#!/bin/sh\necho '{\"blockdevices\": []}'\n"),
+        ("udevadm", "#!/bin/sh\nexit 1\n"),
+        ("smartctl", "#!/bin/sh\necho '{}'\nexit 2\n"),
+    ] {
+        let p = tmp.path().join(tool);
+        std::fs::write(&p, script).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        tmp.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (tmp, path)
+}
+
+#[test]
+fn test_acquire_exit_codes_follow_the_outcome() {
+    let (_tools, path) = mock_tools();
+    let tmp = tempfile::Builder::new()
+        .prefix("dfdisk-cli-acq-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let out = tmp.path().join("out");
+    // Only where the destination is a real filesystem (the CLI has no --allow-tmpfs yet)
+    let facts = dfdisk::engines::preflight::probe_destination(
+        &out,
+        &std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default(),
+    )
+    .unwrap();
+    if facts
+        .fs_type
+        .as_deref()
+        .is_some_and(dfdisk::engines::preflight::is_memory_fs)
+    {
+        eprintln!("skipping: the test directory is on a memory filesystem");
+        return;
+    }
+    let src = tmp.path().join("evidence.bin");
+    std::fs::write(&src, vec![0x5au8; 256 * 1024]).unwrap();
+    let acquire = || {
+        dfdisk()
+            .env("PATH", &path)
+            .args([
+                "acquire",
+                &src.to_string_lossy(),
+                "--format",
+                "raw",
+                "--case",
+                "CLI-1",
+                "--evidence",
+                "E1",
+                "--examiner",
+                "Tester",
+                "-o",
+                &out.to_string_lossy(),
+            ])
+            .output()
+            .unwrap()
+    };
+    // Verified: exit 0, reports written
+    let first = acquire();
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "{}\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(stdout.contains("VERIFIED (exit code 0)"), "{stdout}");
+    let infos = std::fs::read_dir(&out)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".info.json"))
+        .count();
+    assert_eq!(infos, 1);
+    // The same acquisition again: refused, exit 3, nothing overwritten
+    let second = acquire();
+    assert_eq!(second.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("already exists"), "{stderr}");
 }

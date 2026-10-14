@@ -1,13 +1,19 @@
+//! Native RAW engine (§13 RAW): copies the source through a dup of the
+//! session's held descriptor into `<base>.raw`, hashing every byte once, and
+//! re-hashes the image for verification. [`hash_source`] is the second
+//! source read (`--verify-source`) of every engine.
+//!
+//! RAW AGENT: this is the 0.1 copy loop adapted to the session interface;
+//! O_DIRECT/aligned reads, `--on-read-error zero-fill`, piecewise hashes,
+//! source-lost and ENOSPC handling (§13) are still to do.
+
+use crate::engines::error::AcquisitionError;
 use crate::engines::hasher::{HashProgress, MultiHasher};
-use crate::engines::{legacy, preflight};
+use crate::engines::session::{EngineContext, EngineOutput};
 use crate::models::{
-    case::CaseMetadata,
-    config::{AcquisitionConfig, EngineKind},
-    device::BlockDevice,
-    info_report::{
-        compare_digests, ForensicInfoReport, HashResults, HashSelection, VerificationInfo,
-    },
-    outcome::{Outcome, RangeKind},
+    config::{EngineSettings, OnReadError, RawSettings},
+    info_report::{compare_digests, HashResults, HashSelection},
+    outcome::{RangeKind, ReadErrorTable, VerificationResult},
     telemetry::{AcquisitionStatus, ProgressTelemetry},
 };
 use digest::Digest;
@@ -15,9 +21,8 @@ use md5::Md5;
 use sha1::Sha1;
 use sha2::Sha256;
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -177,330 +182,275 @@ pub fn incompleteness(outcome: &CopyOutcome, expected_bytes: u64) -> Option<Inco
     })
 }
 
-pub struct RawAcquireEngine;
+/// How the 0.1 copy loop ended.
+enum Copy {
+    Done(CopyOutcome),
+    /// Stopped by the abort flag after this many bytes were written
+    Aborted(u64),
+}
 
-impl RawAcquireEngine {
-    pub async fn run_acquisition(
-        device: BlockDevice,
-        case: CaseMetadata,
-        config: AcquisitionConfig,
-        progress_tx: mpsc::Sender<ProgressTelemetry>,
-        abort_flag: Arc<AtomicBool>,
-    ) -> Result<ForensicInfoReport, String> {
-        let output_dir = config.output_dir.clone();
-        let audit_anchor = crate::engines::audit::legacy_started("raw", &device, &config);
-        let result = Self::acquire(
-            device.clone(),
-            case,
-            config,
-            progress_tx,
-            abort_flag,
-            audit_anchor,
-        )
-        .await;
-        crate::engines::audit::legacy_finished("raw", &device, &output_dir, &result);
-        result
+/// Acquire the source into `<base>.raw` (step 8).
+pub async fn acquire(ctx: &EngineContext) -> Result<EngineOutput, AcquisitionError> {
+    if ctx.config().on_read_error == OnReadError::ZeroFill {
+        return Err(AcquisitionError::usage(
+            "--on-read-error zero-fill is not available in this build of the RAW engine",
+        ));
     }
+    let raw_path = ctx.output_path(".raw");
+    let mut src = ctx.dup_source().map_err(|e| {
+        AcquisitionError::failed(format!("cannot read the source {}: {e}", ctx.identity.path))
+    })?;
+    let selection = ctx.selection;
+    let expected = ctx.expected_bytes();
+    let sector_size = ctx.sector_size() as usize;
+    let abort = ctx.abort.clone();
+    let sink = ctx.progress.clone();
+    let segment_name = format!("{}.raw", ctx.base_name);
+    let mut telemetry = ProgressTelemetry {
+        status: AcquisitionStatus::Acquiring,
+        total_bytes: expected,
+        current_segment: segment_name.clone(),
+        ..Default::default()
+    };
+    telemetry.push_log(format!("Native RAW acquisition to {segment_name}"));
+    sink.send(telemetry.take_update());
 
-    async fn acquire(
-        device: BlockDevice,
-        case: CaseMetadata,
-        config: AcquisitionConfig,
-        progress_tx: mpsc::Sender<ProgressTelemetry>,
-        abort_flag: Arc<AtomicBool>,
-        audit_anchor: Option<String>,
-    ) -> Result<ForensicInfoReport, String> {
-        let run = legacy::RunClock::start();
-        let selection = HashSelection::from_config(&config);
-
-        let base_name = case.base_filename_checked(&device.display_serial())?;
-        let raw_filename = format!("{}.raw", base_name);
-
-        std::fs::create_dir_all(&config.output_dir)
-            .map_err(|e| format!("Failed to create output directory: {}", e))?;
-        let raw_path = config.output_dir.join(&raw_filename);
-
-        preflight::ensure_no_existing_outputs(&config.output_dir, &base_name)?;
-        preflight::ensure_not_protected(&device.path)?;
-        preflight::ensure_destination_not_on_source(&device.path, &config.output_dir)
-            .map_err(|e| e.message)?;
-
-        let mut telemetry = ProgressTelemetry {
-            status: AcquisitionStatus::Acquiring,
-            total_bytes: device.size_bytes,
-            current_segment: raw_filename.clone(),
-            status_message: format!(
-                "Starting native RAW streaming acquisition to {}...",
-                raw_filename
-            ),
-            ..Default::default()
-        };
-        let _ = progress_tx.send(telemetry.take_update()).await;
-
-        // Perform streaming block copy on a blocking task
-        let src_path = device.path.clone();
-        let target_raw_path = raw_path.clone();
-        let total_device_bytes = device.size_bytes;
-        let sector_size = device.logical_sector_size as usize;
-
-        let (copy_prog_tx, mut copy_prog_rx) = mpsc::channel::<ProgressTelemetry>(100);
-        let copy_abort = abort_flag.clone();
-
-        let copy_task = tokio::task::spawn_blocking(move || -> Result<CopyOutcome, String> {
-            let mut src_file = File::open(&src_path)
-                .map_err(|e| format!("Failed to open source device {}: {}", src_path, e))?;
-
-            let mut dest_file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target_raw_path)
-                .map_err(|e| {
-                    format!(
-                        "Failed to exclusively create RAW destination file {}: {}",
-                        target_raw_path.display(),
-                        e
-                    )
-                })?;
-
-            let segment_name = target_raw_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let start_t = Instant::now();
-            let mut last_report = Instant::now();
-            let mut last_speed_calc = Instant::now();
-            let mut last_read_bytes = 0u64;
-
-            let outcome = copy_and_hash(
-                &mut src_file,
-                &mut dest_file,
-                sector_size,
-                selection,
-                &copy_abort,
-                |bytes_processed| {
-                    if last_report.elapsed() < Duration::from_millis(100) {
-                        return;
-                    }
-                    let total = total_device_bytes.max(1);
-                    let pct = ((bytes_processed as f64 / total as f64) * 100.0).min(100.0);
-
-                    let dt = last_speed_calc.elapsed().as_secs_f64();
-                    let speed = if dt >= 0.1 {
-                        let diff = bytes_processed.saturating_sub(last_read_bytes);
-                        last_read_bytes = bytes_processed;
-                        last_speed_calc = Instant::now();
-                        diff as f64 / dt
-                    } else {
-                        0.0
-                    };
-
-                    let elapsed = start_t.elapsed().as_secs_f64();
-                    let avg_speed = if elapsed > 0.0 {
-                        bytes_processed as f64 / elapsed
-                    } else {
-                        0.0
-                    };
-                    let eta = if avg_speed > 0.0 && total_device_bytes > bytes_processed {
-                        Some(((total_device_bytes - bytes_processed) as f64 / avg_speed) as u64)
-                    } else {
-                        None
-                    };
-
-                    let _ = copy_prog_tx.blocking_send(ProgressTelemetry {
-                        status: AcquisitionStatus::Acquiring,
-                        bytes_processed,
-                        total_bytes: total_device_bytes,
-                        speed_bps: speed,
-                        avg_speed_bps: avg_speed,
-                        percentage: pct,
-                        elapsed_secs: elapsed as u64,
-                        eta_secs: eta,
-                        current_segment: segment_name.clone(),
-                        status_message: format!("Streaming RAW bytes... {:.1}%", pct),
-                        bad_sectors: 0,
-                        compression_ratio: None,
-                        log_messages: vec![],
-                        ..Default::default()
-                    });
-                    last_report = Instant::now();
-                },
-            );
-
-            let outcome = match outcome {
-                Ok(o) => o,
-                Err(e) => {
-                    if copy_abort.load(Ordering::Relaxed) {
-                        let _ = std::fs::remove_file(&target_raw_path);
-                    }
-                    return Err(e);
-                }
-            };
-
-            // Partial images are kept: they are evidence of what could be read
-            dest_file
-                .flush()
-                .map_err(|e| format!("Failed to flush RAW file: {}", e))?;
-            dest_file
-                .sync_all()
-                .map_err(|e| format!("Failed to sync RAW file to disk: {}", e))?;
-
-            Ok(outcome)
-        });
-
-        // Forward progress events during copying
-        while let Some(prog) = copy_prog_rx.recv().await {
-            telemetry = prog;
-            let _ = progress_tx.send(telemetry.take_update()).await;
-        }
-
-        let outcome = match copy_task.await {
-            Ok(Ok(res)) => res,
-            Ok(Err(e)) => {
-                telemetry.status = AcquisitionStatus::Failed(e.clone());
-                let _ = progress_tx.send(telemetry).await;
-                return Err(e);
-            }
-            Err(e) => {
-                let msg = format!("RAW copying task panicked: {}", e);
-                telemetry.status = AcquisitionStatus::Failed(msg.clone());
-                let _ = progress_tx.send(telemetry).await;
-                return Err(msg);
-            }
-        };
-        let bytes_copied = outcome.bytes_copied;
-        let incomplete = incompleteness(&outcome, total_device_bytes);
-        if let Some(inc) = &incomplete {
-            telemetry.push_log(format!("Acquisition stopped early: {}", inc.reason));
-        }
-
-        // Post-acquisition readback verification (of the partial image as well)
-        telemetry.status = AcquisitionStatus::Verifying;
-        telemetry.percentage = 0.0;
-        telemetry.status_message =
-            "Verifying written RAW image cryptographic hashes...".to_string();
-        telemetry.push_log("Beginning post-acquisition destination verification pass...");
-        let _ = progress_tx.send(telemetry.take_update()).await;
-
-        let (v_tx, mut v_rx) = mpsc::channel::<HashProgress>(50);
-        let raw_path_clone = raw_path.clone();
-        let verif_abort = abort_flag.clone();
-
-        let verif_handle = tokio::spawn(async move {
-            MultiHasher::hash_stream_with_capacity(
-                &raw_path_clone,
-                selection.md5,
-                selection.sha1,
-                selection.sha256,
-                Some(bytes_copied),
-                Some(v_tx),
-                Some(verif_abort),
-            )
-            .await
-        });
-
-        while let Some(hp) = v_rx.recv().await {
-            if abort_flag.load(Ordering::Relaxed) {
-                telemetry.status = AcquisitionStatus::Aborted;
-                let _ = progress_tx.send(telemetry).await;
-                return Err("RAW verification aborted by user.".to_string());
-            }
-            telemetry.percentage = hp.percentage;
-            telemetry.speed_bps = hp.speed_bps;
-            telemetry.status_message = format!("Verifying RAW image: {:.1}%", hp.percentage);
-            let _ = progress_tx.send(telemetry.take_update()).await;
-        }
-
-        let destination_hashes = match verif_handle.await {
-            Ok(Ok(res)) => res,
-            Ok(Err(e)) => {
-                telemetry.status = AcquisitionStatus::Failed(e.clone());
-                let _ = progress_tx.send(telemetry).await;
-                return Err(e);
-            }
-            Err(e) => {
-                let msg = format!("Verification task error: {}", e);
-                telemetry.status = AcquisitionStatus::Failed(msg.clone());
-                let _ = progress_tx.send(telemetry).await;
-                return Err(msg);
-            }
-        };
-
-        let method = "image re-read by dfdisk".to_string();
-        let result = compare_digests(
+    let target = raw_path.clone();
+    let copy = tokio::task::spawn_blocking(move || -> Result<Copy, AcquisitionError> {
+        src.seek(SeekFrom::Start(0))?;
+        let mut dest = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|e| {
+                AcquisitionError::failed(format!(
+                    "cannot create the RAW image {}: {e}",
+                    target.display()
+                ))
+            })?;
+        let start_t = Instant::now();
+        let mut last_report = Instant::now();
+        let mut last_speed_calc = Instant::now();
+        let mut last_read_bytes = 0u64;
+        let outcome = copy_and_hash(
+            &mut src,
+            &mut dest,
+            sector_size,
             selection,
-            &outcome.source_hashes,
-            &destination_hashes,
-            &method,
+            &abort,
+            |bytes_processed| {
+                if last_report.elapsed() < Duration::from_millis(100) {
+                    return;
+                }
+                let total = expected.max(1);
+                let pct = ((bytes_processed as f64 / total as f64) * 100.0).min(100.0);
+                let dt = last_speed_calc.elapsed().as_secs_f64();
+                let speed = if dt >= 0.1 {
+                    let diff = bytes_processed.saturating_sub(last_read_bytes);
+                    last_read_bytes = bytes_processed;
+                    last_speed_calc = Instant::now();
+                    diff as f64 / dt
+                } else {
+                    0.0
+                };
+                let elapsed = start_t.elapsed().as_secs_f64();
+                let avg_speed = if elapsed > 0.0 {
+                    bytes_processed as f64 / elapsed
+                } else {
+                    0.0
+                };
+                sink.send(ProgressTelemetry {
+                    status: AcquisitionStatus::Acquiring,
+                    bytes_processed,
+                    total_bytes: expected,
+                    speed_bps: speed,
+                    avg_speed_bps: avg_speed,
+                    percentage: pct,
+                    elapsed_secs: elapsed as u64,
+                    eta_secs: (avg_speed > 0.0 && expected > bytes_processed)
+                        .then(|| ((expected - bytes_processed) as f64 / avg_speed) as u64),
+                    current_segment: segment_name.clone(),
+                    status_message: format!("Streaming RAW bytes... {:.1}%", pct),
+                    ..Default::default()
+                });
+                last_report = Instant::now();
+            },
         );
-
-        let mut report = legacy::new_report(
-            EngineKind::Raw,
-            &device,
-            &case,
-            &config,
-            &base_name,
-            &run,
-            &audit_anchor,
-        );
-        report.bytes_acquired = bytes_copied;
-        report.read_errors.source = "raw engine".into();
-        if let Some(inc) = &incomplete {
-            report.stop_reason = Some(inc.reason.clone());
-            if outcome.read_error.is_some() && total_device_bytes > bytes_copied {
-                // Everything from the unreadable sector to the end was not read
-                report.read_errors.push(
-                    bytes_copied,
-                    total_device_bytes - bytes_copied,
-                    RangeKind::Unread,
-                );
+        // Partial images are kept: they are evidence of what could be read
+        let flushed = dest.flush().and_then(|_| dest.sync_all());
+        match outcome {
+            Ok(o) => {
+                flushed.map_err(|e| {
+                    AcquisitionError::failed(format!("cannot sync the RAW image: {e}"))
+                })?;
+                Ok(Copy::Done(o))
             }
+            Err(_) if abort.load(Ordering::SeqCst) => {
+                Ok(Copy::Aborted(dest.metadata().map(|m| m.len()).unwrap_or(0)))
+            }
+            Err(e) => Err(AcquisitionError::failed(e)),
         }
-        report.notes.push(RAW_ERROR_HANDLING.to_string());
-        report.acquisition_hashes = outcome.source_hashes.clone();
-        report.image_hashes = destination_hashes;
-        report.verification = VerificationInfo {
-            result,
-            method,
-            source_reread: None,
-        };
-        report.image_files = vec![raw_path.to_string_lossy().to_string()];
-        legacy::finish_report(&mut report, &run, bytes_copied);
-        let files = legacy::write_reports(&report, &config.output_dir, &base_name)?;
-        let info_path = files.text;
-        let verification_passed = report.outcome == Outcome::Verified;
-        debug_assert!(
-            incomplete.is_none() || report.outcome == Outcome::Incomplete,
-            "a short copy is never classified as complete"
-        );
+    })
+    .await
+    .map_err(|e| AcquisitionError::failed(format!("the RAW copy task failed: {e}")))??;
 
-        if let Some(inc) = incomplete {
-            let msg = format!(
-                "Acquisition incomplete: acquired {} of {} bytes ({}). Partial image {} and report {} were kept.",
-                inc.bytes_acquired,
-                inc.expected_bytes,
-                inc.reason,
-                raw_path.display(),
-                info_path.display()
-            );
-            telemetry.status = AcquisitionStatus::Failed(msg.clone());
-            telemetry.bytes_processed = bytes_copied;
-            let _ = progress_tx.send(telemetry).await;
-            return Err(msg);
+    let mut out = EngineOutput {
+        expected_bytes: expected,
+        read_errors: ReadErrorTable::new(ctx.sector_size(), "raw engine"),
+        image_files: vec![raw_path],
+        notes: vec![RAW_ERROR_HANDLING.to_string()],
+        // What this engine applies: it stops at the first error, no pieces yet
+        settings: Some(EngineSettings::Raw(RawSettings {
+            on_read_error: OnReadError::Stop,
+            piece_size: None,
+            source_io: Some("buffered reads through the held source descriptor".into()),
+        })),
+        ..Default::default()
+    };
+    match copy {
+        Copy::Aborted(bytes) => {
+            out.aborted = true;
+            out.bytes_acquired = bytes;
+            out.notes.push(format!(
+                "aborted by the examiner after {bytes} bytes; the partial image is kept"
+            ));
         }
-
-        telemetry.status = AcquisitionStatus::Completed;
-        telemetry.percentage = 100.0;
-        telemetry.bytes_processed = bytes_copied;
-        telemetry.status_message = if verification_passed {
-            "RAW acquisition and verification successfully completed.".to_string()
-        } else {
-            "RAW acquisition completed with verification failure.".to_string()
-        };
-        let _ = progress_tx.send(telemetry).await;
-
-        Ok(report)
+        Copy::Done(o) => {
+            if let Some(inc) = incompleteness(&o, expected) {
+                if o.read_error.is_some() && expected > o.bytes_copied {
+                    // Everything from the unreadable sector to the end was not read
+                    out.read_errors.push(
+                        o.bytes_copied,
+                        expected - o.bytes_copied,
+                        RangeKind::Unread,
+                    );
+                }
+                out.stop_reason = Some(inc.reason);
+            }
+            out.bytes_acquired = o.bytes_copied;
+            out.acquisition_hashes = o.source_hashes;
+        }
     }
+    Ok(out)
+}
+
+/// Re-hash the written image (step 11, after the session's flush and cache
+/// eviction) and compare with the acquisition stream.
+pub async fn verify(ctx: &EngineContext, out: &EngineOutput) -> (VerificationResult, HashResults) {
+    let Some(image) = out.image_files.first().cloned() else {
+        return (
+            VerificationResult::Failed {
+                reason: "the RAW engine produced no image file".into(),
+            },
+            HashResults::default(),
+        );
+    };
+    let selection = ctx.selection;
+    let abort = ctx.abort.clone();
+    let bytes = out.bytes_acquired;
+    let (tx, mut rx) = mpsc::channel::<HashProgress>(50);
+    let task = tokio::spawn(async move {
+        MultiHasher::hash_stream_with_capacity(
+            &image,
+            selection.md5,
+            selection.sha1,
+            selection.sha256,
+            Some(bytes),
+            Some(tx),
+            Some(abort),
+        )
+        .await
+    });
+    while let Some(hp) = rx.recv().await {
+        ctx.progress
+            .phase_progress(hp.bytes_hashed, hp.total_bytes, hp.speed_bps);
+    }
+    match task.await {
+        Ok(Ok(image_hashes)) => (
+            compare_digests(
+                selection,
+                &out.acquisition_hashes,
+                &image_hashes,
+                "image re-read by dfdisk",
+            ),
+            image_hashes,
+        ),
+        Ok(Err(e)) => (
+            VerificationResult::Failed { reason: e },
+            HashResults::default(),
+        ),
+        Err(e) => (
+            VerificationResult::Failed {
+                reason: format!("the verification task failed: {e}"),
+            },
+            HashResults::default(),
+        ),
+    }
+}
+
+/// Read the first `size` bytes of the source through `fd` with positioned
+/// reads (the descriptor offset is not used) and hash them with `selection`.
+/// The page cache of the source is dropped first and behind every chunk
+/// (POSIX_FADV_DONTNEED), so the read comes from the medium. `progress`
+/// gets the bytes read so far. A read error, a short source or the abort
+/// flag end it with an error (Failed / Aborted).
+pub fn hash_source(
+    fd: &File,
+    size: u64,
+    selection: HashSelection,
+    abort: &AtomicBool,
+    mut progress: impl FnMut(u64),
+) -> Result<HashResults, AcquisitionError> {
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::io::AsRawFd;
+    let evict = |offset: u64, len: u64| {
+        // SAFETY: advisory call on a descriptor the caller owns
+        unsafe {
+            libc::posix_fadvise(
+                fd.as_raw_fd(),
+                offset as libc::off_t,
+                len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
+    };
+    evict(0, 0);
+    let mut hasher = StreamHasher::new(selection);
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut offset = 0u64;
+    let mut last = Instant::now();
+    while offset < size {
+        if abort.load(Ordering::SeqCst) {
+            return Err(AcquisitionError::aborted(format!(
+                "the second source read was aborted at byte offset {offset}"
+            )));
+        }
+        let want = (size - offset).min(CHUNK_SIZE as u64) as usize;
+        let n = loop {
+            match fd.read_at(&mut buf[..want], offset) {
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(AcquisitionError::failed(format!(
+                        "read error during the second source read at byte offset {offset}: {e}"
+                    )))
+                }
+                Ok(n) => break n,
+            }
+        };
+        if n == 0 {
+            return Err(AcquisitionError::failed(format!(
+                "the source ended at byte offset {offset} during the second read; {size} bytes were expected"
+            )));
+        }
+        hasher.update(&buf[..n]);
+        evict(offset, n as u64);
+        offset += n as u64;
+        if last.elapsed() >= Duration::from_millis(100) || offset == size {
+            progress(offset);
+            last = Instant::now();
+        }
+    }
+    Ok(hasher.finish())
 }
 
 #[cfg(test)]
@@ -627,6 +577,42 @@ mod tests {
         assert!(o.source_hashes.md5.is_none());
         assert!(o.source_hashes.sha1.is_none());
         assert!(o.source_hashes.sha256.is_some());
+    }
+
+    #[test]
+    fn second_source_read_hashes_exactly_size_bytes_with_positioned_reads() {
+        use std::io::Seek;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("src");
+        let data = sample(3 * CHUNK_SIZE + 100);
+        std::fs::write(&p, &data).unwrap();
+        let mut f = File::open(&p).unwrap();
+        // The descriptor offset does not matter
+        f.seek(std::io::SeekFrom::Start(12345)).unwrap();
+        let mut seen = 0;
+        let h = hash_source(&f, data.len() as u64, ALL, &AtomicBool::new(false), |n| {
+            seen = n
+        })
+        .unwrap();
+        assert_eq!(seen, data.len() as u64);
+        assert_eq!(h.sha256, Some(hex::encode(Sha256::digest(&data))));
+        assert_eq!(h.md5, Some(hex::encode(Md5::digest(&data))));
+        // A prefix
+        let h = hash_source(&f, 1000, ALL, &AtomicBool::new(false), |_| {}).unwrap();
+        assert_eq!(h.sha1, Some(hex::encode(Sha1::digest(&data[..1000]))));
+        // A source shorter than expected fails; abort is an abort
+        let e = hash_source(
+            &f,
+            data.len() as u64 + 1,
+            ALL,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(e.kind, crate::engines::ErrorKind::Failed);
+        assert!(e.message.contains("ended at byte offset"), "{e}");
+        let e = hash_source(&f, 10, ALL, &AtomicBool::new(true), |_| {}).unwrap_err();
+        assert_eq!(e.kind, crate::engines::ErrorKind::Aborted);
     }
 
     #[test]

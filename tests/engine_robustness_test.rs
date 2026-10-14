@@ -1,7 +1,7 @@
 mod common;
 
 use common::{audit_sandbox, file_device};
-use dfdisk::engines;
+use dfdisk::engines::session::{self, AcquisitionRequest};
 use dfdisk::models::{
     self,
     case::CaseMetadata,
@@ -225,9 +225,42 @@ fn test_truthful_forensic_reporting_damaged_media_rescue() {
     assert!(cert_text.contains("MD5     : 79054025255fb1a26e4bc422aef54eb4"));
 }
 
+async fn run_session(
+    device: dfdisk::models::device::BlockDevice,
+    case: CaseMetadata,
+    config: AcquisitionConfig,
+    abort: bool,
+) -> Result<ForensicInfoReport, dfdisk::engines::AcquisitionError> {
+    audit_sandbox();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(50);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(abort));
+    session::run(AcquisitionRequest::new(device, case, config), tx, flag).await
+}
+
+/// RAW defaults for a test destination (which may be a tmpfs).
+fn raw_config(out: &std::path::Path) -> AcquisitionConfig {
+    AcquisitionConfig {
+        allow_tmpfs: true,
+        ..AcquisitionConfig::raw(out)
+    }
+}
+
+fn test_case() -> CaseMetadata {
+    CaseMetadata {
+        case_number: "CASE01".to_string(),
+        location_ea: "01".to_string(),
+        evidence_number: "CF01".to_string(),
+        authority: "DFIR".to_string(),
+        examiner: "Examiner".to_string(),
+        description: "Test".to_string(),
+        notes: "".to_string(),
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn test_raw_acquisition_end_to_end() {
-    audit_sandbox();
     let tmp = tempfile::tempdir().unwrap();
     let temp_dir = tmp.path();
 
@@ -249,21 +282,7 @@ async fn test_raw_acquisition_end_to_end() {
     };
 
     let out_dir = temp_dir.join("evidence_output");
-    let config = AcquisitionConfig {
-        format: models::config::ImageFormat::Raw,
-        output_dir: out_dir.clone(),
-        calc_md5: true,
-        calc_sha1: true,
-        calc_sha256: true,
-        ..Default::default()
-    };
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel(50);
-    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
-
-    let report = engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort)
+    let report = run_session(device, case, raw_config(&out_dir), false)
         .await
         .expect("RAW acquisition must succeed");
 
@@ -299,51 +318,26 @@ async fn test_raw_acquisition_end_to_end() {
 
 #[tokio::test]
 async fn test_raw_acquisition_abort_reactivity() {
-    audit_sandbox();
     let tmp = tempfile::tempdir().unwrap();
     let temp_dir = tmp.path();
 
     let source_disk = temp_dir.join("virtual_source.bin");
     let test_data = vec![0xaau8; 10 * 1024 * 1024]; // 10 MB
     std::fs::write(&source_disk, &test_data).unwrap();
-
     let device = file_device(&source_disk, test_data.len() as u64, Some("VT10002"));
-
-    let case = CaseMetadata {
-        case_number: "CASE-ABORT".to_string(),
-        location_ea: "01".to_string(),
-        evidence_number: "CF01".to_string(),
-        authority: "DFIR Unit".to_string(),
-        examiner: "Examiner".to_string(),
-        description: "Test Abort".to_string(),
-        notes: "".to_string(),
-        ..Default::default()
-    };
-
     let out_dir = temp_dir.join("evidence_output");
-    let config = AcquisitionConfig {
-        format: models::config::ImageFormat::Raw,
-        output_dir: out_dir.clone(),
-        ..Default::default()
-    };
 
-    let (tx, _rx) = tokio::sync::mpsc::channel(50);
-    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Trigger abort flag immediately
-    abort.store(true, std::sync::atomic::Ordering::Relaxed);
-
-    let res =
-        engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
-
-    assert!(res.is_err(), "Must return Err on abort");
-    let err_msg = res.unwrap_err();
-    assert!(err_msg.contains("aborted by user"));
+    // Abort requested before the run: nothing is written, exit 8
+    let err = run_session(device, test_case(), raw_config(&out_dir), true)
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, dfdisk::engines::ErrorKind::Aborted);
+    assert_eq!(err.exit_code(), 8);
+    assert!(!out_dir.exists());
 }
 
 #[tokio::test]
 async fn test_raw_acquisition_destination_exists_refusal() {
-    audit_sandbox();
     let tmp = tempfile::tempdir().unwrap();
     let temp_dir = tmp.path();
 
@@ -353,57 +347,33 @@ async fn test_raw_acquisition_destination_exists_refusal() {
     let out_dir = temp_dir.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    let case = CaseMetadata {
-        case_number: "CASE01".to_string(),
-        location_ea: "01".to_string(),
-        evidence_number: "CF01".to_string(),
-        authority: "DFIR".to_string(),
-        examiner: "Examiner".to_string(),
-        description: "Test".to_string(),
-        notes: "".to_string(),
-        ..Default::default()
-    };
+    let case = test_case();
     let device = file_device(&source_disk, 18, Some("SER001"));
-    let config = AcquisitionConfig {
-        format: models::config::ImageFormat::Raw,
-        output_dir: out_dir.clone(),
-        ..Default::default()
-    };
 
     // Pre-create the destination raw file
     let expected_dest = out_dir.join(case.generate_filename(&device.display_serial(), "raw"));
     std::fs::write(&expected_dest, b"already existing file").unwrap();
 
-    let (tx, _rx) = tokio::sync::mpsc::channel(50);
-    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let res =
-        engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
-
-    assert!(res.is_err(), "Must fail if destination RAW already exists");
-    let err = res.unwrap_err();
-    assert!(err.contains("already exists"), "Error was: {}", err);
+    let err = run_session(device, case, raw_config(&out_dir), false)
+        .await
+        .unwrap_err();
+    assert!(err.is_refusal(), "{err}");
+    assert!(err.message.contains("already exists"), "Error was: {}", err);
+    assert_eq!(
+        std::fs::read(&expected_dest).unwrap(),
+        b"already existing file"
+    );
 }
 
 #[tokio::test]
 async fn test_raw_acquisition_source_destination_collision() {
-    audit_sandbox();
     let tmp = tempfile::tempdir().unwrap();
     let temp_dir = tmp.path();
 
     let out_dir = temp_dir.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    let case = CaseMetadata {
-        case_number: "CASE01".to_string(),
-        location_ea: "01".to_string(),
-        evidence_number: "CF01".to_string(),
-        authority: "DFIR".to_string(),
-        examiner: "Examiner".to_string(),
-        description: "Test".to_string(),
-        notes: "".to_string(),
-        ..Default::default()
-    };
+    let case = test_case();
     let serial = "COLLIDE01";
     let target_filename = case.generate_filename(serial, "raw");
     let source_disk = out_dir.join(&target_filename);
@@ -414,27 +384,20 @@ async fn test_raw_acquisition_source_destination_collision() {
     .unwrap();
 
     let device = file_device(&source_disk, 51, Some(serial));
-    let config = AcquisitionConfig {
-        format: models::config::ImageFormat::Raw,
-        output_dir: out_dir.clone(),
-        ..Default::default()
-    };
-
-    let (tx, _rx) = tokio::sync::mpsc::channel(50);
-    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let res =
-        engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
-
-    assert!(res.is_err(), "Must fail when destination matches source");
+    let err = run_session(device, case, raw_config(&out_dir), false)
+        .await
+        .unwrap_err();
+    assert!(
+        err.is_refusal(),
+        "Must refuse when destination matches source"
+    );
     // Ensure the source file was NOT truncated to 0 bytes!
     let data = std::fs::read(&source_disk).unwrap();
     assert_eq!(data, b"precious evidence data that must not be truncated");
 }
 
 #[tokio::test]
-async fn test_raw_acquisition_incomplete_size_mismatch() {
-    audit_sandbox();
+async fn test_raw_acquisition_source_size_mismatch_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let temp_dir = tmp.path();
 
@@ -442,42 +405,21 @@ async fn test_raw_acquisition_incomplete_size_mismatch() {
     std::fs::write(&source_disk, b"short data").unwrap(); // 10 bytes
 
     let out_dir = temp_dir.join("out");
-    std::fs::create_dir_all(&out_dir).unwrap();
-
-    let case = CaseMetadata {
-        case_number: "CASE01".to_string(),
-        location_ea: "01".to_string(),
-        evidence_number: "CF01".to_string(),
-        authority: "DFIR".to_string(),
-        examiner: "Examiner".to_string(),
-        description: "Test".to_string(),
-        notes: "".to_string(),
-        ..Default::default()
-    };
     let device = file_device(&source_disk, 1000, Some("SER_MISMATCH"));
-    let config = AcquisitionConfig {
-        format: models::config::ImageFormat::Raw,
-        output_dir: out_dir.clone(),
-        ..Default::default()
-    };
-
-    let (tx, _rx) = tokio::sync::mpsc::channel(50);
-    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let res =
-        engines::raw::RawAcquireEngine::run_acquisition(device, case, config, tx, abort).await;
-
+    let err = run_session(device, test_case(), raw_config(&out_dir), false)
+        .await
+        .unwrap_err();
+    // The source is not what was selected (1000 bytes): refused, nothing written
+    assert!(err.is_refusal(), "{err}");
     assert!(
-        res.is_err(),
-        "Must fail when bytes copied != expected device size"
+        err.message.contains("source changed since it was selected"),
+        "{err}"
     );
-    let err = res.unwrap_err();
-    assert!(err.contains("Acquisition incomplete"), "Error was: {}", err);
+    assert!(!out_dir.exists());
 }
 
 #[tokio::test]
 async fn test_rescue_stale_files_refusal_without_resume() {
-    audit_sandbox();
     let tmp = tempfile::tempdir().unwrap();
     let temp_dir = tmp.path();
 
@@ -487,25 +429,11 @@ async fn test_rescue_stale_files_refusal_without_resume() {
     let out_dir = temp_dir.join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    let case = CaseMetadata {
-        case_number: "CASE01".to_string(),
-        location_ea: "01".to_string(),
-        evidence_number: "CF01".to_string(),
-        authority: "DFIR".to_string(),
-        examiner: "Examiner".to_string(),
-        description: "Test".to_string(),
-        notes: "".to_string(),
-        ..Default::default()
-    };
+    let case = test_case();
     let device = file_device(&source_disk, 6, Some("RESCUE001"));
     let config = AcquisitionConfig {
-        format: models::config::ImageFormat::E01,
-        compression: models::config::CompressionLevel::Fast,
-        split_size: models::config::SplitSize::TwoGb,
-        output_dir: out_dir.clone(),
-        rescue_mode: true,
-        resume: false,
-        ..Default::default()
+        allow_tmpfs: true,
+        ..AcquisitionConfig::rescue(&out_dir)
     };
 
     // Pre-create existing mapfile
@@ -513,16 +441,10 @@ async fn test_rescue_stale_files_refusal_without_resume() {
     let existing_map = out_dir.join(format!("{}.map", base_name));
     std::fs::write(&existing_map, b"# ddrescue mapfile\n").unwrap();
 
-    let (tx, _rx) = tokio::sync::mpsc::channel(50);
-    let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let res =
-        engines::rescue::RescueAcquireEngine::run_rescue(device, case, config, tx, abort).await;
-
+    let err = run_session(device, case, config, false).await.unwrap_err();
     assert!(
-        res.is_err(),
+        err.is_refusal(),
         "Must refuse to silently overwrite or reuse existing mapfile without --resume"
     );
-    let err = res.unwrap_err();
-    assert!(err.contains("already exists"), "Error was: {}", err);
+    assert!(err.message.contains("already exists"), "Error was: {}", err);
 }
