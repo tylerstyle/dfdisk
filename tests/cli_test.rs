@@ -6,9 +6,30 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_dfdisk");
 
+/// Scratch directory of this test binary for the audit log and registry.
+fn sandbox() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("dfdisk-cli-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .unwrap()
+            .keep()
+    })
+}
+
+/// The dfdisk binary with its audit log and protected-device registry in the
+/// sandbox: no test ever appends to the host's audit log.
+fn dfdisk() -> Command {
+    let mut cmd = Command::new(BIN);
+    cmd.env("DFNIX_AUDIT_LOG", sandbox().join("audit.jsonl"))
+        .env("DFNIX_PROTECTED_FILE", sandbox().join("protected.json"));
+    cmd
+}
+
 #[test]
 fn test_cli_version() {
-    let output = Command::new(BIN)
+    let output = dfdisk()
         .arg("--version")
         .output()
         .expect("Failed to execute dfdisk --version");
@@ -28,7 +49,7 @@ fn test_cli_version() {
     assert!(stdout.contains(" git revision: "), "{stdout}");
 
     // Short flag -V prints the version line only
-    let output_short = Command::new(BIN)
+    let output_short = dfdisk()
         .arg("-V")
         .output()
         .expect("Failed to execute dfdisk -V");
@@ -43,7 +64,7 @@ fn test_cli_version() {
 
 #[test]
 fn test_cli_help() {
-    let output = Command::new(BIN)
+    let output = dfdisk()
         .arg("--help")
         .output()
         .expect("Failed to execute dfdisk --help");
@@ -60,7 +81,7 @@ fn test_cli_help() {
     assert!(stdout.contains("tui"));
 
     // Test short flag -h
-    let output_short = Command::new(BIN)
+    let output_short = dfdisk()
         .arg("-h")
         .output()
         .expect("Failed to execute dfdisk -h");
@@ -72,7 +93,7 @@ fn test_cli_help() {
 #[test]
 fn test_subcommand_help() {
     // 1. list --help
-    let list_out = Command::new(BIN)
+    let list_out = dfdisk()
         .args(["list", "--help"])
         .output()
         .expect("Failed to execute list --help");
@@ -82,7 +103,7 @@ fn test_subcommand_help() {
     assert!(list_str.contains("List all connected storage media"));
 
     // 2. acquire --help
-    let acq_out = Command::new(BIN)
+    let acq_out = dfdisk()
         .args(["acquire", "--help"])
         .output()
         .expect("Failed to execute acquire --help");
@@ -99,7 +120,7 @@ fn test_subcommand_help() {
     assert!(acq_str.contains("--auto-unmount"));
 
     // 3. convert --help
-    let conv_out = Command::new(BIN)
+    let conv_out = dfdisk()
         .args(["convert", "--help"])
         .output()
         .expect("Failed to execute convert --help");
@@ -110,7 +131,7 @@ fn test_subcommand_help() {
     assert!(conv_str.contains("--output-dir"));
 
     // 4. verify --help
-    let ver_out = Command::new(BIN)
+    let ver_out = dfdisk()
         .args(["verify", "--help"])
         .output()
         .expect("Failed to execute verify --help");
@@ -125,7 +146,7 @@ fn test_subcommand_help() {
 #[test]
 fn test_clap_argument_validation() {
     // Missing required positional argument: acquire
-    let missing_acq = Command::new(BIN)
+    let missing_acq = dfdisk()
         .arg("acquire")
         .output()
         .expect("Failed to execute acquire without args");
@@ -142,21 +163,21 @@ fn test_clap_argument_validation() {
     );
 
     // Missing required positional argument: convert (missing source and --to)
-    let missing_conv = Command::new(BIN)
+    let missing_conv = dfdisk()
         .arg("convert")
         .output()
         .expect("Failed to execute convert without args");
     assert_eq!(missing_conv.status.code(), Some(2));
 
     // Missing required positional argument: verify (missing image)
-    let missing_ver = Command::new(BIN)
+    let missing_ver = dfdisk()
         .arg("verify")
         .output()
         .expect("Failed to execute verify without args");
     assert_eq!(missing_ver.status.code(), Some(2));
 
     // Invalid enum value for --format
-    let invalid_fmt = Command::new(BIN)
+    let invalid_fmt = dfdisk()
         .args(["acquire", "/dev/null", "--format", "invalid"])
         .output()
         .expect("Failed to execute with invalid format");
@@ -169,21 +190,21 @@ fn test_clap_argument_validation() {
     );
 
     // Invalid enum value for --split
-    let invalid_split = Command::new(BIN)
+    let invalid_split = dfdisk()
         .args(["acquire", "/dev/null", "--split", "invalid_split"])
         .output()
         .expect("Failed to execute with invalid split");
     assert_eq!(invalid_split.status.code(), Some(2));
 
     // Invalid enum value for --compression
-    let invalid_comp = Command::new(BIN)
+    let invalid_comp = dfdisk()
         .args(["acquire", "/dev/null", "--compression", "ultra_max"])
         .output()
         .expect("Failed to execute with invalid compression");
     assert_eq!(invalid_comp.status.code(), Some(2));
 
     // Unexpected flag
-    let unexpected_flag = Command::new(BIN)
+    let unexpected_flag = dfdisk()
         .arg("--unsupported-forensic-flag")
         .output()
         .expect("Failed to execute with unexpected flag");
@@ -216,7 +237,7 @@ fn test_verify_subcommand_exit_codes() {
     let expected_sha256 = hex::encode(sha256_h.finalize());
 
     // 1. Verify with matching MD5 (must exit 0)
-    let verify_md5_match = Command::new(BIN)
+    let verify_md5_match = dfdisk()
         .args([
             "verify",
             test_file.to_str().unwrap(),
@@ -234,7 +255,7 @@ fn test_verify_subcommand_exit_codes() {
     assert!(stdout_match.contains("VERIFICATION RESULT: PASSED"));
 
     // 2. Verify with matching SHA-256 (must exit 0)
-    let verify_sha256_match = Command::new(BIN)
+    let verify_sha256_match = dfdisk()
         .args([
             "verify",
             test_file.to_str().unwrap(),
@@ -248,7 +269,7 @@ fn test_verify_subcommand_exit_codes() {
     assert!(stdout_sha_match.contains("VERIFICATION RESULT: PASSED"));
 
     // 3. Verify with dual matching hashes (must exit 0)
-    let verify_dual_match = Command::new(BIN)
+    let verify_dual_match = dfdisk()
         .args([
             "verify",
             test_file.to_str().unwrap(),
@@ -263,7 +284,7 @@ fn test_verify_subcommand_exit_codes() {
 
     // 4. Verify with mismatched MD5 (must exit non-zero / 1)
     let mismatched_md5 = "00000000000000000000000000000000";
-    let verify_md5_mismatch = Command::new(BIN)
+    let verify_md5_mismatch = dfdisk()
         .args([
             "verify",
             test_file.to_str().unwrap(),
@@ -281,9 +302,22 @@ fn test_verify_subcommand_exit_codes() {
     assert!(stdout_mismatch.contains("MISMATCH"));
     assert!(stdout_mismatch.contains("VERIFICATION RESULT: FAILED"));
 
+    // Every verification leaves an addendum next to the image and an audit record
+    let addenda = std::fs::read_dir(temp_dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("verify_test.verify-") && n.ends_with(".txt")
+        })
+        .count();
+    assert!(addenda >= 1, "no verification addendum written");
+    let log = std::fs::read_to_string(sandbox().join("audit.jsonl")).unwrap();
+    assert!(log.contains("\"image_verification\""), "{log}");
+
     // 5. Verify with mismatched SHA-256 (must exit 1)
     let mismatched_sha256 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-    let verify_sha256_mismatch = Command::new(BIN)
+    let verify_sha256_mismatch = dfdisk()
         .args([
             "verify",
             test_file.to_str().unwrap(),
@@ -342,7 +376,7 @@ EOF
     let current_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", temp_dir.display(), current_path);
 
-    let output = Command::new(BIN)
+    let output = dfdisk()
         .args(["list", "--json"])
         .env("PATH", new_path)
         .output()
@@ -395,7 +429,7 @@ EOF
 
 #[test]
 fn test_acquire_rejects_nonexistent() {
-    let output = Command::new(BIN)
+    let output = dfdisk()
         .args(["acquire", "/nonexistent/device/path/12345"])
         .output()
         .expect("Failed to execute dfdisk acquire");
@@ -412,7 +446,7 @@ fn test_acquire_rejects_nonexistent() {
 fn test_acquire_rejects_directory() {
     let temp_dir = tempfile::tempdir().unwrap();
 
-    let output = Command::new(BIN)
+    let output = dfdisk()
         .args(["acquire", &temp_dir.path().to_string_lossy()])
         .output()
         .expect("Failed to execute dfdisk acquire");

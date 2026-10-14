@@ -2,20 +2,19 @@ use crate::cli::args::{
     AcquireArgs, CliCompression, CliImageFormat, CliSplitSize, ConvertArgs, ListArgs, VerifyArgs,
 };
 use crate::discovery::{DeviceScanner, SafetyChecker};
-use crate::engines::{
-    EwfAcquireEngine, FormatConverter, MultiHasher, RawAcquireEngine, RescueAcquireEngine,
-};
+use crate::engines::verify::{self, CheckStatus, ExpectedHashes, VerifyEvent, VerifyOptions};
+use crate::engines::{EwfAcquireEngine, FormatConverter, RawAcquireEngine, RescueAcquireEngine};
 use crate::models::{
     case::CaseMetadata,
     config::{AcquisitionConfig, CompressionLevel, ImageFormat, SplitSize},
     device::{BlockDevice, DeviceSafety},
-    outcome::Outcome,
+    outcome::{Outcome, VerificationResult},
     telemetry::AcquisitionStatus,
 };
+use crate::signals::StopFlags;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 pub async fn handle_list(args: ListArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -479,237 +478,95 @@ pub async fn handle_convert(args: ConvertArgs) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-pub fn is_ewf_image_file(path: &Path) -> bool {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    if ext == "e01" || ext == "s01" {
-        return true;
-    }
-
-    if let Ok(mut f) = std::fs::File::open(path) {
-        use std::io::Read;
-        let mut magic = [0u8; 6];
-        if f.read_exact(&mut magic).is_ok() && &magic == b"EVF\x09\x0d\x0a" {
-            return true;
-        }
-    }
-
-    false
-}
-
-pub async fn handle_verify_ewf(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n[*] Forensic E01 Decoded Stream Verifier (ewfverify)");
-    println!("    Target EWF Segment: {}", args.image.display());
-
-    let mut cmd = tokio::process::Command::new("ewfverify");
-    cmd.arg("-d").arg("md5,sha1,sha256");
-    cmd.arg(&args.image);
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(|e| {
-        format!(
-            "Failed to spawn ewfverify (ensure libewf is installed): {}",
-            e
-        )
-    })?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("Failed to capture ewfverify stdout")?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or("Failed to capture ewfverify stderr")?;
-
-    let mut reader_out = tokio::io::BufReader::new(stdout).lines();
-    let mut reader_err = tokio::io::BufReader::new(stderr).lines();
-
-    let regex_md5 =
-        regex::Regex::new(r"MD5 hash calculated over data:\s*([a-fA-F0-9]{32})").unwrap();
-    let regex_sha1 =
-        regex::Regex::new(r"SHA1 hash calculated over data:\s*([a-fA-F0-9]{40})").unwrap();
-    let regex_sha256 =
-        regex::Regex::new(r"SHA256 hash calculated over data:\s*([a-fA-F0-9]{64})").unwrap();
-
-    let mut calc_md5 = None;
-    let mut calc_sha1 = None;
-    let mut calc_sha256 = None;
-    let mut verify_success = false;
-
-    let mut out_closed = false;
-    let mut err_closed = false;
-
-    while !out_closed || !err_closed {
-        tokio::select! {
-            line = reader_out.next_line(), if !out_closed => {
-                match line {
-                    Ok(Some(l)) => {
-                        let text = l.trim();
-                        if text.contains("ewfverify: SUCCESS") {
-                            verify_success = true;
-                        }
-                        if let Some(caps) = regex_md5.captures(text) {
-                            calc_md5 = Some(caps[1].to_lowercase());
-                        }
-                        if let Some(caps) = regex_sha1.captures(text) {
-                            calc_sha1 = Some(caps[1].to_lowercase());
-                        }
-                        if let Some(caps) = regex_sha256.captures(text) {
-                            calc_sha256 = Some(caps[1].to_lowercase());
-                        }
-                    }
-                    Ok(None) | Err(_) => out_closed = true,
-                }
-            }
-            line = reader_err.next_line(), if !err_closed => {
-                match line {
-                    Ok(Some(l)) => {
-                        let text = l.trim();
-                        if !text.is_empty() {
-                            eprintln!("[ewfverify] {}", text);
-                        }
-                    }
-                    Ok(None) | Err(_) => err_closed = true,
-                }
-            }
-        }
-    }
-
-    let status = child.wait().await?;
-    println!("\n================================================================================");
-    println!(
-        "  MD5 (decoded data)   : {}",
-        calc_md5.as_deref().unwrap_or("N/A")
-    );
-    println!(
-        "  SHA-1 (decoded data) : {}",
-        calc_sha1.as_deref().unwrap_or("N/A")
-    );
-    println!(
-        "  SHA-256 (decoded data): {}",
-        calc_sha256.as_deref().unwrap_or("N/A")
-    );
-    println!("================================================================================");
-
-    let any_checked = args.md5.is_some() || args.sha1.is_some() || args.sha256.is_some();
-    let mut all_match = true;
-
-    if let (Some(exp), Some(calc)) = (&args.md5, &calc_md5) {
-        if exp.eq_ignore_ascii_case(calc) {
-            println!("  [+] MD5 MATCH");
-        } else {
-            println!("  [!] MD5 MISMATCH! Expected: {}", exp);
-            all_match = false;
-        }
-    }
-    if let (Some(exp), Some(calc)) = (&args.sha1, &calc_sha1) {
-        if exp.eq_ignore_ascii_case(calc) {
-            println!("  [+] SHA-1 MATCH");
-        } else {
-            println!("  [!] SHA-1 MISMATCH! Expected: {}", exp);
-            all_match = false;
-        }
-    }
-    if let (Some(exp), Some(calc)) = (&args.sha256, &calc_sha256) {
-        if exp.eq_ignore_ascii_case(calc) {
-            println!("  [+] SHA-256 MATCH");
-        } else {
-            println!("  [!] SHA-256 MISMATCH! Expected: {}", exp);
-            all_match = false;
-        }
-    }
-
-    if !status.success() || !verify_success {
-        println!("\n[!] VERIFICATION RESULT: FAILED (EWF structure or media checksum error)");
-        return Err("EWF image verification failed".into());
-    }
-
-    if !any_checked {
-        println!("\n[*] HASH COMPUTATION COMPLETE (No verification hashes supplied, EWF structure verified)");
-        Ok(())
-    } else if all_match {
-        println!("\n[+] VERIFICATION RESULT: PASSED");
-        Ok(())
-    } else {
-        println!("\n[!] VERIFICATION RESULT: FAILED (INTEGRITY ERROR)");
-        Err("Cryptographic hash mismatch".into())
-    }
-}
-
+/// Re-verify an image (engines::verify): computed digests, each expected
+/// digest's check and the verdict, as in 0.1; plus the addendum and the audit
+/// record the verification writes.
 pub async fn handle_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if is_ewf_image_file(&args.image) {
-        return handle_verify_ewf(args).await;
-    }
-
-    println!("\n[*] Cryptographic Image Integrity Verifier");
-    println!("    Image: {}", args.image.display());
-
-    let (prog_tx, mut prog_rx) = mpsc::channel(50);
-    let img = args.image.clone();
-
-    let join_handle = tokio::spawn(async move {
-        MultiHasher::hash_stream(&img, true, true, true, Some(prog_tx)).await
-    });
-
-    while let Some(prog) = prog_rx.recv().await {
-        print!(
-            "\r[*] Hashing: {:>5.1}% │ Speed: {:>10} MB/s",
-            prog.percentage,
-            (prog.speed_bps / (1024.0 * 1024.0)) as u64
-        );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-    }
-    println!("\n");
-
-    let hashes = join_handle.await??;
-    println!("================================================================================");
-    println!("  MD5    : {}", hashes.md5.as_deref().unwrap_or("N/A"));
-    println!("  SHA-1  : {}", hashes.sha1.as_deref().unwrap_or("N/A"));
-    println!("  SHA-256: {}", hashes.sha256.as_deref().unwrap_or("N/A"));
-    println!("================================================================================");
-
-    let any_checked = args.md5.is_some() || args.sha1.is_some() || args.sha256.is_some();
-    let mut all_match = true;
-    if let (Some(exp), Some(calc)) = (&args.md5, &hashes.md5) {
-        if exp.eq_ignore_ascii_case(calc) {
-            println!("  [+] MD5 MATCH");
-        } else {
-            println!("  [!] MD5 MISMATCH! Expected: {}", exp);
-            all_match = false;
-        }
-    }
-    if let (Some(exp), Some(calc)) = (&args.sha1, &hashes.sha1) {
-        if exp.eq_ignore_ascii_case(calc) {
-            println!("  [+] SHA-1 MATCH");
-        } else {
-            println!("  [!] SHA-1 MISMATCH! Expected: {}", exp);
-            all_match = false;
-        }
-    }
-    if let (Some(exp), Some(calc)) = (&args.sha256, &hashes.sha256) {
-        if exp.eq_ignore_ascii_case(calc) {
-            println!("  [+] SHA-256 MATCH");
-        } else {
-            println!("  [!] SHA-256 MISMATCH! Expected: {}", exp);
-            all_match = false;
-        }
-    }
-
-    if !any_checked {
-        println!("\n[*] HASH COMPUTATION COMPLETE (No verification hashes supplied)");
-        Ok(())
-    } else if all_match {
-        println!("\n[+] VERIFICATION RESULT: PASSED");
-        Ok(())
+    let expected = ExpectedHashes::given(args.md5.clone(), args.sha1.clone(), args.sha256.clone());
+    let ewf = verify::is_ewf_image_file(&args.image);
+    if ewf {
+        println!("\n[*] Forensic E01 Decoded Stream Verifier (ewfverify)");
+        println!("    Target EWF Segment: {}", args.image.display());
     } else {
-        println!("\n[!] VERIFICATION RESULT: FAILED (INTEGRITY ERROR)");
-        Err("Cryptographic hash mismatch".into())
+        println!("\n[*] Cryptographic Image Integrity Verifier");
+        println!("    Image: {}", args.image.display());
+    }
+
+    let v = verify::verify_image(
+        &args.image,
+        &expected,
+        &VerifyOptions::recorded(),
+        &StopFlags::new(),
+        |event| match event {
+            VerifyEvent::Progress(p) => {
+                print!(
+                    "\r[*] Hashing: {:>5.1}% │ Speed: {:>10} MB/s",
+                    p.percentage,
+                    (p.speed_bps / (1024.0 * 1024.0)) as u64
+                );
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            }
+            VerifyEvent::ToolOutput(line) => eprintln!("[ewfverify] {line}"),
+        },
+    )
+    .await?;
+    if !ewf {
+        println!("\n");
+    }
+
+    let na = |d: &Option<String>| d.clone().unwrap_or_else(|| "N/A".into());
+    println!("\n================================================================================");
+    if ewf {
+        println!("  MD5 (decoded data)   : {}", na(&v.computed.md5));
+        println!("  SHA-1 (decoded data) : {}", na(&v.computed.sha1));
+        println!("  SHA-256 (decoded data): {}", na(&v.computed.sha256));
+    } else {
+        println!("  MD5    : {}", na(&v.computed.md5));
+        println!("  SHA-1  : {}", na(&v.computed.sha1));
+        println!("  SHA-256: {}", na(&v.computed.sha256));
+    }
+    println!("================================================================================");
+    for c in &v.checks {
+        match c.status {
+            CheckStatus::Match => println!("  [+] {} MATCH", c.algorithm.label()),
+            CheckStatus::Mismatch => {
+                println!(
+                    "  [!] {} MISMATCH! Expected: {}",
+                    c.algorithm.label(),
+                    c.expected
+                )
+            }
+            CheckStatus::NotComputed => println!(
+                "  [!] {} NOT COMPUTED! Expected: {}",
+                c.algorithm.label(),
+                c.expected
+            ),
+        }
+    }
+    for w in &v.warnings {
+        eprintln!("[!] WARNING: {w}");
+    }
+    if let Some(a) = &v.addendum {
+        println!("[+] Verification addendum: {}", a.display());
+    }
+
+    match &v.result {
+        VerificationResult::Matched { .. } => {
+            println!("\n[+] VERIFICATION RESULT: PASSED");
+            Ok(())
+        }
+        VerificationResult::NotPossible { .. } => {
+            println!("\n[*] HASH COMPUTATION COMPLETE (No verification hashes supplied)");
+            Ok(())
+        }
+        VerificationResult::Mismatched { .. } => {
+            println!("\n[!] VERIFICATION RESULT: FAILED (INTEGRITY ERROR)");
+            Err("Cryptographic hash mismatch".into())
+        }
+        VerificationResult::Failed { reason } => {
+            println!("\n[!] VERIFICATION RESULT: FAILED ({reason})");
+            Err(format!("Verification failed: {reason}").into())
+        }
     }
 }
 

@@ -9,6 +9,7 @@ pub mod process;
 pub mod progress;
 pub mod raw;
 pub mod rescue;
+pub mod verify;
 
 pub use converter::FormatConverter;
 pub use error::{AcquisitionError, AcquisitionResult, ErrorKind};
