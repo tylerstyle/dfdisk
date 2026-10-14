@@ -1,0 +1,5 @@
+Errors reading device:
+	total number: 1
+	at sector(s): 2048 - 8192 number: 6144 (offset: 0x00100000 of size: 3145728)
+
+MD5 hash calculated over data:		64db095913c7413116bc8a0121e175b4

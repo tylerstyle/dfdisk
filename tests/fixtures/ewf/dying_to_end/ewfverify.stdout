@@ -1,0 +1,17 @@
+ewfverify 20231119
+
+Verify started at: Oct 15, 2026 01:12:39
+This could take a while.
+
+Verify completed at: Oct 15, 2026 01:12:39
+
+Read: 4.0 MiB (4194304 bytes) in 0 second(s)
+
+MD5 hash stored in file:		64db095913c7413116bc8a0121e175b4
+MD5 hash calculated over data:		64db095913c7413116bc8a0121e175b4
+SHA1 hash stored in file:		N/A
+SHA1 hash calculated over data:		ba2a290e27272727218da37182ca9c441d6a9824
+SHA256 hash stored in file:		N/A
+SHA256 hash calculated over data:	55e24d2550aa4442815878a30d4bf7e7446ed73b7c781d1c7e19cb2af7d5ea7f
+
+ewfverify: SUCCESS

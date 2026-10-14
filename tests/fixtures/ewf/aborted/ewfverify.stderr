@@ -1,0 +1,5 @@
+Unable to verify input.
+libewf_internal_handle_read_buffer_from_file_io_pool: unable to retrieve chunk data for offset: 0 (0x00000000).
+libewf_handle_read_buffer: unable to read buffer.
+storage_media_buffer_read_from_handle: unable to read storage media buffer.
+verification_handle_verify_input: unable to read data.

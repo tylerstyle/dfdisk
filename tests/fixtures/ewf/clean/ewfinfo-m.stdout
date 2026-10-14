@@ -1,0 +1,20 @@
+ewfinfo 20231119
+
+EWF information:
+	File format:		EnCase 6
+	Sectors per chunk:	64
+	Error granularity:	1
+	Compression method:	deflate
+	Compression level:	no compression
+
+Media information:
+	Media type:		removable disk
+	Is physical:		no
+	Bytes per sector:	512
+	Number of sectors:	8192
+	Media size:		4.0 MiB (4194304 bytes)
+
+Digest hash information:
+	MD5:			c0ed3b46644cbdf9322e6028c84f82fc
+	SHA1:			1dbbb00f9daaaab78905d7f61ef1f1865f601117
+
