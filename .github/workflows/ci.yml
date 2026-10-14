@@ -5,11 +5,23 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Toolchain for fmt, clippy and the tests; the release workflow uses the same
+  # version. Bump both together (docs/RELEASING.md).
+  RUST_TOOLCHAIN: "1.98.1"
+  CARGO_TERM_COLOR: always
 
 jobs:
   test:
     name: Test & Lint
-    runs-on: ubuntu-latest
+    # Same distribution as the .deb build: the tool tests run against the
+    # ewf-tools and gddrescue packages the .deb depends on
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -20,24 +32,64 @@ jobs:
           git clone https://github.com/tylerstyle/dfcore.git ../dfcore
           git -C ../dfcore checkout --detach "$rev"
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
 
-      - name: Install forensic system dependencies
+      - name: Install the external tools the tests run
         run: |
           sudo apt-get update
-          sudo apt-get install -y ewf-tools gddrescue smartmontools util-linux udev || sudo apt-get install -y libewf-tools gddrescue smartmontools util-linux udev
+          sudo apt-get install -y ewf-tools gddrescue
+
+      - name: Tool versions
+        run: |
+          ewfacquire -V | head -n 1
+          ddrescue --version | head -n 1
+          cc --version | head -n 1
 
       - name: Check formatting
         run: cargo fmt --check
 
-      - name: Run clippy linter
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Run unit and integration tests
-        run: cargo test --verbose
+      - name: Run the tests (tool tests must run, not skip)
+        env:
+          DFDISK_REQUIRE_TOOLS: "1"
+        run: cargo test --locked
+
+  msrv:
+    name: MSRV (rust-version)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Checkout sibling dfcore at the locked revision
+        run: |
+          rev=$(jq -r '.nodes.dfcore.locked.rev' flake.lock)
+          git clone https://github.com/tylerstyle/dfcore.git ../dfcore
+          git -C ../dfcore checkout --detach "$rev"
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(sed -n 's/^rust-version *= *"\([0-9.]*\)".*/\1/p' Cargo.toml)
+          if [ -z "$msrv" ]; then
+            echo "::error::Cargo.toml declares no rust-version"
+            exit 1
+          fi
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Build every target with the locked dependencies
+        run: cargo check --locked --all-targets
 
   nix:
     name: Nix Build
@@ -52,5 +104,5 @@ jobs:
       - name: Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@v8
 
-      - name: Build package (runs the test suite in the Nix sandbox)
+      - name: Build package (runs the test suite with libewf and ddrescue, DFDISK_REQUIRE_TOOLS=1)
         run: nix build -L .#default
