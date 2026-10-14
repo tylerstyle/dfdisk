@@ -107,6 +107,10 @@ pub struct SmartSnapshot {
     pub json_sha256: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
+    /// Serial number the device reported to smartctl (ATA IDENTIFY / NVMe
+    /// identify); the session adds it to the source's serial candidates
+    #[serde(default)]
+    pub device_serial: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -133,8 +133,9 @@ fn disks_of(identity: &SourceIdentity) -> Vec<String> {
 }
 
 /// The source node, its partitions (for a disk) and everything stacked on
-/// them: the nodes whose mounts are "in the source tree".
-fn source_tree(sys: &SysRoot, identity: &SourceIdentity) -> BTreeSet<String> {
+/// them, by kernel name: the nodes whose mounts (and active swap, R8) are "in
+/// the source tree".
+pub fn source_tree(sys: &SysRoot, identity: &SourceIdentity) -> BTreeSet<String> {
     let mut tree = BTreeSet::new();
     let src = identity.kernel_name.clone();
     let mut roots = vec![src.clone()];

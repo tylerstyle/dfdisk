@@ -1,6 +1,58 @@
-use crate::models::device::{SmartHealth, SmartInfo};
+use crate::engines::process::StopControl;
+use crate::models::config::SmartPolicy;
+use crate::models::device::{SmartHealth, SmartInfo, SmartSnapshot};
+use crate::models::identity::SourceIdentity;
+use crate::models::provenance::ProvenanceRecorder;
 use serde_json::Value;
+use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
+
+/// Timeout of a SMART query (§8).
+pub const SMART_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// SMART snapshot of the disk the source is stored on, per `policy` (§8, P4).
+/// `None` when the policy is off or no physical disk applies (regular file,
+/// loop device). `json_file`: where smartctl's raw JSON is saved
+/// (`<base>.smart-before.json` / `-after.json`); `None` saves nothing
+/// (`check`, TUI queries). Never fails: an inaccessible device is a snapshot
+/// with health UNKNOWN, never FAILED.
+///
+/// DISCOVERY AGENT: placeholder with its final signature. Implement per §8:
+/// basic = `smartctl -j -i -H -A -l error`, full adds the `-x` logs without
+/// SCT; 30 s timeout through `engines::process` with `control`, the command
+/// recorded in `recorder` and in `SmartSnapshot::command`; target the
+/// physical disk (R6); save the raw JSON to `json_file` (fsync) with its
+/// SHA-256; fill `device_serial` from the IDENTIFY data.
+pub async fn snapshot(
+    identity: &SourceIdentity,
+    policy: SmartPolicy,
+    json_file: Option<&Path>,
+    control: &StopControl,
+    recorder: Option<&ProvenanceRecorder>,
+) -> Option<SmartSnapshot> {
+    let _ = (json_file, control, recorder);
+    if policy == SmartPolicy::Off || !identity.is_block_device() {
+        return None;
+    }
+    Some(SmartSnapshot {
+        policy,
+        command: Vec::new(),
+        smartctl_version: None,
+        exit_status: None,
+        taken_at: chrono::Utc::now(),
+        summary: SmartInfo {
+            health: SmartHealth::Unknown,
+            passed: false,
+            assessment: "UNKNOWN (SMART was not queried)".into(),
+            ..Default::default()
+        },
+        json_file: None,
+        json_sha256: None,
+        note: Some("SMART snapshots are not implemented in this build".into()),
+        device_serial: None,
+    })
+}
 
 pub struct SmartChecker;
 
