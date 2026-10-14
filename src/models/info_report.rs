@@ -1068,11 +1068,26 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-/// fsync a directory so renames and new entries in it are durable.
+/// Whether an fsync error on a directory only means that the filesystem
+/// cannot sync directories: exFAT, NTFS-3G, CIFS/SMB and other FUSE or
+/// network filesystems answer EINVAL, ENOTSUP or ENOSYS. Those count as
+/// success (the rule dfcore's audit log applies); every other errno is a
+/// real error.
+pub fn dir_sync_unsupported(errno: Option<i32>) -> bool {
+    matches!(errno, Some(libc::EINVAL | libc::ENOTSUP | libc::ENOSYS))
+}
+
+/// fsync a directory so renames and new entries in it are durable. A
+/// filesystem that cannot sync directories ([`dir_sync_unsupported`]) is not
+/// an error; failing to open the directory, or any other fsync error, is.
+/// Every directory fsync in dfdisk goes through this function.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(|e| with_path(dir, e, "sync directory"))
+    let d = File::open(dir).map_err(|e| with_path(dir, e, "open directory"))?;
+    match d.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e) if dir_sync_unsupported(e.raw_os_error()) => Ok(()),
+        Err(e) => Err(with_path(dir, e, "sync directory")),
+    }
 }
 
 /// Path of the reservation file of `base` in `dir`.
@@ -1110,6 +1125,11 @@ pub fn create_reserve_file(dir: &Path, base: &str) -> io::Result<PathBuf> {
         drop(f);
         let _ = std::fs::remove_file(&path);
         return Err(with_path(&path, e, "reserve space for the report in"));
+    }
+    drop(f);
+    if let Err(e) = sync_dir(dir) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e);
     }
     Ok(path)
 }
@@ -1510,6 +1530,28 @@ mod tests {
         assert_ne!(again.text_sha256, files.text_sha256);
         // An unwritable destination is an error
         assert!(r.write_reports(&dir.path().join("missing"), base).is_err());
+    }
+
+    #[test]
+    fn directory_sync_tolerates_filesystems_that_cannot_sync_directories() {
+        // exFAT, NTFS-3G, CIFS/SMB, FUSE
+        for errno in [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS] {
+            assert!(dir_sync_unsupported(Some(errno)), "{errno}");
+        }
+        // Real failures stay failures
+        for errno in [
+            libc::EIO,
+            libc::ENOSPC,
+            libc::EDQUOT,
+            libc::EROFS,
+            libc::EBADF,
+        ] {
+            assert!(!dir_sync_unsupported(Some(errno)), "{errno}");
+        }
+        assert!(!dir_sync_unsupported(None));
+        let dir = tempfile::tempdir().unwrap();
+        assert!(sync_dir(dir.path()).is_ok());
+        assert!(sync_dir(&dir.path().join("missing")).is_err());
     }
 
     #[test]
