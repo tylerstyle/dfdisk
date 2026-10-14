@@ -42,6 +42,9 @@ pub const OUTPUT_SUFFIXES: &[&str] = &[
     ".identity.json.tmp",
     ".smart-before.json",
     ".smart-after.json",
+    // A resumed rescue's later SMART snapshots (session::smart_json_path)
+    ".smart-before-999.json",
+    ".smart-after-999.json",
     ".ewfacquire.log",
     ".verify-20260101T000000Z.txt",
 ];
