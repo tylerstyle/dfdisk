@@ -188,7 +188,7 @@ impl RawAcquireEngine {
         abort_flag: Arc<AtomicBool>,
     ) -> Result<ForensicInfoReport, String> {
         let output_dir = config.output_dir.clone();
-        let audit_anchor = crate::engines::audit::started("raw", &device, &config);
+        let audit_anchor = crate::engines::audit::legacy_started("raw", &device, &config);
         let result = Self::acquire(
             device.clone(),
             case,
@@ -198,7 +198,7 @@ impl RawAcquireEngine {
             audit_anchor,
         )
         .await;
-        crate::engines::audit::finished("raw", &device, &output_dir, &result);
+        crate::engines::audit::legacy_finished("raw", &device, &output_dir, &result);
         result
     }
 

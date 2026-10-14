@@ -6,6 +6,7 @@ pub mod hasher;
 pub(crate) mod legacy;
 pub mod preflight;
 pub mod process;
+pub mod progress;
 pub mod raw;
 pub mod rescue;
 

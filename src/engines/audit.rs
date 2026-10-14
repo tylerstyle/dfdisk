@@ -1,61 +1,500 @@
-//! Acquisition records in the dfnix audit log (dfcore). A "started" record is
-//! written before the source is read; its hash is the report's audit anchor. The
-//! "finished" record carries the outcome, the hashes and the SHA-256 of the report.
+//! dfdisk's records in the dfnix audit log (dfcore): every acquisition writes
+//! "acquisition_started" before the source is read (its hash is the report's
+//! audit anchor) and "acquisition_finished" on every path afterwards, carrying
+//! the outcome, exit code, read-error summary, every known digest, the SHA-256
+//! of both reports and the files ([`FinishedGuard`] writes it even when the run
+//! ends by an error, a cancellation or a panic). Refusals are recorded by their
+//! [`ErrorKind`](crate::engines::ErrorKind), never by message text.
+//!
+//! Further records: [`unmount`], [`image_verification`],
+//! [`conversion_started`] / [`conversion_finished`].
+//!
+//! Every function takes the log path (normally [`log_path`], which honours
+//! `DFNIX_AUDIT_LOG`), so tests use their own logs. On dfnix (protected-device
+//! registry present) a "started" record that cannot be written refuses the
+//! acquisition; elsewhere it is a warning in the report and the UI. Warnings
+//! never go to stderr: a TUI may own the terminal.
 
-use crate::models::{
-    config::AcquisitionConfig, device::BlockDevice, info_report::ForensicInfoReport,
-};
-use dfcore::audit::{self, Event, Outcome};
+use crate::engines::error::AcquisitionError;
+use crate::engines::preflight::DestinationFacts;
+use crate::engines::progress::ProgressSink;
+use crate::models::case::CaseMetadata;
+use crate::models::config::{AcquisitionConfig, EffectiveConfig, EngineKind};
+use crate::models::device::BlockDevice;
+use crate::models::identity::SourceIdentity;
+use crate::models::info_report::{AuditInfo, AuditStatus, ForensicInfoReport, ReportFiles};
+use crate::models::outcome::{RangeKind, VerificationResult};
+use crate::models::protection::RegistryPresence;
+use dfcore::audit::{Event, Outcome};
 use dfcore::lsblk::DeviceIdentity;
-use sha2::{Digest, Sha256};
+use serde_json::{json, Map, Value};
+use std::path::{Path, PathBuf};
 
-const TOOL: &str = "dfdisk";
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Tool name in every record.
+pub const TOOL: &str = "dfdisk";
+/// dfdisk version in every record.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn identity(device: &BlockDevice) -> DeviceIdentity {
-    device.device_identity()
+/// Record actions written by dfdisk.
+pub mod action {
+    pub const ACQUISITION_STARTED: &str = "acquisition_started";
+    pub const ACQUISITION_FINISHED: &str = "acquisition_finished";
+    pub const UNMOUNT: &str = "unmount";
+    pub const IMAGE_VERIFICATION: &str = "image_verification";
+    pub const CONVERSION_STARTED: &str = "conversion_started";
+    pub const CONVERSION_FINISHED: &str = "conversion_finished";
 }
 
-fn record(event: Event) -> Option<String> {
-    match audit::append(event) {
-        Ok(rec) => rec.hash,
-        Err(e) => {
-            eprintln!("[!] WARNING: audit log not written: {e:#}");
-            None
+/// The audit log of this host (`DFNIX_AUDIT_LOG` or /run/dfnix/audit.jsonl).
+pub fn log_path() -> PathBuf {
+    dfcore::audit::path()
+}
+
+/// Append `event` to the log at `log`: the record's hash, or why it was not
+/// written.
+pub fn append(log: &Path, event: Event) -> Result<String, String> {
+    match dfcore::audit::append_to(log, event) {
+        Ok(rec) => rec.hash.ok_or_else(|| "the record has no hash".to_string()),
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
+/// What the "acquisition_started" record states.
+#[derive(Debug, Clone, Copy)]
+pub struct StartedRecord<'a> {
+    pub engine: EngineKind,
+    /// Identity probed at the start (maj:min, diskseq, serial, ...)
+    pub identity: &'a SourceIdentity,
+    pub case: &'a CaseMetadata,
+    pub effective: &'a EffectiveConfig,
+    pub output_dir: &'a Path,
+    pub base_name: &'a str,
+    /// Path external tools read the source through (R3)
+    pub tool_source_path: &'a str,
+    pub destination: Option<&'a DestinationFacts>,
+    pub registry: &'a RegistryPresence,
+}
+
+/// The "acquisition_started" event (pure).
+pub fn started_event(r: &StartedRecord<'_>) -> Event {
+    let case = r.case.sanitized();
+    let id = r.identity;
+    Event::new(TOOL, VERSION, action::ACQUISITION_STARTED)
+        .device(id.device_identity())
+        .detail("engine", r.engine.tag())
+        .detail("base_name", r.base_name)
+        .detail("output_dir", r.output_dir.to_string_lossy().into_owned())
+        .detail("tool_source_path", r.tool_source_path)
+        .detail(
+            "case",
+            json!({
+                "case_number": case.case_number,
+                "evidence_number": case.evidence_number,
+                "examiner": case.examiner,
+            }),
+        )
+        .detail(
+            "source",
+            json!({
+                "path": id.path,
+                "kind": id.kind.label(),
+                "maj_min": id.maj_min,
+                "diskseq": id.diskseq,
+                "size_bytes": id.size_bytes,
+                "serial": id.serial,
+                "serial_source": id.serial_source().map(|s| s.label()),
+                "wwn": id.wwn,
+                "parent_disks": id.parent_disks,
+            }),
+        )
+        .detail(
+            "effective_config",
+            serde_json::to_value(r.effective).unwrap_or_default(),
+        )
+        .detail(
+            "destination",
+            r.destination
+                .map(|d| serde_json::to_value(d).unwrap_or_default())
+                .unwrap_or(Value::Null),
+        )
+        .detail("dfnix_registry", r.registry.label())
+}
+
+/// Write "acquisition_started" (§4 step 7, R7). Returns the report's audit
+/// info: the anchor when written; when it cannot be written, `NotWritten` off
+/// dfnix (the caller must warn), and a refusal on dfnix (registry present),
+/// where no evidence may be read unrecorded.
+pub fn started(log: &Path, record: &StartedRecord<'_>) -> Result<AuditInfo, AcquisitionError> {
+    match append(log, started_event(record)) {
+        Ok(hash) => Ok(AuditInfo {
+            anchor: Some(hash),
+            status: AuditStatus::Written,
+            export_file: None,
+        }),
+        Err(reason) => {
+            if *record.registry != RegistryPresence::Absent {
+                Err(AcquisitionError::refused(format!(
+                    "the dfnix audit log {} cannot be written ({reason}); on dfnix every acquisition is recorded before the source is read",
+                    log.display()
+                )))
+            } else {
+                Ok(AuditInfo {
+                    anchor: None,
+                    status: AuditStatus::NotWritten {
+                        reason: format!(
+                            "the audit log {} cannot be written: {reason}",
+                            log.display()
+                        ),
+                    },
+                    export_file: None,
+                })
+            }
         }
     }
 }
 
-/// Record the start of an acquisition; returns the anchor for the report.
-pub fn started(engine: &str, device: &BlockDevice, config: &AcquisitionConfig) -> Option<String> {
-    record(
-        Event::new(TOOL, VERSION, "acquisition_started")
-            .device(identity(device))
-            .detail("engine", engine)
-            .detail("format", format!("{:?}", config.format))
-            .detail(
-                "output_dir",
-                config.output_dir.to_string_lossy().to_string(),
-            )
-            .detail(
-                "hashes",
-                serde_json::json!({
-                    "md5": config.calc_md5, "sha1": config.calc_sha1, "sha256": config.calc_sha256
-                }),
-            ),
-    )
+fn read_error_summary(report: &ForensicInfoReport) -> Value {
+    let t = &report.read_errors;
+    json!({
+        "source": t.source,
+        "sector_size": t.effective_sector_size(),
+        "ranges": t.ranges.len(),
+        "substituted_ranges": t.count(RangeKind::Substituted),
+        "unread_ranges": t.count(RangeKind::Unread),
+        "substituted_bytes": t.substituted_bytes(),
+        "unread_bytes": t.unread_bytes(),
+        "substituted_sectors": t.substituted_sectors(),
+        "unread_sectors": t.unread_sectors(),
+    })
 }
 
-/// Record how the acquisition ended, then copy the verified log and its head into
-/// the case directory: /run is lost at power-off, the case drive is not.
-pub fn finished(
+/// Details of the "acquisition_finished" record of a run with a report
+/// (pure): outcome, exit code, read-error summary, every digest, the report
+/// digests and the files.
+pub fn finished_details(report: &ForensicInfoReport, files: &ReportFiles) -> Map<String, Value> {
+    let mut d = Map::new();
+    let mut put = |k: &str, v: Value| {
+        d.insert(k.to_string(), v);
+    };
+    put("engine", json!(report.engine.tag()));
+    put("anchor", json!(report.audit.anchor));
+    put(
+        "outcome",
+        serde_json::to_value(report.outcome).unwrap_or_default(),
+    );
+    put("exit_code", json!(report.exit_code));
+    put("outcome_reason", json!(report.outcome_reason));
+    put("bytes_acquired", json!(report.bytes_acquired));
+    put("expected_bytes", json!(report.expected_bytes));
+    put("stop_reason", json!(report.stop_reason));
+    put("aborted", json!(report.aborted));
+    put("read_errors", read_error_summary(report));
+    put(
+        "acquisition_hashes",
+        serde_json::to_value(&report.acquisition_hashes).unwrap_or_default(),
+    );
+    put(
+        "image_hashes",
+        serde_json::to_value(&report.image_hashes).unwrap_or_default(),
+    );
+    put(
+        "verification",
+        serde_json::to_value(&report.verification).unwrap_or_default(),
+    );
+    put("identity_end_ok", json!(report.identity_check.end_ok));
+    put(
+        "write_protection",
+        report
+            .write_protection
+            .as_ref()
+            .map(|wp| json!({ "summary": wp.summary(), "nodes_set": wp.nodes_set }))
+            .unwrap_or(Value::Null),
+    );
+    put(
+        "capacity",
+        report
+            .capacity
+            .as_ref()
+            .map(|c| json!(c.summary()))
+            .unwrap_or(Value::Null),
+    );
+    for (key, snap) in [
+        ("smart_before", &report.smart_before),
+        ("smart_after", &report.smart_after),
+    ] {
+        put(
+            key,
+            snap.as_ref()
+                .map(|s| json!(s.summary.health.label()))
+                .unwrap_or(Value::Null),
+        );
+    }
+    put("report_file", json!(files.text.to_string_lossy()));
+    put("report_json_file", json!(files.json.to_string_lossy()));
+    put("report_sha256", json!(files.text_sha256));
+    put("report_json_sha256", json!(files.json_sha256));
+    put("files", json!(report.image_files));
+    put(
+        "auxiliary_files",
+        serde_json::to_value(&report.auxiliary_files).unwrap_or_default(),
+    );
+    put(
+        "piecewise",
+        serde_json::to_value(&report.piecewise).unwrap_or_default(),
+    );
+    put("audit_export", json!(report.audit.export_file));
+    d
+}
+
+/// Details of the "acquisition_finished" record of a run that ended by an
+/// error, without a report (pure).
+pub fn error_details(engine: EngineKind, err: &AcquisitionError) -> Map<String, Value> {
+    let mut d = Map::new();
+    d.insert("engine".into(), json!(engine.tag()));
+    d.insert(
+        "error_kind".into(),
+        serde_json::to_value(err.kind).unwrap_or_default(),
+    );
+    d.insert("outcome".into(), json!(err.kind.label()));
+    d.insert("exit_code".into(), json!(err.exit_code()));
+    d.insert("report_written".into(), json!(false));
+    d
+}
+
+/// Writes the "acquisition_finished" record exactly once: through
+/// [`report`](Self::report) or [`error`](Self::error), or, if the run ends
+/// any other way after "started" (panic unwinding, a cancelled future), when
+/// dropped. A record that cannot be written is a warning on the progress sink.
+#[derive(Debug)]
+pub struct FinishedGuard {
+    log: PathBuf,
+    device: DeviceIdentity,
+    engine: EngineKind,
+    anchor: Option<String>,
+    sink: ProgressSink,
+    armed: bool,
+}
+
+impl FinishedGuard {
+    pub fn new(
+        log: impl Into<PathBuf>,
+        device: DeviceIdentity,
+        engine: EngineKind,
+        anchor: Option<String>,
+        sink: ProgressSink,
+    ) -> Self {
+        Self {
+            log: log.into(),
+            device,
+            engine,
+            anchor,
+            sink,
+            armed: true,
+        }
+    }
+
+    fn event(
+        &self,
+        outcome: Outcome,
+        message: Option<String>,
+        details: Map<String, Value>,
+    ) -> Event {
+        let mut e = Event::new(TOOL, VERSION, action::ACQUISITION_FINISHED)
+            .device(self.device.clone())
+            .outcome(outcome, message);
+        e.details = details;
+        e.details
+            .entry("anchor")
+            .or_insert_with(|| json!(self.anchor));
+        e
+    }
+
+    fn write(&mut self, event: Event) -> Result<String, String> {
+        self.armed = false;
+        let r = append(&self.log, event);
+        if let Err(reason) = &r {
+            self.sink.warn(format!(
+                "the audit record \"acquisition_finished\" was not written: {reason}"
+            ));
+        }
+        r
+    }
+
+    /// The run produced a report (any outcome, aborted included).
+    pub fn report(
+        mut self,
+        report: &ForensicInfoReport,
+        files: &ReportFiles,
+    ) -> Result<String, String> {
+        let message = format!(
+            "{} (exit code {})",
+            report.outcome.label(),
+            report.exit_code
+        );
+        let event = self.event(Outcome::Ok, Some(message), finished_details(report, files));
+        self.write(event)
+    }
+
+    /// The run ended by an error after "started" without a report
+    /// (refusal, failure, or an abort before anything was written).
+    pub fn error(mut self, err: &AcquisitionError) -> Result<String, String> {
+        let event = self.event(
+            err.audit_outcome(),
+            Some(err.message.clone()),
+            error_details(self.engine, err),
+        );
+        self.write(event)
+    }
+}
+
+impl Drop for FinishedGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let message = if std::thread::panicking() {
+            "the acquisition ended by an internal error (panic) without a result"
+        } else {
+            "the acquisition ended without a result (cancelled)"
+        };
+        let mut details = Map::new();
+        details.insert("engine".into(), json!(self.engine.tag()));
+        details.insert("report_written".into(), json!(false));
+        details.insert(
+            "exit_code".into(),
+            json!(crate::models::outcome::exit_code::INTERNAL_ERROR),
+        );
+        let event = self.event(Outcome::Error, Some(message.into()), details);
+        let _ = self.write(event);
+    }
+}
+
+/// Record an explicit unmount of the source tree (§10): the mounts found,
+/// those unmounted, and the result.
+pub fn unmount(
+    log: &Path,
+    identity: &SourceIdentity,
+    mounts: &[String],
+    result: Result<&[String], &AcquisitionError>,
+) -> Result<String, String> {
+    let mut event = Event::new(TOOL, VERSION, action::UNMOUNT)
+        .device(identity.device_identity())
+        .detail("mounts_before", json!(mounts));
+    event = match result {
+        Ok(done) => event.detail("unmounted", json!(done)),
+        Err(e) => event
+            .detail(
+                "error_kind",
+                serde_json::to_value(e.kind).unwrap_or_default(),
+            )
+            .outcome(e.audit_outcome(), Some(e.message.clone())),
+    };
+    append(log, event)
+}
+
+/// Record a re-verification of an existing image (§13 Verify).
+pub fn image_verification(
+    log: &Path,
+    image: &Path,
+    result: &VerificationResult,
+    exit_code: i32,
+    details: Map<String, Value>,
+) -> Result<String, String> {
+    let mut event = Event::new(TOOL, VERSION, action::IMAGE_VERIFICATION);
+    event.details = details;
+    event
+        .details
+        .insert("image".into(), json!(image.to_string_lossy()));
+    event.details.insert(
+        "result".into(),
+        serde_json::to_value(result).unwrap_or_default(),
+    );
+    event.details.insert("exit_code".into(), json!(exit_code));
+    if let VerificationResult::Failed { reason } = result {
+        event = event.outcome(Outcome::Error, Some(reason.clone()));
+    }
+    append(log, event)
+}
+
+/// Record the start of a conversion (§13 Converter); the hash is the anchor
+/// of its report.
+pub fn conversion_started(
+    log: &Path,
+    source: &Path,
+    target: &Path,
+    details: Map<String, Value>,
+) -> Result<String, String> {
+    let mut event = Event::new(TOOL, VERSION, action::CONVERSION_STARTED);
+    event.details = details;
+    event
+        .details
+        .insert("source".into(), json!(source.to_string_lossy()));
+    event
+        .details
+        .insert("target".into(), json!(target.to_string_lossy()));
+    append(log, event)
+}
+
+/// Record how a conversion ended: `Ok(details)` (outcome, digests, report
+/// digests, files) or the error.
+pub fn conversion_finished(
+    log: &Path,
+    source: &Path,
+    target: &Path,
+    anchor: Option<&str>,
+    result: Result<Map<String, Value>, &AcquisitionError>,
+) -> Result<String, String> {
+    let mut event = Event::new(TOOL, VERSION, action::CONVERSION_FINISHED);
+    match result {
+        Ok(details) => event.details = details,
+        Err(e) => {
+            event = event
+                .detail(
+                    "error_kind",
+                    serde_json::to_value(e.kind).unwrap_or_default(),
+                )
+                .detail("exit_code", e.exit_code())
+                .outcome(e.audit_outcome(), Some(e.message.clone()));
+        }
+    }
+    event
+        .details
+        .insert("source".into(), json!(source.to_string_lossy()));
+    event
+        .details
+        .insert("target".into(), json!(target.to_string_lossy()));
+    event.details.insert("anchor".into(), json!(anchor));
+    append(log, event)
+}
+
+/// 0.1 engine records, until the engines run in `engines::session`.
+#[doc(hidden)]
+pub fn legacy_started(
     engine: &str,
     device: &BlockDevice,
-    output_dir: &std::path::Path,
+    config: &AcquisitionConfig,
+) -> Option<String> {
+    let event = Event::new(TOOL, VERSION, action::ACQUISITION_STARTED)
+        .device(device.device_identity())
+        .detail("engine", engine)
+        .detail(
+            "output_dir",
+            config.output_dir.to_string_lossy().to_string(),
+        );
+    append(&log_path(), event).ok()
+}
+
+/// 0.1 engine records, until the engines run in `engines::session`.
+#[doc(hidden)]
+pub fn legacy_finished(
+    engine: &str,
+    device: &BlockDevice,
+    output_dir: &Path,
     result: &Result<ForensicInfoReport, String>,
 ) {
-    let mut event = Event::new(TOOL, VERSION, "acquisition_finished")
-        .device(identity(device))
+    use sha2::{Digest, Sha256};
+    let mut event = Event::new(TOOL, VERSION, action::ACQUISITION_FINISHED)
+        .device(device.device_identity())
         .detail("engine", engine);
     let mut refused = false;
     match result {
@@ -66,26 +505,10 @@ pub fn finished(
                     serde_json::to_value(report.outcome).unwrap_or_default(),
                 )
                 .detail("exit_code", report.exit_code)
-                .detail("outcome_reason", report.outcome_reason.clone())
-                .detail("bytes_acquired", report.bytes_acquired)
-                .detail("expected_bytes", report.expected_bytes)
-                .detail(
-                    "read_errors",
-                    serde_json::json!({
-                        "ranges": report.read_errors.ranges.len(),
-                        "substituted_bytes": report.read_errors.substituted_bytes(),
-                        "unread_bytes": report.read_errors.unread_bytes(),
-                    }),
-                )
                 .detail(
                     "acquisition_hashes",
                     serde_json::to_value(&report.acquisition_hashes).unwrap_or_default(),
                 )
-                .detail(
-                    "image_hashes",
-                    serde_json::to_value(&report.image_hashes).unwrap_or_default(),
-                )
-                .detail("files", report.image_files.clone())
                 .detail(
                     "report_sha256",
                     hex::encode(Sha256::digest(report.render_text().as_bytes())),
@@ -109,15 +532,274 @@ pub fn finished(
             );
         }
     }
-    record(event);
-    // A refused acquisition writes nothing to its destination, which may well be
-    // the very disk the refusal protects
+    let _ = append(&log_path(), event);
     if !refused && output_dir.is_dir() {
-        if let Err(e) = audit::export(&audit::path(), output_dir) {
-            eprintln!(
-                "[!] WARNING: audit log not copied to {}: {e:#}",
-                output_dir.display()
+        let _ = dfcore::audit::export(&log_path(), output_dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::config::AcquisitionConfig;
+    use crate::models::identity::SerialSource;
+    use crate::models::info_report::HashResults;
+
+    fn identity() -> SourceIdentity {
+        let mut id = SourceIdentity {
+            path: "/dev/sdb".into(),
+            canonical_path: "/dev/sdb".into(),
+            kernel_name: "sdb".into(),
+            maj_min: Some("8:16".into()),
+            diskseq: Some(9),
+            size_bytes: 4096,
+            logical_sector_size: 512,
+            physical_sector_size: 512,
+            ..Default::default()
+        };
+        id.add_serial_candidate("SER9", SerialSource::VpdPage80);
+        id
+    }
+
+    fn case() -> CaseMetadata {
+        CaseMetadata {
+            case_number: "C1".into(),
+            evidence_number: "E1".into(),
+            examiner: "X".into(),
+            ..Default::default()
+        }
+    }
+
+    fn records(log: &Path) -> Vec<Value> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn started_record<'a>(
+        id: &'a SourceIdentity,
+        case: &'a CaseMetadata,
+        eff: &'a EffectiveConfig,
+        registry: &'a RegistryPresence,
+    ) -> StartedRecord<'a> {
+        StartedRecord {
+            engine: EngineKind::Raw,
+            identity: id,
+            case,
+            effective: eff,
+            output_dir: Path::new("/out"),
+            base_name: "c1_ea01_e1_SER9",
+            tool_source_path: "/dev/disk/by-diskseq/9",
+            destination: None,
+            registry,
+        }
+    }
+
+    #[test]
+    fn started_records_identity_and_config_and_gives_the_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let (id, case) = (identity(), case());
+        let eff = EffectiveConfig::build(&AcquisitionConfig::raw("/out"), Some(&id));
+        let info = started(
+            &log,
+            &started_record(&id, &case, &eff, &RegistryPresence::Absent),
+        )
+        .unwrap();
+        assert_eq!(info.status, AuditStatus::Written);
+        let recs = records(&log);
+        assert_eq!(recs[0]["hash"], json!(info.anchor));
+        assert_eq!(recs[0]["action"], "acquisition_started");
+        assert_eq!(recs[0]["device"]["maj_min"], "8:16");
+        assert_eq!(recs[0]["device"]["diskseq"], 9);
+        assert_eq!(
+            recs[0]["details"]["source"]["serial_source"],
+            "SCSI VPD page 0x80"
+        );
+        assert_eq!(recs[0]["details"]["effective_config"]["engine"], "raw");
+        assert_eq!(
+            recs[0]["details"]["tool_source_path"],
+            "/dev/disk/by-diskseq/9"
+        );
+    }
+
+    #[test]
+    fn unwritable_log_refuses_on_dfnix_and_warns_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, b"x").unwrap();
+        let log = blocker.join("audit.jsonl");
+        let (id, case) = (identity(), case());
+        let eff = EffectiveConfig::build(&AcquisitionConfig::raw("/out"), Some(&id));
+        let e = started(
+            &log,
+            &started_record(&id, &case, &eff, &RegistryPresence::Present),
+        )
+        .unwrap_err();
+        assert!(e.is_refusal());
+        assert!(e.message.contains("on dfnix"), "{e}");
+        let info = started(
+            &log,
+            &started_record(&id, &case, &eff, &RegistryPresence::Absent),
+        )
+        .unwrap();
+        assert!(info.anchor.is_none());
+        let AuditStatus::NotWritten { reason } = info.status else {
+            panic!()
+        };
+        assert!(reason.contains("cannot be written"), "{reason}");
+    }
+
+    #[test]
+    fn finished_guard_records_errors_by_kind_and_fires_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let sink = ProgressSink::disconnected();
+        let guard = FinishedGuard::new(
+            &log,
+            identity().device_identity(),
+            EngineKind::Ewf,
+            Some("a".into()),
+            sink.clone(),
+        );
+        guard
+            .error(&AcquisitionError::refused("cannot write-protect"))
+            .unwrap();
+        let guard = FinishedGuard::new(
+            &log,
+            identity().device_identity(),
+            EngineKind::Ewf,
+            None,
+            sink.clone(),
+        );
+        guard
+            .error(&AcquisitionError::failed("Refusing words are not refusals"))
+            .unwrap();
+        {
+            let _guard = FinishedGuard::new(
+                &log,
+                identity().device_identity(),
+                EngineKind::Raw,
+                Some("b".into()),
+                sink.clone(),
             );
         }
+        let recs = records(&log);
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0]["outcome"], "refused");
+        assert_eq!(recs[0]["details"]["error_kind"], "refused");
+        assert_eq!(recs[0]["details"]["exit_code"], 3);
+        assert_eq!(recs[0]["details"]["anchor"], "a");
+        assert_eq!(recs[1]["outcome"], "error");
+        assert_eq!(recs[1]["details"]["exit_code"], 4);
+        assert_eq!(recs[2]["outcome"], "error");
+        assert!(recs[2]["message"].as_str().unwrap().contains("cancelled"));
+        assert_eq!(recs[2]["details"]["anchor"], "b");
+        assert!(sink.warnings().is_empty());
+
+        // A record that cannot be written is a visible warning
+        let blocker = dir.path().join("f");
+        std::fs::write(&blocker, b"x").unwrap();
+        let guard = FinishedGuard::new(
+            blocker.join("log"),
+            identity().device_identity(),
+            EngineKind::Raw,
+            None,
+            sink.clone(),
+        );
+        assert!(guard.error(&AcquisitionError::failed("x")).is_err());
+        assert_eq!(sink.warnings().len(), 1);
+    }
+
+    #[test]
+    fn finished_details_carry_everything_the_report_knows() {
+        let id = identity();
+        let eff = EffectiveConfig::build(&AcquisitionConfig::raw("/out"), Some(&id));
+        let mut r = ForensicInfoReport::new(EngineKind::Raw, &case(), id, eff);
+        r.bytes_acquired = 4096;
+        r.read_errors.push(512, 512, RangeKind::Substituted);
+        r.acquisition_hashes = HashResults {
+            md5: Some("aa".into()),
+            ..Default::default()
+        };
+        r.image_files = vec!["/out/x.raw".into()];
+        r.apply_classification();
+        let files = ReportFiles {
+            text: "/out/x.info".into(),
+            json: "/out/x.info.json".into(),
+            text_sha256: "t".into(),
+            json_sha256: "j".into(),
+        };
+        let d = finished_details(&r, &files);
+        assert_eq!(d["outcome"], serde_json::to_value(r.outcome).unwrap());
+        assert_eq!(d["exit_code"], r.exit_code);
+        assert_eq!(d["read_errors"]["substituted_sectors"], 1);
+        assert_eq!(d["acquisition_hashes"]["md5"], "aa");
+        assert_eq!(d["report_sha256"], "t");
+        assert_eq!(d["report_json_sha256"], "j");
+        assert_eq!(d["files"][0], "/out/x.raw");
+    }
+
+    #[test]
+    fn other_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let id = identity();
+        let mounts = vec!["/mnt/a".to_string()];
+        unmount(&log, &id, &mounts, Ok(&mounts)).unwrap();
+        unmount(
+            &log,
+            &id,
+            &mounts,
+            Err(&AcquisitionError::refused("system mount")),
+        )
+        .unwrap();
+        image_verification(
+            &log,
+            Path::new("/case/x.E01"),
+            &VerificationResult::Failed {
+                reason: "SHA-1 not computed".into(),
+            },
+            4,
+            Map::new(),
+        )
+        .unwrap();
+        let anchor =
+            conversion_started(&log, Path::new("/a.raw"), Path::new("/b"), Map::new()).unwrap();
+        conversion_finished(
+            &log,
+            Path::new("/a.raw"),
+            Path::new("/b"),
+            Some(&anchor),
+            Err(&AcquisitionError::aborted("stop")),
+        )
+        .unwrap();
+        let recs = records(&log);
+        let actions: Vec<(&str, &str)> = recs
+            .iter()
+            .map(|r| {
+                (
+                    r["action"].as_str().unwrap(),
+                    r["outcome"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                ("unmount", "ok"),
+                ("unmount", "refused"),
+                ("image_verification", "error"),
+                ("conversion_started", "ok"),
+                ("conversion_finished", "error"),
+            ]
+        );
+        assert_eq!(recs[0]["details"]["unmounted"][0], "/mnt/a");
+        assert_eq!(recs[2]["details"]["exit_code"], 4);
+        assert_eq!(recs[4]["details"]["anchor"], json!(anchor));
+        assert_eq!(recs[4]["details"]["exit_code"], 8);
+        assert!(dfcore::audit::verify(&log).is_ok());
     }
 }
