@@ -300,7 +300,7 @@ fn buffer_to_svg(buffer: &Buffer, width_cells: u16, height_cells: u16) -> String
 }
 
 fn build_case_setup_app() -> App {
-    let mut app = App::new();
+    let mut app = App::with_devices(Vec::new());
     app.current_screen = Screen::CaseSetup;
     app.case_metadata = CaseMetadata {
         case_number: "VG-2026/4192".to_string(),
@@ -310,13 +310,14 @@ fn build_case_setup_app() -> App {
         examiner: "Det. J. Doe (#4192)".to_string(),
         description: "Samsung 970 EVO NVMe M.2 1TB".to_string(),
         notes: "/mnt/evidence/cases".to_string(),
+        ..Default::default()
     };
     app.active_field = 6; // FormField::Notes
     app.cursor_pos = app.case_metadata.notes.len();
 
-    app.target_dir_str = "/home/examiner/git/dfdisk".to_string();
+    app.target_dir_str = "/mnt/evidence/cases".to_string();
     app.config = AcquisitionConfig {
-        output_dir: std::path::PathBuf::from("/home/examiner/git/dfdisk"),
+        output_dir: std::path::PathBuf::from("/mnt/evidence/cases"),
         format: ImageFormat::E01,
         split_size: SplitSize::TwoGb,
         compression: CompressionLevel::Fast,
@@ -358,13 +359,13 @@ fn build_case_setup_app() -> App {
 }
 
 fn build_image_converter_app() -> App {
-    let mut app = App::new();
+    let mut app = App::with_devices(Vec::new());
     app.current_screen = Screen::Converter;
     app.conv_source_path = "/mnt/evidence/cases/suspect_disk.raw".to_string();
     app.conv_cursor_pos = app.conv_source_path.len();
     app.conv_active_field = 0; // ConverterField::SourcePath
     app.conv_to_e01 = true;
-    app.conv_target_dir = "/home/examiner/git/dfdisk".to_string();
+    app.conv_target_dir = "/mnt/evidence/cases".to_string();
     app.conv_status_msg = "Ready to convert images.".to_string();
 
     app

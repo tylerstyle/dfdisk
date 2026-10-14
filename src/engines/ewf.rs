@@ -56,7 +56,7 @@ impl EwfAcquireEngine {
         let instant_start = Instant::now();
 
         // Target path without extension (ewfacquire appends .E01 automatically)
-        let base_name = case.generate_base_filename(&device.display_serial());
+        let base_name = case.base_filename_checked(&device.display_serial())?;
         let target_path_without_ext = config.output_dir.join(&base_name);
         let target_str = target_path_without_ext.to_string_lossy().to_string();
 
@@ -73,14 +73,18 @@ impl EwfAcquireEngine {
         let mut cmd = Command::new("ewfacquire");
         cmd.arg("-u"); // Unattended mode (no prompts; overwrite protection is ours)
 
-        // Metadata flags
-        cmd.arg("-C").arg(case.effective_case());
-        cmd.arg("-E").arg(case.effective_evidence());
-        cmd.arg("-e").arg(case.effective_examiner());
-        cmd.arg("-D")
-            .arg(case.effective_description(&device.display_name()));
-        if !case.notes.trim().is_empty() {
-            cmd.arg("-N").arg(&case.notes);
+        // Metadata flags: the same sanitised values the .info records; empty
+        // optional fields are omitted, never filled with placeholders
+        cmd.arg("-C").arg(case.effective_case().unwrap_or_default());
+        cmd.arg("-E")
+            .arg(case.effective_evidence().unwrap_or_default());
+        cmd.arg("-e")
+            .arg(case.effective_examiner().unwrap_or_default());
+        if let Some(description) = case.effective_description() {
+            cmd.arg("-D").arg(description);
+        }
+        if let Some(notes) = case.ewf_header_notes() {
+            cmd.arg("-N").arg(notes);
         }
 
         // Format and compression

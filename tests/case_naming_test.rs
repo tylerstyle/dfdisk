@@ -10,6 +10,7 @@ fn test_evidence_filename_generation_format() {
         examiner: "Special Agent Smith".to_string(),
         description: "Seized NVMe Drive".to_string(),
         notes: "Acquired at scene".to_string(),
+        ..Default::default()
     };
 
     let base = meta.generate_base_filename("WD-WCC4M123456");
@@ -162,6 +163,7 @@ fn test_multibyte_international_utf8() {
             examiner: "Examiner Müller".to_string(),
             description: "Cross-border forensic acquisition".to_string(),
             notes: "".to_string(),
+            ..Default::default()
         };
 
         // Generation must not panic
@@ -182,26 +184,42 @@ fn test_multibyte_international_utf8() {
 }
 
 #[test]
-fn test_metadata_defaults() {
+fn test_metadata_defaults_invent_nothing() {
     let default_meta = CaseMetadata::default();
 
-    assert_eq!(default_meta.effective_case(), "CASE001");
+    assert_eq!(default_meta.effective_case(), None);
+    assert_eq!(default_meta.effective_evidence(), None);
+    assert_eq!(default_meta.effective_examiner(), None);
+    assert_eq!(default_meta.effective_authority(), None);
+    assert_eq!(default_meta.effective_description(), None);
+    // The EA number defaults to the "01" numbering convention
     assert_eq!(default_meta.effective_ea(), "01");
-    assert_eq!(default_meta.effective_evidence(), "cf01");
-    assert_eq!(
-        default_meta.effective_authority(),
-        "Law Enforcement / DFIR Unit"
-    );
-    assert_eq!(default_meta.effective_examiner(), "Forensic Examiner");
-    assert_eq!(
-        default_meta.effective_description("Fallback Device"),
-        "Fallback Device"
-    );
+    assert!(default_meta.validate_required().is_err());
 
-    assert_eq!(default_meta.sanitized_case(), "case001");
+    assert_eq!(default_meta.sanitized_case(), "unknown");
     assert_eq!(default_meta.formatted_ea(), "ea01");
-    assert_eq!(default_meta.formatted_evidence(), "cf01");
+    assert_eq!(default_meta.formatted_evidence(), "unknown");
 
     let base = default_meta.generate_base_filename("");
-    assert_eq!(base, "case001_ea01_cf01_NOSERIAL");
+    assert_eq!(base, "unknown_ea01_unknown_NOSERIAL");
+}
+
+#[test]
+fn test_documented_naming_example() {
+    // README: `VG-2026/4192` + `01` + `SSD01` + `EXNVME0000004192F`
+    let meta = CaseMetadata {
+        case_number: "VG-2026/4192".to_string(),
+        location_ea: "01".to_string(),
+        evidence_number: "SSD01".to_string(),
+        examiner: "J. Doe".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(
+        meta.generate_filename("EXNVME0000004192F", "e01"),
+        "vg_2026_4192_ea01_ssd01_EXNVME0000004192F.e01"
+    );
+    assert_eq!(
+        meta.base_filename_checked("EXNVME0000004192F").unwrap(),
+        "vg_2026_4192_ea01_ssd01_EXNVME0000004192F"
+    );
 }

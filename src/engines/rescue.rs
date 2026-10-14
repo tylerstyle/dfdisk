@@ -54,7 +54,7 @@ impl RescueAcquireEngine {
         let start_time = Utc::now();
         let instant_start = Instant::now();
 
-        let base_name = case.generate_base_filename(&device.display_serial());
+        let base_name = case.base_filename_checked(&device.display_serial())?;
         let raw_filename = format!("{}.raw", base_name);
         let map_filename = format!("{}.map", base_name);
 

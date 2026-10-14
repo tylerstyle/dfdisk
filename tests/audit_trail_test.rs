@@ -36,6 +36,7 @@ fn case() -> CaseMetadata {
         examiner: "Examiner".into(),
         description: "Audit trail".into(),
         notes: "".into(),
+        ..Default::default()
     }
 }
 

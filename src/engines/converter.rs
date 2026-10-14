@@ -38,10 +38,17 @@ impl FormatConverter {
 
         let mut cmd = Command::new("ewfacquire");
         cmd.arg("-u");
-        cmd.arg("-C").arg(&case_meta.case_number);
-        cmd.arg("-E").arg(&case_meta.evidence_number);
-        cmd.arg("-e").arg(&case_meta.examiner);
-        cmd.arg("-D").arg(&case_meta.description);
+        // Only values that were given; nothing is made up for the header
+        for (flag, value) in [
+            ("-C", case_meta.effective_case()),
+            ("-E", case_meta.effective_evidence()),
+            ("-e", case_meta.effective_examiner()),
+            ("-D", case_meta.effective_description()),
+        ] {
+            if let Some(value) = value {
+                cmd.arg(flag).arg(value);
+            }
+        }
         cmd.arg("-f").arg("encase6");
         cmd.arg("-c").arg(compression.as_ewf_arg());
         cmd.arg("-S").arg(split_size.as_ewf_arg());

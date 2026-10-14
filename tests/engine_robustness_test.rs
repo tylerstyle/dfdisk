@@ -158,6 +158,7 @@ fn test_truthful_forensic_reporting_damaged_media_rescue() {
             examiner: "Forensic Specialist".to_string(),
             description: "Damaged HDD with bad sectors".to_string(),
             notes: "DDRescue resilient pass".to_string(),
+            ..Default::default()
         },
         device: BlockDevice {
             name: "sdd".to_string(),
@@ -268,6 +269,7 @@ async fn test_raw_acquisition_end_to_end() {
         examiner: "Forensic Specialist".to_string(),
         description: "Test Raw Acquisition".to_string(),
         notes: "Automated verification test".to_string(),
+        ..Default::default()
     };
 
     let out_dir = temp_dir.join("evidence_output");
@@ -337,6 +339,7 @@ async fn test_raw_acquisition_abort_reactivity() {
         examiner: "Examiner".to_string(),
         description: "Test Abort".to_string(),
         notes: "".to_string(),
+        ..Default::default()
     };
 
     let out_dir = temp_dir.join("evidence_output");
@@ -380,6 +383,7 @@ async fn test_raw_acquisition_destination_exists_refusal() {
         examiner: "Examiner".to_string(),
         description: "Test".to_string(),
         notes: "".to_string(),
+        ..Default::default()
     };
     let device = file_device(&source_disk, 18, Some("SER001"));
     let config = AcquisitionConfig {
@@ -420,6 +424,7 @@ async fn test_raw_acquisition_source_destination_collision() {
         examiner: "Examiner".to_string(),
         description: "Test".to_string(),
         notes: "".to_string(),
+        ..Default::default()
     };
     let serial = "COLLIDE01";
     let target_filename = case.generate_filename(serial, "raw");
@@ -469,6 +474,7 @@ async fn test_raw_acquisition_incomplete_size_mismatch() {
         examiner: "Examiner".to_string(),
         description: "Test".to_string(),
         notes: "".to_string(),
+        ..Default::default()
     };
     let device = file_device(&source_disk, 1000, Some("SER_MISMATCH"));
     let config = AcquisitionConfig {
@@ -511,6 +517,7 @@ async fn test_rescue_stale_files_refusal_without_resume() {
         examiner: "Examiner".to_string(),
         description: "Test".to_string(),
         notes: "".to_string(),
+        ..Default::default()
     };
     let device = file_device(&source_disk, 6, Some("RESCUE001"));
     let config = AcquisitionConfig {

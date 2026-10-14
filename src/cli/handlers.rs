@@ -272,6 +272,7 @@ pub async fn handle_acquire(args: AcquireArgs) -> Result<(), Box<dyn std::error:
         examiner: args.examiner,
         description: args.description,
         notes: args.notes,
+        ..Default::default()
     };
 
     let compression = match args.compression {
