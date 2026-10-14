@@ -6,6 +6,7 @@ use std::path::PathBuf;
     name = "dfdisk",
     author = "dfdisk DFIR contributors",
     version = env!("CARGO_PKG_VERSION"),
+    long_version = crate::models::provenance::LONG_VERSION,
     about = "Modern forensic disk imaging, rescue, and format conversion CLI/TUI",
     long_about = "A high-performance forensic disk imager and evidence management tool.\nSupports E01 (Expert Witness Format) and RAW imaging, damaged media rescue (ddrescue),\nauto-sanitized forensic naming, cryptographic verification (MD5/SHA1/SHA256),\nand forensic .info certificate generation."
 )]

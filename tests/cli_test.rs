@@ -22,14 +22,23 @@ fn test_cli_version() {
     );
     assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
 
-    // Test short flag -V
+    // --version names the source revisions of dfdisk and dfcore
+    assert!(stdout.contains("dfdisk git revision: "), "{stdout}");
+    assert!(stdout.contains("dfcore "), "{stdout}");
+    assert!(stdout.contains(" git revision: "), "{stdout}");
+
+    // Short flag -V prints the version line only
     let output_short = Command::new(BIN)
         .arg("-V")
         .output()
         .expect("Failed to execute dfdisk -V");
     assert!(output_short.status.success());
     let stdout_short = String::from_utf8_lossy(&output_short.stdout);
-    assert_eq!(stdout, stdout_short);
+    assert_eq!(
+        stdout_short,
+        format!("dfdisk {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(stdout.lines().next(), stdout_short.lines().next());
 }
 
 #[test]

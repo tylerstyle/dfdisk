@@ -15,7 +15,11 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
-        dfdisk = pkgs.callPackage ./package.nix { dfcoreSrc = dfcore; };
+        dfdisk = pkgs.callPackage ./package.nix {
+          dfcoreSrc = dfcore;
+          dfdiskRev = self.rev or self.dirtyRev or null;
+          dfcoreRev = dfcore.rev or null;
+        };
       in
       {
         packages = {

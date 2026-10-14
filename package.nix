@@ -10,6 +10,10 @@
 , systemd
   # dfcore is a sibling path dependency (../dfcore); flakes pass their input
 , dfcoreSrc ? ../dfcore
+  # Source revisions embedded in the binary and every report (`dfdisk --version`);
+  # the flake passes its own and the dfcore input's revision
+, dfdiskRev ? null
+, dfcoreRev ? null
 }:
 
 let
@@ -18,6 +22,7 @@ let
     fileset = lib.fileset.unions [
       ./Cargo.toml
       ./Cargo.lock
+      ./build.rs
       ./src
       ./tests
       ./README.md
@@ -47,6 +52,12 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   cargoLock = {
     lockFile = ./Cargo.lock;
+  };
+
+  # build.rs cannot run git in the sandbox: take the revisions from here
+  env = {
+    DFDISK_GIT_REV = if dfdiskRev != null then dfdiskRev else "unknown";
+    DFCORE_GIT_REV = if dfcoreRev != null then dfcoreRev else "unknown";
   };
 
   nativeBuildInputs = [
