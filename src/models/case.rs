@@ -83,31 +83,52 @@ pub fn or_not_provided(value: Option<String>) -> String {
     value.unwrap_or_else(|| NOT_PROVIDED.to_string())
 }
 
+/// JSON form of an optional case field: an empty value is `null` (not `""`),
+/// and `null` or a missing key reads back as empty. Text reports show
+/// "(not provided)" instead.
+mod empty_as_null {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &str, s: S) -> Result<S::Ok, S::Error> {
+        if value.is_empty() {
+            s.serialize_none()
+        } else {
+            s.serialize_some(value)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+    }
+}
+
+/// Case and chain-of-custody values. In JSON (the `.info.json` report), an
+/// empty optional field is `null`; required fields are always strings.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaseMetadata {
     /// Required
     pub case_number: String,
     /// EA / location number; "01" when empty
-    #[serde(default)]
+    #[serde(default, with = "empty_as_null")]
     pub location_ea: String,
     /// Required
     pub evidence_number: String,
-    #[serde(default)]
+    #[serde(default, with = "empty_as_null")]
     pub authority: String,
     /// Required
     pub examiner: String,
-    #[serde(default)]
+    #[serde(default, with = "empty_as_null")]
     pub description: String,
-    #[serde(default)]
+    #[serde(default, with = "empty_as_null")]
     pub notes: String,
     /// Chain of custody: number of the evidence seal
-    #[serde(default)]
+    #[serde(default, with = "empty_as_null")]
     pub seal_number: String,
     /// Chain of custody: when the evidence was seized (free text)
-    #[serde(default)]
+    #[serde(default, with = "empty_as_null")]
     pub seizure_time: String,
     /// Chain of custody: where the evidence was seized
-    #[serde(default)]
+    #[serde(default, with = "empty_as_null")]
     pub seizure_location: String,
 }
 
@@ -464,6 +485,31 @@ mod tests {
         );
         assert_eq!(composed.sanitized_case(), "caf\u{e9}");
         assert_eq!(decomposed.formatted_evidence(), "\u{e4}1");
+    }
+
+    #[test]
+    fn empty_optional_fields_serialise_as_null() {
+        let meta = CaseMetadata {
+            authority: "Police".into(),
+            ..full()
+        };
+        let json = serde_json::to_value(&meta).unwrap();
+        assert_eq!(json["authority"], "Police");
+        assert_eq!(json["case_number"], "VG12345/26");
+        assert!(json["notes"].is_null());
+        assert!(json["seal_number"].is_null());
+        assert_eq!(serde_json::from_value::<CaseMetadata>(json).unwrap(), meta);
+        // Required fields stay strings even when empty; null optional fields
+        // and missing keys read back as empty
+        let empty = serde_json::to_value(CaseMetadata::default()).unwrap();
+        assert_eq!(empty["case_number"], "");
+        assert!(empty["location_ea"].is_null());
+        let parsed: CaseMetadata = serde_json::from_str(
+            r#"{"case_number":"C","evidence_number":"E","examiner":"X","notes":null}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.notes, "");
+        assert_eq!(parsed.authority, "");
     }
 
     #[test]

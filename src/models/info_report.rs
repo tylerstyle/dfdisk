@@ -1338,6 +1338,34 @@ mod tests {
     }
 
     #[test]
+    fn empty_optional_case_values_are_null_in_json() {
+        let r = verified();
+        let json: serde_json::Value = serde_json::from_str(&r.to_json()).unwrap();
+        let case = &json["case_metadata"];
+        for field in [
+            "authority",
+            "description",
+            "notes",
+            "seal_number",
+            "seizure_time",
+            "seizure_location",
+        ] {
+            assert!(case[field].is_null(), "{field}: {case}");
+        }
+        assert_eq!(case["case_number"], "CASE-1");
+        assert_eq!(case["evidence_number"], "EV1");
+        assert_eq!(case["examiner"], "Examiner One");
+        assert_eq!(case["location_ea"], "01");
+        // The text report still says "(not provided)", and the JSON reads back
+        assert!(r
+            .render_text()
+            .contains("Seal Number           : (not provided)"));
+        let back = ForensicInfoReport::from_json(&r.to_json()).unwrap();
+        assert_eq!(back.case_metadata, r.case_metadata);
+        assert_eq!(back.case_metadata.authority, "");
+    }
+
+    #[test]
     fn values_are_sanitised_in_text_but_exact_in_json() {
         let mut r = verified();
         r.source.model = Some("Evil\u{1b}[2J\nModel".into());
