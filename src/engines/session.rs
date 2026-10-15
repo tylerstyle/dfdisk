@@ -1119,15 +1119,16 @@ impl ImageFlush {
         r
     }
 
-    /// The image verification once the flush is taken into account: an
-    /// image that is not durable fails verification (a mismatch stays a
-    /// mismatch, an aborted run stays not verified).
+    /// The image verification once the flush is taken into account (only
+    /// for a verification that ran; an aborted run stays not verified): an
+    /// image that is not durable fails verification, also a rescue image
+    /// that had nothing to be compared with; a mismatch stays a mismatch.
     fn apply(&self, image: VerificationResult) -> VerificationResult {
         if self.not_durable.is_empty() {
             return image;
         }
         match image {
-            VerificationResult::Mismatched { .. } | VerificationResult::NotPossible { .. } => image,
+            VerificationResult::Mismatched { .. } => image,
             _ => VerificationResult::Failed {
                 reason: format!(
                     "the image could not be flushed durably to the destination: {}",
@@ -1437,7 +1438,11 @@ async fn acquire_phase(
         sink.phase(AcquisitionStatus::Verifying, "Verifying the written image");
         host.verify(&ctx, &out).await
     };
-    let image_result = flush.apply(image_result);
+    let image_result = if verify_ran {
+        flush.apply(image_result)
+    } else {
+        image_result
+    };
     if stop.is_aborted() {
         out.aborted = true;
     }

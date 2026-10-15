@@ -1211,6 +1211,27 @@ async fn an_image_that_cannot_be_flushed_is_never_verified() {
         .method
         .ends_with("after fsync and page-cache eviction of the image"));
 
+    // A rescue image (nothing to compare with) that cannot be fsynced is
+    // VERIFICATION FAILED, not COMPLETE, NOT VERIFIED; a matching second read
+    // of the source does not change that
+    for verify_source in [false, true] {
+        let mut fake = Fake::new();
+        fake.fsync_fail = Some(".raw");
+        fake.engine = Some(rescue_engine(fake.data.clone()));
+        let config = AcquisitionConfig {
+            verify_source,
+            smart: SmartPolicy::Off,
+            ..AcquisitionConfig::rescue(fake.out())
+        };
+        let report = run_fake(&fake, config).await.0.unwrap();
+        assert_eq!(
+            report.outcome,
+            Outcome::VerificationFailed,
+            "{}",
+            report.outcome_reason
+        );
+    }
+
     // An aborted run never claims a verification method
     let mut fake = Fake::new();
     fake.fsync_fail = Some(".raw");
