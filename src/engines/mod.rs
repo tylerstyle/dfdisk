@@ -13,7 +13,6 @@ pub mod rescue;
 pub mod session;
 pub mod verify;
 
-pub use converter::FormatConverter;
 pub use error::{AcquisitionError, AcquisitionResult, ErrorKind};
 pub use hasher::MultiHasher;
 pub use progress::ProgressSink;
