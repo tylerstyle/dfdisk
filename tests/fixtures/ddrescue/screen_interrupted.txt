@@ -1,0 +1,28 @@
+GNU ddrescue 1.30
+Press Ctrl-C to interrupt
+
+
+
+
+
+
+[A[A[A[A[A[A     ipos:        0 B, non-trimmed:        0 B,   current rate:       0 B/s
+     opos:        0 B, non-scraped:        0 B,   average rate:       0 B/s
+non-tried:    4194 kB,  bad-sector:        0 B,     error rate:       0 B/s
+  rescued:        0 B,   bad areas:          0,       run time:          0s
+pct rescued:    0.00%, read errors:          0, remaining time:         n/a
+                               time since last successful read:         n/a
+Copying non-tried blocks... Pass 1 (forwards)[A[A[A[A[A[A     ipos:   327680 B, non-trimmed:        0 B,   current rate:    327 kB/s
+     opos:   327680 B, non-scraped:        0 B,   average rate:    327 kB/s
+non-tried:    3866 kB,  bad-sector:        0 B,     error rate:       0 B/s
+  rescued:   327680 B,   bad areas:          0,       run time:          1s
+pct rescued:    7.81%, read errors:          0, remaining time:         n/a
+                               time since last successful read:          0s
+Copying non-tried blocks... Pass 1 (forwards)[A[A[A[A[A[A     ipos:   655360 B, non-trimmed:        0 B,   current rate:    327 kB/s
+     opos:   655360 B, non-scraped:        0 B,   average rate:    327 kB/s
+non-tried:    3538 kB,  bad-sector:        0 B,     error rate:       0 B/s
+  rescued:   655360 B,   bad areas:          0,       run time:          2s
+pct rescued:   15.62%, read errors:          0, remaining time:         11s
+                               time since last successful read:          0s
+
+  Interrupted by user
