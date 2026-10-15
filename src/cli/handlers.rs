@@ -150,6 +150,14 @@ pub fn device_table(devices: &[BlockDevice], with_smart: bool) -> String {
                 sanitize_line(reason)
             ));
         }
+        if let crate::models::device::DeviceSafety::SystemDisk(reasons) = &d.safety {
+            if !reasons.is_empty() {
+                out.push_str(&format!(
+                    "    running system: {}\n",
+                    sanitize_line(&reasons.join("; "))
+                ));
+            }
+        }
         for p in &d.partitions {
             let mut state = Vec::new();
             if let Some(m) = &p.mountpoint {
@@ -577,6 +585,15 @@ mod tests {
         assert!(t.contains("/dev/sdb1"), "{t}");
         assert!(t.contains("mounted at /media/x"), "{t}");
         assert!(t.contains("protected by the dfnix registry"), "{t}");
+        let system = BlockDevice {
+            safety: DeviceSafety::SystemDisk(vec!["/dev/sda2 mounted at /".into()]),
+            ..devices[0].clone()
+        };
+        let t2 = device_table(&[system], false);
+        assert!(
+            t2.contains("running system: /dev/sda2 mounted at /"),
+            "{t2}"
+        );
         assert!(t.contains("1 GiB"), "{t}");
         assert_eq!(badges(&BlockDevice::default()), "-");
     }
