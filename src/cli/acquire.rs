@@ -289,7 +289,7 @@ pub async fn handle_acquire(
     let case = case_from_args(&args.case);
     validate_acquisition(&config, &case)?;
     let source = resolve_argument(&args.device)?;
-    let device = select_device(&source, DeviceScanner::scan_devices)?;
+    let device = select_device(&source, DeviceScanner::scan)?;
     let base_name = case
         .base_filename_checked(&device.display_serial())
         .map_err(AcquisitionError::usage)?;
@@ -335,6 +335,9 @@ async fn auto_unmount(
                 device.path
             ))
         })?;
+    // Unmount only the device that was selected
+    id.same_attachment(&device.device_identity())
+        .map_err(AcquisitionError::refused)?;
     let mounted = {
         let id = id.clone();
         tokio::task::spawn_blocking(move || {
@@ -355,13 +358,11 @@ async fn auto_unmount(
         .await
         .map_err(|e| AcquisitionError::failed(format!("the unmount stopped: {e}")))??;
     for m in &result.unmounted {
-        console.say(&format!("[+] unmounted {m}"));
+        console.say(&format!("[+] unmounted {}", sanitize_line(m)));
     }
-    if !result.holders.is_empty() {
-        console.note(&format!(
-            "[!] devices stacked on the source stay open (not closed by dfdisk): {}",
-            result.holders.join(", ")
-        ));
+    // The notes name the holders left open (dfdisk does not close them)
+    for n in &result.notes {
+        console.note(&format!("[!] {}", sanitize_line(n)));
     }
     Ok(result.unmounted)
 }
@@ -696,7 +697,7 @@ pub async fn handle_check(
     let config = config_from_options(&args.options)?;
     let case = case_from_args(&args.case);
     let source = resolve_argument(&args.device)?;
-    let device = select_device(&source, DeviceScanner::scan_devices)?;
+    let device = select_device(&source, DeviceScanner::scan)?;
     let request = AcquisitionRequest::new(device, case, config);
     console.note(&format!(
         "[*] Checking {} (nothing is written or changed)",

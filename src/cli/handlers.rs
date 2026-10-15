@@ -216,12 +216,18 @@ pub async fn handle_unmount(args: UnmountArgs, console: &Console) -> Result<i32,
         console.data(
             &serde_json::to_string_pretty(&json!({
                 "device": device,
+                "mounts_before": result.mounts_before,
                 "unmounted": result.unmounted,
                 "holders": result.holders,
                 "audit_record": result.audit_hash,
+                "audit_error": result.audit_error,
+                "notes": result.notes,
             }))
             .unwrap_or_default(),
         );
+        for n in &result.notes {
+            console.note(&format!("[!] {}", sanitize_line(n)));
+        }
         return Ok(exit_code::VERIFIED);
     }
     if result.unmounted.is_empty() {
@@ -230,14 +236,17 @@ pub async fn handle_unmount(args: UnmountArgs, console: &Console) -> Result<i32,
     for m in &result.unmounted {
         console.data(&format!("[+] Unmounted {}", sanitize_line(m)));
     }
-    if !result.holders.is_empty() {
-        console.data(&format!(
-            "[!] Devices stacked on {device} stay open (dfdisk does not close them): {}",
-            result.holders.join(", ")
-        ));
+    // The notes name the holders left open (dfdisk does not close them)
+    for n in &result.notes {
+        console.data(&format!("[!] {}", sanitize_line(n)));
     }
-    if let Some(h) = &result.audit_hash {
-        console.data(&format!("[+] Audit record: {h}"));
+    match (&result.audit_hash, &result.audit_error) {
+        (Some(h), _) => console.data(&format!("[+] Audit record: {h}")),
+        (None, Some(e)) => console.data(&format!(
+            "[!] The unmount was NOT recorded in the audit log: {}",
+            sanitize_line(e)
+        )),
+        (None, None) => {}
     }
     Ok(exit_code::VERIFIED)
 }

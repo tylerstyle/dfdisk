@@ -2602,18 +2602,22 @@ impl App {
                             Level::Info,
                             if res.unmounted.is_empty() {
                                 format!("Nothing was mounted on {path}.")
-                            } else {
+                            } else if res.audit_hash.is_some() {
                                 format!("Unmounted (audited): {}", res.unmounted.join(", "))
+                            } else {
+                                format!("Unmounted: {}", res.unmounted.join(", "))
                             },
                         );
-                        if !res.holders.is_empty() {
-                            self.notify(
-                                Level::Warning,
-                                format!(
-                                    "Still open on {path} (reported, not closed): {}",
-                                    res.holders.join(", ")
-                                ),
-                            );
+                        for note in &res.notes {
+                            // The audit failure is among the notes: an error
+                            let level = if res.audit_error.is_some()
+                                && note.contains("NOT recorded in the audit log")
+                            {
+                                Level::Error
+                            } else {
+                                Level::Warning
+                            };
+                            self.notify(level, note.clone());
                         }
                         self.unmounted = res.unmounted;
                         self.unmounted_key = Some(key.clone());
