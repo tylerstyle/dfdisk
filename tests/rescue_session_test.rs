@@ -100,10 +100,14 @@ fn rescue_config(out: &Path) -> AcquisitionConfig {
     }
 }
 
+/// Run the session; with `abort_when_mapped`, abort shortly after ddrescue
+/// wrote its map into that directory (a fixed delay raced with a slow
+/// session start under load: an abort before ddrescue wrote anything is an
+/// error, not a report).
 async fn run_with_abort(
     device: BlockDevice,
     config: AcquisitionConfig,
-    abort_after: Option<Duration>,
+    abort_when_mapped: Option<PathBuf>,
 ) -> Result<ForensicInfoReport, AcquisitionError> {
     audit_sandbox();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressTelemetry>(1000);
@@ -115,10 +119,22 @@ async fn run_with_abort(
         t
     });
     let abort = Arc::new(AtomicBool::new(false));
-    if let Some(delay) = abort_after {
+    if let Some(dir) = abort_when_mapped {
         let flag = abort.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
+            for _ in 0..1500 {
+                let mapped = std::fs::read_dir(&dir).is_ok_and(|rd| {
+                    rd.flatten().any(|e| {
+                        e.file_name().to_string_lossy().ends_with(".map")
+                            && e.metadata().is_ok_and(|m| m.len() > 0)
+                    })
+                });
+                if mapped {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
             flag.store(true, Ordering::SeqCst);
         });
     }
@@ -365,18 +381,15 @@ async fn an_aborted_rescue_resumes_with_its_sessions_listed() {
     }
     let tmp = scratch();
     let size = 4 * MIB;
-    // 256 KiB/s: the 4 MiB source takes 16 s; abort after 1.5 s
+    // 256 KiB/s: the 4 MiB source takes 16 s; abort 0.5 s after the map
+    // appears
     let args = format!("-Z 262144 -H {}", fixture(TESTMODE_4MIB).display());
     let (src, data) = source(tmp.path(), size, Some(args));
     let out = tmp.path().join("out");
     let device = file_device(&src, size as u64, Some("RESUME01"));
-    let report = run_with_abort(
-        device.clone(),
-        rescue_config(&out),
-        Some(Duration::from_millis(1500)),
-    )
-    .await
-    .unwrap();
+    let report = run_with_abort(device.clone(), rescue_config(&out), Some(out.clone()))
+        .await
+        .unwrap();
     assert_eq!(
         report.outcome,
         Outcome::Aborted,
@@ -459,6 +472,15 @@ async fn an_aborted_rescue_resumes_with_its_sessions_listed() {
         notes.contains("the source matches the identity recorded at the first start"),
         "{notes}"
     );
+    // R-6: the identity record is the one the previous report lists
+    let identity = out.join(format!("{}.identity.json", resumed.base_name));
+    let identity_sha = sha256_file(&identity).unwrap();
+    assert!(
+        notes.contains(&format!(
+            "(SHA-256 {identity_sha}) is the one the report of the last session"
+        )),
+        "{notes}"
+    );
     assert!(
         notes.contains(&format!(
             "(SHA-256 {first_map_sha}) is the map the report of session 1 lists"
@@ -468,6 +490,87 @@ async fn an_aborted_rescue_resumes_with_its_sessions_listed() {
     let text = resumed.render_text();
     assert!(text.contains("Earlier Session 1"), "{text}");
     assert!(text.contains("Resumed"), "{text}");
+}
+
+/// R-2: a session killed after ddrescue wrote data but before it saved its
+/// map leaves source data in areas the map lists as not tried; when the
+/// resumed session finds them unreadable, ddrescue marks them bad and never
+/// writes them. The report says bad sectors are zeros in the image: dfdisk
+/// makes that true.
+#[tokio::test]
+async fn bad_areas_hold_zeros_after_a_killed_session_is_resumed() {
+    if !ddrescue_wrapper() {
+        return;
+    }
+    let tmp = scratch();
+    let (src, data) = source(tmp.path(), MIB, None);
+    let out = tmp.path().join("out");
+    let device = file_device(&src, MIB as u64, Some("KILLED01"));
+    let first = run(device.clone(), rescue_config(&out)).await.unwrap();
+    assert_eq!(first.outcome, Outcome::CompleteUnverified);
+    // The map as a killed session can leave it: the image holds the data of
+    // these areas, the map lists them as not tried
+    let map = out.join(format!("{}.map", first.base_name));
+    std::fs::write(
+        &map,
+        "# Mapfile. Created by GNU ddrescue version 1.30\n\
+         # current_pos  current_status  current_pass\n\
+         0x00010000     ?               1\n\
+         #      pos        size  status\n\
+         0x00000000  0x00010000  +\n\
+         0x00010000  0x00000400  ?\n\
+         0x00010400  0x0007FC00  +\n\
+         0x00090000  0x00000200  ?\n\
+         0x00090200  0x0006FE00  +\n",
+    )
+    .unwrap();
+    assert_eq!(image_of(&first), data, "the image holds the whole source");
+    // Now these areas cannot be read
+    std::fs::write(
+        tmp.path().join("src.bin.ddrescue-args"),
+        format!("-H {}", fixture(TESTMODE_BAD_MIDDLE).display()),
+    )
+    .unwrap();
+    let config = AcquisitionConfig {
+        resume: true,
+        ..rescue_config(&out)
+    };
+    let resumed = run(device, config).await.unwrap();
+    assert_eq!(
+        resumed.outcome,
+        Outcome::CompletedWithReadErrors,
+        "{}",
+        resumed.outcome_reason
+    );
+    let saved = std::fs::read_to_string(&map).unwrap();
+    assert!(
+        saved.contains("0x00010000  0x00000400  -"),
+        "ddrescue marked the area bad:\n{saved}"
+    );
+    let image = image_of(&resumed);
+    assert_eq!(image.len(), MIB);
+    assert!(image[0x10000..0x10400].iter().all(|b| *b == 0));
+    assert!(image[0x90000..0x90200].iter().all(|b| *b == 0));
+    assert_eq!(image[..0x10000], data[..0x10000]);
+    assert_eq!(image[0x10400..0x90000], data[0x10400..0x90000]);
+    assert_eq!(image[0x90200..], data[0x90200..]);
+    let notes = resumed.notes.join("\n");
+    assert!(
+        notes.contains("dfdisk wrote zeros over the 2 bad-sector areas of the map inside the image (1536 bytes)"),
+        "{notes}"
+    );
+    assert!(
+        notes.contains("3 sectors (512-byte) held other data before"),
+        "{notes}"
+    );
+    // The digests describe the zeros
+    let mut expected = data.clone();
+    expected[0x10000..0x10400].fill(0);
+    expected[0x90000..0x90200].fill(0);
+    assert_eq!(
+        resumed.image_hashes.md5.as_deref(),
+        Some(hex::encode(<md5::Md5 as md5::Digest>::digest(&expected)).as_str())
+    );
 }
 
 #[tokio::test]
@@ -526,6 +629,20 @@ async fn a_resume_on_another_source_is_refused_before_anything_is_written() {
         "{e}"
     );
     assert_eq!(snapshot(&out), before);
+
+    // R-6: an identity record changed after the last report (here: the same
+    // content re-serialised) is not trusted
+    std::fs::write(&src, vec![0xEEu8; MIB]).unwrap();
+    let record = out.join(format!("{base}.identity.json"));
+    let original = std::fs::read_to_string(&record).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&original).unwrap();
+    std::fs::write(&record, serde_json::to_string(&value).unwrap()).unwrap();
+    let changed = snapshot(&out);
+    let e = run(device.clone(), resume.clone()).await.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Refused, "{e}");
+    assert!(e.message.contains("changed or replaced"), "{e}");
+    assert_eq!(snapshot(&out), changed, "a refused resume changes nothing");
+    std::fs::write(&record, original).unwrap();
 
     // No identity record: the map cannot be tied to any source
     std::fs::remove_file(out.join(format!("{base}.identity.json"))).unwrap();

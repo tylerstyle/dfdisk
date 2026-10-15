@@ -63,14 +63,30 @@ async fn acquire(serial: &str, shim: &[(&str, &str)], stop: Option<StopFlags>) -
     let stop = stop.unwrap_or_default();
     let trigger = stop.clone();
     let abort_after_start = shim.iter().any(|(k, _)| *k == "FAKEDEV_DELAY_US");
+    let out_dir = out.clone();
     let drain = tokio::spawn(async move {
         let mut started = false;
         while let Some(t) = rx.recv().await {
             if abort_after_start && !started && t.status == AcquisitionStatus::Acquiring {
                 started = true;
                 let flags = trigger.clone();
+                let dir = out_dir.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    // Once ewfacquire has written its first segment (a fixed
+                    // delay raced with a slow start under load), then 1 s more
+                    for _ in 0..1500 {
+                        let written = std::fs::read_dir(&dir).is_ok_and(|rd| {
+                            rd.flatten().any(|e| {
+                                e.file_name().to_string_lossy().ends_with(".E01")
+                                    && e.metadata().is_ok_and(|m| m.len() > 0)
+                            })
+                        });
+                        if written {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
                     flags.abort.store(true, std::sync::atomic::Ordering::SeqCst);
                 });
             }
@@ -308,7 +324,8 @@ async fn medium_failing_to_the_end_while_attached_is_read_errors() {
 
 #[tokio::test]
 async fn abort_keeps_the_segments_and_reports_aborted() {
-    // 128 slow reads (about 6 s); the test aborts 1.5 s into the acquisition
+    // 128 slow reads (about 6 s); the test aborts 1 s after ewfacquire wrote
+    // its first segment
     let Some(run) = acquire(
         "ABORT1",
         &[("FAKEDEV_DELAY_US", "50000")],

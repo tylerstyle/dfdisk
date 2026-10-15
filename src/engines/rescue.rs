@@ -3,8 +3,11 @@
 //!
 //! What the report says comes from the map only ([`ddrescue_map`]):
 //! - `+` finished: in the image as read;
-//! - `-` bad sector: zeros in the image (ddrescue never writes it), listed
-//!   as `Substituted`;
+//! - `-` bad sector: zeros in the image, listed as `Substituted`. ddrescue
+//!   never writes a bad sector, but a session killed before it saved its map
+//!   can leave data there that the map does not list as rescued; after every
+//!   ddrescue run dfdisk writes zeros over the bad-sector areas inside the
+//!   image (and fsyncs it), so the statement holds;
 //! - `?` non-tried, `*` non-trimmed, `/` non-scraped: `Unread`; the rescue is
 //!   incomplete until it is run again (resumed).
 //!
@@ -52,7 +55,7 @@ use crate::models::info_report::{
 use crate::models::outcome::{RangeKind, ReadErrorTable, VerificationResult};
 use crate::models::provenance::{DFDISK_GIT_REV, DFDISK_VERSION};
 use crate::models::telemetry::ProgressTelemetry;
-use crate::models::text::sanitize_line;
+use crate::models::text::{plural, sanitize_line};
 use chrono::{DateTime, Utc};
 use digest::Digest;
 use regex::Regex;
@@ -83,6 +86,8 @@ pub const DDRESCUE_GRACE: Duration = Duration::from_secs(30);
 const MAP_POLL: Duration = Duration::from_secs(2);
 /// Chunk size for hashing the image.
 const HASH_CHUNK: usize = 4 << 20;
+/// Chunk size for writing zeros over bad-sector areas.
+const ZERO_CHUNK: usize = 1 << 20;
 
 const NO_STREAM_DIGEST: &str = "ddrescue computes no digest while reading, so the image digests have nothing to be compared with; --verify-source compares them with a second read of the source";
 
@@ -130,10 +135,13 @@ pub async fn acquire_with(
     ctx.provenance.set_tool_version(DDRESCUE, &version);
 
     let mut resume_sessions = Vec::new();
+    // The previous report kept by a resume: put back when ddrescue never ran
+    let mut kept_report: Option<u32> = None;
     if config.resume {
-        let (sessions, resume_notes) = prepare_resume(ctx, &map)?;
-        resume_sessions = sessions;
-        notes.extend(resume_notes);
+        let prepared = prepare_resume(ctx, &map)?;
+        resume_sessions = prepared.sessions;
+        kept_report = prepared.kept;
+        notes.extend(prepared.notes);
     } else {
         write_identity_record(&sidecar, ctx)?;
     }
@@ -237,9 +245,16 @@ pub async fn acquire_with(
         Ok(o) => o,
         Err(e) => {
             discard_unused_record(config.resume, &sidecar, &image, &map);
-            return Err(AcquisitionError::failed(format!(
-                "cannot start ddrescue: {e}"
-            )));
+            let mut message = format!("cannot start ddrescue: {e}");
+            if let Some(n) = kept_report {
+                // ddrescue never ran: the previous report is the last word again
+                if let Err(r) = restore_previous_report(&ctx.output_dir, &ctx.base_name, n) {
+                    message.push_str(&format!(
+                        "; the report of the previous session stays kept as session {n} ({r})"
+                    ));
+                }
+            }
+            return Err(AcquisitionError::failed(message));
         }
     };
     let aborted = outcome.aborted || outcome.force_killed || ctx.is_aborted();
@@ -402,6 +417,22 @@ fn finalize(map_path: &Path, image_path: &Path, expected: u64, sector_size: u32)
             image_path.display()
         ));
     }
+    // R-2: the report says bad sectors are zeros in the image; ddrescue only
+    // never writes them, so data an earlier session wrote there before its
+    // map recorded it would stay. dfdisk writes the zeros itself
+    let mut stop_reason = None;
+    let zeroed = match image_len {
+        Some(l) => match zero_bad_sectors(image_path, &map, l, sector_size) {
+            Ok(z) => z.map(|z| z.statement()),
+            Err(e) => {
+                stop_reason = Some(format!(
+                    "dfdisk could not write zeros over the bad-sector areas of the map in the image ({e}); the image may hold other data there than the zeros this report states"
+                ));
+                None
+            }
+        },
+        None => None,
+    };
     if image_len.is_some()
         && len < expected
         && map.covers(expected)
@@ -427,14 +458,111 @@ fn finalize(map_path: &Path, image_path: &Path, expected: u64, sector_size: u32)
     }
     let a = map.assess(expected, len, sector_size);
     notes.push(map_summary(&map, map_path, &a.counts));
+    notes.extend(zeroed);
     notes.extend(a.notes.iter().cloned());
     Finalized {
         bad_sectors: map.bad_sectors(sector_size),
         read_errors: a.read_errors,
         bytes_acquired: a.bytes_acquired,
-        stop_reason: None,
+        stop_reason,
         notes,
     }
+}
+
+/// What [`zero_bad_sectors`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Zeroed {
+    /// Bad-sector blocks of the map inside the image file
+    ranges: usize,
+    /// Bytes of them inside the image file (all now zeros)
+    bytes: u64,
+    /// Sectors among them that held something other than zeros before
+    sectors_with_data: u64,
+    sector_size: u32,
+}
+
+impl Zeroed {
+    fn statement(&self) -> String {
+        let what = format!(
+            "dfdisk wrote zeros over the {} of the map inside the image ({}) after ddrescue ended, so the image holds zeros there",
+            plural(self.ranges as u64, "bad-sector area", "bad-sector areas"),
+            plural(self.bytes, "byte", "bytes")
+        );
+        if self.sectors_with_data == 0 {
+            format!("{what}; none of their sectors held other data before")
+        } else {
+            format!(
+                "{what}; {} ({}-byte) held other data before, which the map does not record as rescued (an earlier session can write data before its map records it, e.g. when it is killed), and was overwritten",
+                plural(self.sectors_with_data, "sector", "sectors"),
+                self.sector_size
+            )
+        }
+    }
+}
+
+/// Write zeros over every bad-sector (`-`) block of `map` inside the image
+/// file (up to `image_len`; nothing is written beyond its end), then fsync
+/// it. ddrescue never writes a bad sector, so the image holds zeros there
+/// only if nothing else was written before: a session killed before it
+/// saved its map leaves data the map does not list as rescued, which a
+/// later session can mark bad. `None` when no bad-sector block lies inside
+/// the image.
+fn zero_bad_sectors(
+    image: &Path,
+    map: &Mapfile,
+    image_len: u64,
+    sector_size: u32,
+) -> Result<Option<Zeroed>, String> {
+    use std::os::unix::fs::FileExt;
+    let ranges: Vec<(u64, u64)> = map
+        .blocks
+        .iter()
+        .filter(|b| b.status == ddrescue_map::BlockStatus::BadSector)
+        .map(|b| (b.pos, b.end().min(image_len)))
+        .filter(|(start, end)| end > start)
+        .collect();
+    if ranges.is_empty() {
+        return Ok(None);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image)
+        .map_err(|e| format!("cannot open {}: {e}", image.display()))?;
+    let sector = u64::from(sector_size.max(1));
+    let zeros = vec![0u8; ZERO_CHUNK];
+    let mut buf = vec![0u8; ZERO_CHUNK];
+    let mut z = Zeroed {
+        ranges: ranges.len(),
+        bytes: 0,
+        sectors_with_data: 0,
+        sector_size: sector_size.max(1),
+    };
+    for (start, end) in ranges {
+        let mut offset = start;
+        while offset < end {
+            let n = (end - offset).min(ZERO_CHUNK as u64) as usize;
+            // What was there (counted per sector), then the zeros
+            if file.read_exact_at(&mut buf[..n], offset).is_ok() {
+                let mut s = offset - offset % sector;
+                while s < offset + n as u64 {
+                    let from = s.max(offset) - offset;
+                    let to = (s + sector).min(offset + n as u64) - offset;
+                    if buf[from as usize..to as usize].iter().any(|b| *b != 0) {
+                        z.sectors_with_data += 1;
+                    }
+                    s += sector;
+                }
+            }
+            file.write_all_at(&zeros[..n], offset)
+                .map_err(|e| format!("write at byte offset {offset}: {e}"))?;
+            offset += n as u64;
+            z.bytes += n as u64;
+        }
+    }
+    file.sync_all()
+        .map_err(|e| format!("fsync of {}: {e}", image.display()))?;
+    Ok(Some(z))
 }
 
 fn map_summary(map: &Mapfile, path: &Path, counts: &ddrescue_map::MapCounts) -> String {
@@ -748,6 +876,55 @@ fn serial_tie(recorded: &SourceIdentity, now: &SourceIdentity) -> Result<Option<
         .ok_or_else(|| format!("serial {}, was {}", distinct(&b), distinct(&a)))
 }
 
+/// Attached through USB (transport "usb").
+fn is_usb(id: &SourceIdentity) -> bool {
+    id.transport
+        .as_deref()
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("usb"))
+}
+
+/// The serial the drive itself reported through ATA IDENTIFY (smartctl),
+/// when both identities have it and it is the same: behind a USB bridge the
+/// only serial that names the drive rather than the bridge.
+fn drive_serial_tie(recorded: &SourceIdentity, now: &SourceIdentity) -> Option<String> {
+    let identify = |id: &SourceIdentity| -> Option<String> {
+        id.serial_candidates
+            .iter()
+            .find(|c| c.source == SerialSource::SmartctlIdentify)
+            .map(|c| c.value.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    match (identify(recorded), identify(now)) {
+        (Some(a), Some(b)) if a.eq_ignore_ascii_case(&b) => Some(b),
+        _ => None,
+    }
+}
+
+/// The same attachment: kernel name and major:minor, and the disk sequence
+/// number where both have one (a new attachment gets a new one).
+fn same_attachment(recorded: &SourceIdentity, now: &SourceIdentity) -> bool {
+    let seq_ok = match (recorded.diskseq, now.diskseq) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
+    recorded.maj_min.is_some()
+        && recorded.maj_min == now.maj_min
+        && recorded.kernel_name == now.kernel_name
+        && seq_ok
+}
+
+/// "sdx, major:minor 8:16, disk sequence number 7".
+fn attachment(id: &SourceIdentity) -> String {
+    format!(
+        "{}, major:minor {}{}",
+        id.kernel_name,
+        id.maj_min.as_deref().unwrap_or("unknown"),
+        id.diskseq
+            .map(|s| format!(", disk sequence number {s}"))
+            .unwrap_or_else(|| ", disk sequence number unknown".into())
+    )
+}
+
 /// Both known and different (trimmed, case-insensitive).
 fn differs(a: &Option<String>, b: &Option<String>) -> bool {
     match (a, b) {
@@ -763,6 +940,9 @@ fn differs(a: &Option<String>, b: &Option<String>) -> bool {
 /// serial source may disagree; a device with neither serial nor WWN is
 /// accepted only in the same attachment (major:minor, disk sequence number),
 /// because a re-attached drive without either cannot be told from another.
+/// Behind a USB bridge without a WWN the serials (SCSI VPD page, udev) are
+/// the bridge's: only the drive's own ATA IDENTIFY serial on both sides, or
+/// the same attachment, ties the drive.
 /// Regular files: same canonical path and file identity. `Ok` says what tied
 /// them; `Err` lists every difference.
 pub fn compare_resume_identity(
@@ -835,38 +1015,39 @@ pub fn compare_resume_identity(
             }
             _ => false,
         };
+        let usb = is_usb(recorded) || is_usb(now);
         match serial_tie(recorded, now) {
+            Ok(Some(s)) if usb && !wwn_pair => match drive_serial_tie(recorded, now) {
+                Some(drive) => basis.push(format!(
+                    "the drive's own serial {drive} (ATA IDENTIFY)"
+                )),
+                // Behind a USB bridge the serial is the bridge's (SCSI VPD
+                // page, udev): another drive of the same model and size in
+                // the same enclosure reports it too (R-5)
+                None if same_attachment(recorded, now) => basis.push(format!(
+                    "serial {s} as the USB bridge reports it, in the same attachment ({})",
+                    attachment(now)
+                )),
+                None => diffs.push(format!(
+                    "the source is attached through USB and its serial {s} is the one the USB bridge reports (SCSI VPD page, udev), not the drive's own: another drive of the same model and size behind the same bridge reports it too. Without the drive's own serial (ATA IDENTIFY, read when SMART runs) at the first start and now, or a WWN, only the same attachment can tie it to this rescue; it is now ({}), was ({})",
+                    attachment(now),
+                    attachment(recorded)
+                )),
+            },
             Ok(Some(s)) => basis.push(format!("serial {s}")),
             Ok(None) if !wwn_pair => {
                 // dfcore's fallback (name + major:minor) cannot tell a
                 // re-attached drive from another one: the same attachment only
-                let seq_ok = match (recorded.diskseq, now.diskseq) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => true,
-                };
-                if recorded.maj_min.is_some()
-                    && recorded.maj_min == now.maj_min
-                    && recorded.kernel_name == now.kernel_name
-                    && seq_ok
-                {
+                if same_attachment(recorded, now) {
                     basis.push(format!(
-                        "no serial number or WWN; the same attachment ({}, major:minor {}{})",
-                        now.kernel_name,
-                        now.maj_min.as_deref().unwrap_or("-"),
-                        now.diskseq
-                            .map(|s| format!(", disk sequence number {s}"))
-                            .unwrap_or_default()
+                        "no serial number or WWN; the same attachment ({})",
+                        attachment(now)
                     ));
                 } else {
-                    let unknown = || "unknown".to_string();
                     diffs.push(format!(
-                        "the source reports no serial number and no WWN, so only the same attachment can tie it to this rescue; it is now {} major:minor {} disk sequence number {}, was {} major:minor {} disk sequence number {} (a re-attached drive without serial cannot be told from another drive)",
-                        now.kernel_name,
-                        now.maj_min.clone().unwrap_or_else(unknown),
-                        now.diskseq.map(|s| s.to_string()).unwrap_or_else(unknown),
-                        recorded.kernel_name,
-                        recorded.maj_min.clone().unwrap_or_else(unknown),
-                        recorded.diskseq.map(|s| s.to_string()).unwrap_or_else(unknown),
+                        "the source reports no serial number and no WWN, so only the same attachment can tie it to this rescue; it is now ({}), was ({}) (a re-attached drive without serial cannot be told from another drive)",
+                        attachment(now),
+                        attachment(recorded)
                     ));
                 }
             }
@@ -882,10 +1063,82 @@ pub fn compare_resume_identity(
     }
 }
 
+/// The newest report of the rescue `base` in `dir`: `<base>.info.json` when
+/// it exists (the previous session's report before a resume keeps it), else
+/// the JSON twin of the highest kept session. (label, path)
+fn latest_report_json(dir: &Path, base: &str) -> Option<(String, PathBuf)> {
+    let current = dir.join(format!("{base}{INFO_JSON_SUFFIX}"));
+    if current.is_file() {
+        return Some(("the report of the last session".into(), current));
+    }
+    kept_sessions(dir, base)
+        .into_iter()
+        .rev()
+        .find_map(|(n, _, json)| json.map(|j| (format!("the report of session {n}"), j)))
+}
+
+/// SHA-256 of the auxiliary file whose name ends with `suffix` that the
+/// report `json` lists. `Err` when the report cannot be read.
+fn digest_listed_in(json: &Path, suffix: &str) -> Result<Option<String>, String> {
+    let text = fs::read_to_string(json).map_err(|e| format!("cannot read it: {e}"))?;
+    let report =
+        ForensicInfoReport::from_json(&text).map_err(|e| format!("it is not readable: {e}"))?;
+    Ok(report
+        .auxiliary_files
+        .iter()
+        .find(|f| f.path.to_lowercase().ends_with(suffix))
+        .map(|f| f.sha256.clone()))
+}
+
+/// The identity record must be the one the newest report lists (R-6): a
+/// record changed or replaced after that report cannot tie a resume to the
+/// source. Returns the statement; `Err` names both digests.
+fn check_identity_record_digest(
+    dir: &Path,
+    base: &str,
+    record: &Path,
+) -> Result<String, AcquisitionError> {
+    let now = sha256_file(record).map_err(|e| {
+        AcquisitionError::refused(format!(
+            "cannot resume the rescue: the identity record {} cannot be hashed: {e}",
+            record.display()
+        ))
+    })?;
+    let Some((label, report)) = latest_report_json(dir, base) else {
+        return Ok(format!(
+            "no report of an earlier session lists the identity record {} (SHA-256 {now}); it cannot be compared with one",
+            file_name(record)
+        ));
+    };
+    match digest_listed_in(&report, IDENTITY_SUFFIX) {
+        Ok(Some(listed)) if listed.eq_ignore_ascii_case(&now) => Ok(format!(
+            "the identity record {} (SHA-256 {now}) is the one {label} ({}) lists",
+            file_name(record),
+            file_name(&report)
+        )),
+        Ok(Some(listed)) => Err(AcquisitionError::refused(format!(
+            "cannot resume the rescue: the identity record {} was changed or replaced after {label} ({}) was written: that report lists SHA-256 {listed}, the record now has {now}. The record is what ties the map and image to the source; dfdisk does not resume on a record it cannot trust. Restore the original record, or start a new rescue under a new evidence number",
+            record.display(),
+            report.display()
+        ))),
+        Ok(None) => Ok(format!(
+            "{label} ({}) lists no digest of the identity record {} (SHA-256 {now}) to compare it with",
+            file_name(&report),
+            file_name(record)
+        )),
+        Err(e) => Ok(format!(
+            "the identity record {} (SHA-256 {now}) could not be compared with {label} ({}): {e}",
+            file_name(record),
+            file_name(&report)
+        )),
+    }
+}
+
 /// Before a resumed rescue writes anything (session step 4, and the engine
 /// again with the identity that includes the SMART IDENTIFY serial): the
-/// identity recorded at the first start must exist and describe this source.
-/// Returns the statement for the report; `Refused` otherwise.
+/// identity recorded at the first start must exist, be the record the newest
+/// report lists, and describe this source. Returns the statements for the
+/// report; `Refused` otherwise.
 pub fn check_resume_identity(
     dir: &Path,
     base: &str,
@@ -904,6 +1157,7 @@ pub fn check_resume_identity(
             record.base_name
         )));
     }
+    let digest_statement = check_identity_record_digest(dir, base, &path)?;
     let tie = compare_resume_identity(&record.identity, now).map_err(|d| {
         AcquisitionError::refused(format!(
             "cannot resume the rescue: the source is not the device this rescue started on ({d}). The map and image belong to {} ({}, {} bytes, serial {}), recorded at {} in {}. dfdisk never merges two devices into one image",
@@ -915,11 +1169,14 @@ pub fn check_resume_identity(
             path.display()
         ))
     })?;
-    Ok(vec![format!(
-        "resumed rescue: the source matches the identity recorded at the first start of this rescue ({}, {}): {tie}",
-        file_name(&path),
-        record.recorded_at.to_rfc3339()
-    )])
+    Ok(vec![
+        format!(
+            "resumed rescue: the source matches the identity recorded at the first start of this rescue ({}, {}): {tie}",
+            file_name(&path),
+            record.recorded_at.to_rfc3339()
+        ),
+        digest_statement,
+    ])
 }
 
 /// Session number of `file_name` if it is a kept report of `base`
@@ -963,38 +1220,76 @@ fn kept_sessions(dir: &Path, base: &str) -> Vec<KeptSession> {
         .collect()
 }
 
+/// The report files of the current session (`<base>.info`,
+/// `<base>.info.json`) and of kept session `n`, pairwise.
+fn report_and_kept(dir: &Path, base: &str, n: u32) -> [(PathBuf, PathBuf); 2] {
+    [
+        (
+            dir.join(format!("{base}{INFO_SUFFIX}")),
+            dir.join(format!("{base}{SESSION_SUFFIX}{n}")),
+        ),
+        (
+            dir.join(format!("{base}{INFO_JSON_SUFFIX}")),
+            dir.join(format!("{base}{SESSION_SUFFIX}{n}.json")),
+        ),
+    ]
+}
+
 /// Keep the report of the previous session (`<base>.info`, `<base>.info.json`)
 /// as `<base>.info.session-N` and `<base>.info.session-N.json`, N one past the
 /// highest kept session. Returns N and the kept files, `None` when there was
-/// no report. Never overwrites.
+/// no report. Never overwrites; a failure part way renames back what was
+/// already renamed, so an error leaves the previous report where it was.
 pub fn keep_previous_report(dir: &Path, base: &str) -> io::Result<Option<(u32, Vec<PathBuf>)>> {
-    let text = dir.join(format!("{base}{INFO_SUFFIX}"));
-    let json = dir.join(format!("{base}{INFO_JSON_SUFFIX}"));
-    if !text.exists() && !json.exists() {
-        return Ok(None);
-    }
     let n = kept_sessions(dir, base)
         .last()
         .map(|(n, _, _)| n + 1)
         .unwrap_or(1);
-    let text_to = dir.join(format!("{base}{SESSION_SUFFIX}{n}"));
-    let json_to = dir.join(format!("{base}{SESSION_SUFFIX}{n}.json"));
-    let mut kept = Vec::new();
-    for (from, to) in [(&text, &text_to), (&json, &json_to)] {
-        if !from.exists() {
-            continue;
+    let pairs: Vec<(PathBuf, PathBuf)> = report_and_kept(dir, base, n)
+        .into_iter()
+        .filter(|(from, _)| from.exists())
+        .collect();
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    if let Some((_, to)) = pairs.iter().find(|(_, to)| to.exists()) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", to.display()),
+        ));
+    }
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for (i, (from, to)) in pairs.iter().enumerate() {
+        if let Err(e) = fs::rename(from, to) {
+            for (back_from, back_to) in &pairs[..i] {
+                let _ = fs::rename(back_to, back_from);
+            }
+            let _ = sync_dir(dir);
+            return Err(e);
         }
-        if to.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("{} already exists", to.display()),
-            ));
-        }
-        fs::rename(from, to)?;
         kept.push(to.clone());
     }
     sync_dir(dir)?;
     Ok(Some((n, kept)))
+}
+
+/// Undo [`keep_previous_report`] for kept session `n` (the resume ended
+/// before ddrescue ran): its files get their previous names again. Never
+/// overwrites a report of the current session.
+fn restore_previous_report(dir: &Path, base: &str, n: u32) -> io::Result<()> {
+    for (current, kept) in report_and_kept(dir, base, n) {
+        if !kept.exists() {
+            continue;
+        }
+        if current.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists", current.display()),
+            ));
+        }
+        fs::rename(&kept, &current)?;
+    }
+    sync_dir(dir)
 }
 
 /// Every kept session report of `base` in `dir`, with the digest of the
@@ -1023,43 +1318,55 @@ pub fn list_sessions(dir: &Path, base: &str) -> Vec<SessionInfo> {
 /// SHA-256 of the map the report of kept session `session` lists.
 fn map_digest_in_report(dir: &Path, base: &str, session: u32) -> Option<String> {
     let json = dir.join(format!("{base}{SESSION_SUFFIX}{session}.json"));
-    let report = ForensicInfoReport::from_json(&fs::read_to_string(json).ok()?).ok()?;
-    report
-        .auxiliary_files
-        .iter()
-        .find(|f| f.path.to_lowercase().ends_with(MAP_SUFFIX))
-        .map(|f| f.sha256.clone())
+    digest_listed_in(&json, MAP_SUFFIX).ok().flatten()
 }
 
-/// Resume: keep the previous report, list the sessions, state whether the
-/// map changed since the last report, and check the identity again (now
-/// with the SMART IDENTIFY serial, when SMART ran). The previous report is
-/// kept before anything can refuse, so it is never overwritten.
-fn prepare_resume(
-    ctx: &EngineContext,
-    map: &Path,
-) -> Result<(Vec<SessionInfo>, Vec<String>), AcquisitionError> {
+/// What [`prepare_resume`] found and did.
+struct PreparedResume {
+    sessions: Vec<SessionInfo>,
+    notes: Vec<String>,
+    /// Number under which the previous report was kept
+    kept: Option<u32>,
+}
+
+/// Resume: check the identity again (now with the SMART IDENTIFY serial,
+/// when SMART ran), keep the previous report, list the sessions and state
+/// whether the map changed since the last report. The identity is checked
+/// before the previous report is renamed: a refused resume leaves every file
+/// as it was (the previous report stays `<base>.info`). The previous report
+/// is kept before ddrescue runs, so it is never overwritten.
+fn prepare_resume(ctx: &EngineContext, map: &Path) -> Result<PreparedResume, AcquisitionError> {
     let dir = &ctx.output_dir;
     let base = &ctx.base_name;
+    // The session checked the identity before anything was written; now the
+    // identity includes a SMART IDENTIFY serial when SMART ran. Its
+    // statement is the session's (step 4), not repeated here
+    check_resume_identity(dir, base, &ctx.identity)?;
     let mut notes = Vec::new();
-    match keep_previous_report(dir, base) {
-        Ok(Some((_, files))) => notes.push(format!(
-            "the report of the previous session was kept as {}",
-            files
-                .iter()
-                .map(|f| file_name(f))
-                .collect::<Vec<_>>()
-                .join(" and ")
-        )),
-        Ok(None) => notes.push(
-            "no report of the previous session was found: it ended without writing one".into(),
-        ),
+    let kept = match keep_previous_report(dir, base) {
+        Ok(Some((n, files))) => {
+            notes.push(format!(
+                "the report of the previous session was kept as {}",
+                files
+                    .iter()
+                    .map(|f| file_name(f))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ));
+            Some(n)
+        }
+        Ok(None) => {
+            notes.push(
+                "no report of the previous session was found: it ended without writing one".into(),
+            );
+            None
+        }
         Err(e) => {
             return Err(AcquisitionError::failed(format!(
                 "cannot keep the report of the previous session: {e}"
             )))
         }
-    }
+    };
     let sessions = list_sessions(dir, base);
     for s in &sessions {
         let when =
@@ -1105,10 +1412,11 @@ fn prepare_resume(
             "the map could not be hashed before this session: {e}"
         )),
     }
-    // Defence in depth: the session checked the identity before anything was
-    // written; now the identity includes a SMART IDENTIFY serial when SMART ran
-    check_resume_identity(dir, base, &ctx.identity)?;
-    Ok((sessions, notes))
+    Ok(PreparedResume {
+        sessions,
+        notes,
+        kept,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1401,12 +1709,69 @@ mod tests {
             e.contains("DRIVE-B (ATA IDENTIFY (smartctl)), was DRIVE-A"),
             "{e}"
         );
-        // Without IDENTIFY on this side the bridge serial ties them
+        // Without IDENTIFY on this side the bridge serial ties them only in
+        // the same attachment
         let mut now = rec.clone();
         now.serial_candidates
             .retain(|c| c.source == SerialSource::VpdPage80);
         now.choose_serial();
-        assert!(compare_resume_identity(&rec, &now).is_ok());
+        let tie = compare_resume_identity(&rec, &now).unwrap();
+        assert!(tie.contains("as the USB bridge reports it"), "{tie}");
+        now.diskseq = Some(8);
+        let e = compare_resume_identity(&rec, &now).unwrap_err();
+        assert!(e.contains("is the one the USB bridge reports"), "{e}");
+    }
+
+    #[test]
+    fn a_usb_bridge_serial_alone_ties_only_the_same_attachment() {
+        // R-5: SMART did not run at the first start; the bridge's serial is
+        // all there is, and another drive in the same enclosure has it too
+        let mut rec = no_serial();
+        rec.transport = Some("usb".into());
+        rec.model = Some("ST2000DM008".into());
+        rec.add_serial_candidate("BRIDGE0001", SerialSource::VpdPage80);
+        rec.add_serial_candidate("BRIDGE0001", SerialSource::UdevIdSerialShort);
+        let mut other_drive = rec.clone();
+        other_drive.kernel_name = "sdy".into();
+        other_drive.maj_min = Some("8:32".into());
+        other_drive.diskseq = Some(12);
+        let e = compare_resume_identity(&rec, &other_drive).unwrap_err();
+        assert!(
+            e.contains("serial BRIDGE0001 is the one the USB bridge"),
+            "{e}"
+        );
+        assert!(e.contains("ATA IDENTIFY"), "{e}");
+        assert!(
+            e.contains(
+                "it is now (sdy, major:minor 8:32, disk sequence number 12), was (sdx, major:minor 8:16, disk sequence number 7)"
+            ),
+            "{e}"
+        );
+        // SMART now, but not at the first start: still the bridge's serial
+        let mut smart_now = other_drive.clone();
+        smart_now.add_serial_candidate("DRIVE-B", SerialSource::SmartctlIdentify);
+        assert!(compare_resume_identity(&rec, &smart_now).is_err());
+        // The same attachment (never unplugged): the same drive
+        assert!(compare_resume_identity(&rec, &rec.clone()).is_ok());
+        // The drive's own serial on both sides ties a re-attached drive
+        let mut rec_smart = rec.clone();
+        rec_smart.add_serial_candidate("DRIVE-A", SerialSource::SmartctlIdentify);
+        let mut again = other_drive.clone();
+        again.add_serial_candidate("DRIVE-A", SerialSource::SmartctlIdentify);
+        let tie = compare_resume_identity(&rec_smart, &again).unwrap();
+        assert!(tie.contains("the drive's own serial DRIVE-A"), "{tie}");
+        // A WWN ties as on any transport
+        let mut a = rec.clone();
+        a.wwn = Some("0x5000c500a1b2c3d4".into());
+        let mut b = other_drive.clone();
+        b.wwn = a.wwn.clone();
+        assert!(compare_resume_identity(&a, &b).unwrap().contains("WWN"));
+        // Not USB: the serial ties a re-attached drive as before
+        let mut sata = rec.clone();
+        sata.transport = Some("sata".into());
+        let mut sata_now = other_drive.clone();
+        sata_now.transport = Some("sata".into());
+        assert!(compare_resume_identity(&sata, &sata_now).is_ok());
     }
 
     #[test]
@@ -1506,6 +1871,11 @@ mod tests {
     }
 
     fn report_json(outcome: Outcome, map_sha: &str) -> String {
+        report_json_listing(outcome, map_sha, None)
+    }
+
+    /// A rescue report listing the map and, when given, the identity record.
+    fn report_json_listing(outcome: Outcome, map_sha: &str, identity_sha: Option<&str>) -> String {
         let source = disk();
         let config = AcquisitionConfig::rescue("/out");
         let mut r = ForensicInfoReport::new(
@@ -1520,7 +1890,63 @@ mod tests {
                 path: "/out/b.map".into(),
                 sha256: map_sha.into(),
             });
+        if let Some(sha) = identity_sha {
+            r.auxiliary_files
+                .push(crate::models::info_report::FileDigest {
+                    path: "/out/b.identity.json".into(),
+                    sha256: sha.into(),
+                });
+        }
         r.to_json()
+    }
+
+    #[test]
+    fn the_identity_record_must_be_the_one_the_last_report_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let base = "b";
+        let record = IdentityRecord::new(&disk(), base, "/dev/sdx", 512);
+        let path = identity_record_path(d, base);
+        std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+        let sha = sha256_file(&path).unwrap();
+
+        // No report yet: stated, not refused
+        let notes = check_resume_identity(d, base, &disk()).unwrap();
+        assert!(
+            notes[1].contains("no report of an earlier session lists"),
+            "{notes:?}"
+        );
+        // The last report lists this record
+        std::fs::write(
+            d.join("b.info.json"),
+            report_json_listing(Outcome::Aborted, "aa", Some(&sha)),
+        )
+        .unwrap();
+        let notes = check_resume_identity(d, base, &disk()).unwrap();
+        assert!(
+            notes[1].contains(&format!(
+                "(SHA-256 {sha}) is the one the report of the last session (b.info.json) lists"
+            )),
+            "{notes:?}"
+        );
+        // The record was replaced afterwards (same identity, other bytes)
+        std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+        let e = check_resume_identity(d, base, &disk()).unwrap_err();
+        assert!(e.is_refusal(), "{e}");
+        assert!(e.message.contains("changed or replaced"), "{e}");
+        assert!(e.message.contains(&sha), "{e}");
+        // Kept as session 1 by an earlier resume: compared all the same
+        std::fs::rename(d.join("b.info.json"), d.join("b.info.session-1.json")).unwrap();
+        let e = check_resume_identity(d, base, &disk()).unwrap_err();
+        assert!(e.message.contains("the report of session 1"), "{e}");
+        // A report without the record's digest: stated
+        std::fs::write(
+            d.join("b.info.json"),
+            report_json_listing(Outcome::Aborted, "aa", None),
+        )
+        .unwrap();
+        let notes = check_resume_identity(d, base, &disk()).unwrap();
+        assert!(notes[1].contains("lists no digest"), "{notes:?}");
     }
 
     #[test]
@@ -1611,6 +2037,82 @@ mod tests {
         let data = std::fs::read(&image).unwrap();
         assert!(data[(MIB - 0x400) as usize..].iter().all(|b| *b == 0));
         assert!(data[..(MIB - 0x400) as usize].iter().all(|b| *b == 7));
+    }
+
+    #[test]
+    fn bad_sector_areas_are_zeros_in_the_image_whatever_was_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("b.map");
+        let image = dir.path().join("b.raw");
+        // BAD_MIDDLE: bad 0x10000+0x400 and 0x90000+0x200 in 1 MiB
+        std::fs::write(&map, BAD_MIDDLE).unwrap();
+        let mut data = vec![7u8; MIB as usize];
+        data[0x10000..0x10200].fill(0); // one sector of the first area already zeros
+        std::fs::write(&image, &data).unwrap();
+        let fin = finalize(&map, &image, MIB, 512);
+        let after = std::fs::read(&image).unwrap();
+        assert!(after[0x10000..0x10400].iter().all(|b| *b == 0));
+        assert!(after[0x90000..0x90200].iter().all(|b| *b == 0));
+        assert!(after[..0x10000].iter().all(|b| *b == 7));
+        assert!(after[0x10400..0x90000].iter().all(|b| *b == 7));
+        assert!(after[0x90200..].iter().all(|b| *b == 7));
+        assert_eq!(after.len(), MIB as usize);
+        assert_eq!(fin.stop_reason, None);
+        assert_eq!(fin.read_errors.substituted_bytes(), 0x600);
+        let notes = fin.notes.join("\n");
+        assert!(
+            notes.contains(
+                "dfdisk wrote zeros over the 2 bad-sector areas of the map inside the image (1536 bytes)"
+            ),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("2 sectors (512-byte) held other data before"),
+            "{notes}"
+        );
+        // Run again: nothing but zeros there now
+        let fin = finalize(&map, &image, MIB, 512);
+        assert!(
+            fin.notes
+                .join("\n")
+                .contains("none of their sectors held other data before"),
+            "{:?}",
+            fin.notes
+        );
+        // Bad areas beyond the end of an unfinished image are not written
+        std::fs::write(&image, vec![7u8; 0x10200]).unwrap();
+        let fin = finalize(&map, &image, MIB, 512);
+        let after = std::fs::read(&image).unwrap();
+        assert_eq!(after.len(), 0x10200);
+        assert!(after[0x10000..].iter().all(|b| *b == 0));
+        assert!(
+            fin.notes
+                .join("\n")
+                .contains("the 1 bad-sector area of the map inside the image (512 bytes)"),
+            "{:?}",
+            fin.notes
+        );
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_zeroed_is_not_claimed_to_hold_zeros() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("b.map");
+        let image = dir.path().join("b.raw");
+        std::fs::write(&map, BAD_MIDDLE).unwrap();
+        std::fs::write(&image, vec![7u8; MIB as usize]).unwrap();
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if OpenOptions::new().write(true).open(&image).is_ok() {
+            // root ignores the mode: nothing to test here
+            return;
+        }
+        let fin = finalize(&map, &image, MIB, 512);
+        let stop = fin.stop_reason.unwrap();
+        assert!(
+            stop.contains("could not write zeros over the bad-sector areas"),
+            "{stop}"
+        );
     }
 
     #[test]
@@ -1932,8 +2434,17 @@ mod tests {
         );
         let ctx = context(tmp.path(), 4 * MIB, false);
         let abort = ctx.abort.clone();
+        // Abort once the fake has written its map (a fixed delay raced with
+        // a slow start of the script under load)
+        let map = ctx.output_path(".map");
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            for _ in 0..200 {
+                if std::fs::metadata(&map).is_ok_and(|m| m.len() > 0) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
             abort.store(true, Ordering::SeqCst);
         });
         let t0 = Instant::now();
@@ -2021,16 +2532,124 @@ mod tests {
             .join("\n")
             .contains("the map changed after the report of session 2"));
 
-        // Another file at the same path: refused, the previous report kept anyway
+        // Another file at the same path: refused before anything is renamed;
+        // the previous report stays the report of the rescue (R-1)
         std::fs::write(ctx.output_path(".info"), "report 3").unwrap();
+        std::fs::write(
+            ctx.output_path(".info.json"),
+            report_json(Outcome::Incomplete, "00"),
+        )
+        .unwrap();
         let mut ctx3 = context_again(&ctx, true);
         ctx3.identity.file_id = Some("0:0".into());
         let e = acquire_with(&ctx3, fake.as_os_str()).await.unwrap_err();
         assert!(e.is_refusal(), "{e}");
         assert_eq!(
-            std::fs::read_to_string(ctx.output_path(".info.session-3")).unwrap(),
+            std::fs::read_to_string(ctx.output_path(".info")).unwrap(),
             "report 3"
         );
+        assert!(ctx.output_path(".info.json").exists());
+        assert!(!ctx.output_path(".info.session-3").exists());
+        assert!(!ctx.output_path(".info.session-3.json").exists());
+    }
+
+    #[tokio::test]
+    async fn data_a_killed_session_left_in_bad_areas_is_zeroed_on_resume() {
+        // R-2: the first session wrote the whole image but was killed before
+        // ddrescue saved a map listing it; the resumed session finds those
+        // areas unreadable and marks them bad without writing them
+        let tmp = tempfile::tempdir().unwrap();
+        let first = fake_ddrescue(
+            tmp.path(),
+            &format!(
+                "head -c {MIB} /dev/zero | tr '\\0' 'Z' > \"$IMG\"\nprintf '%s' '{INTERRUPTED}' > \"$MAP\"\nkill -KILL $$\n"
+            ),
+        );
+        let ctx = context(tmp.path(), MIB, false);
+        let out = acquire_with(&ctx, first.as_os_str()).await.unwrap();
+        assert!(out.stop_reason.is_some(), "{out:?}");
+        let resumed = script(
+            tmp.path(),
+            "resumed-ddrescue",
+            &format!(
+                "if [ \"$1\" = --version ]; then echo 'GNU ddrescue 1.30 (fake)'; exit 0; fi\n\
+                 for a; do MAP=\"$a\"; done\nprintf '%s' '{BAD_MIDDLE}' > \"$MAP\"\nexit 0\n"
+            ),
+        );
+        let out = acquire_with(&context_again(&ctx, true), resumed.as_os_str())
+            .await
+            .unwrap();
+        assert_eq!(out.stop_reason, None);
+        assert_eq!(out.read_errors.substituted_bytes(), 0x600);
+        let image = std::fs::read(ctx.output_path(".raw")).unwrap();
+        assert!(image[0x10000..0x10400].iter().all(|b| *b == 0));
+        assert!(image[0x90000..0x90200].iter().all(|b| *b == 0));
+        assert!(image[..0x10000].iter().all(|b| *b == b'Z'));
+        assert!(image[0x90200..].iter().all(|b| *b == b'Z'));
+        let notes = out.notes.join("\n");
+        assert!(
+            notes.contains("3 sectors (512-byte) held other data before"),
+            "{notes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_never_starts_ddrescue_puts_the_previous_report_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ok = fake_ddrescue(
+            tmp.path(),
+            &format!("printf '%s' '{BAD_MIDDLE}' > \"$MAP\"\nexit 0\n"),
+        );
+        let ctx = context(tmp.path(), MIB, false);
+        std::fs::write(ctx.output_path(".raw"), vec![0u8; MIB as usize]).unwrap();
+        acquire_with(&ctx, ok.as_os_str()).await.unwrap();
+        std::fs::write(ctx.output_path(".info"), "report 1").unwrap();
+        std::fs::write(
+            ctx.output_path(".info.json"),
+            report_json(Outcome::Aborted, "aa"),
+        )
+        .unwrap();
+        // Answers --version, then is gone when the rescue starts it
+        let vanishing = script(
+            tmp.path(),
+            "vanishing-ddrescue",
+            "if [ \"$1\" = --version ]; then echo 'GNU ddrescue 1.30 (fake)'; \
+             if [ -f \"$0.vanish\" ]; then rm -f \"$0\"; fi; exit 0; fi\nexit 0\n",
+        );
+        std::fs::write(tmp.path().join("vanishing-ddrescue.vanish"), "").unwrap();
+        let e = acquire_with(&context_again(&ctx, true), vanishing.as_os_str())
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind, crate::engines::ErrorKind::Failed, "{e}");
+        assert!(e.message.contains("cannot start ddrescue"), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(ctx.output_path(".info")).unwrap(),
+            "report 1"
+        );
+        assert!(ctx.output_path(".info.json").exists());
+        assert!(kept_sessions(&ctx.output_dir, "b").is_empty());
+    }
+
+    #[test]
+    fn a_kept_report_can_be_put_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join("b.info"), "text").unwrap();
+        std::fs::write(d.join("b.info.json"), "{}").unwrap();
+        let (n, kept) = keep_previous_report(d, "b").unwrap().unwrap();
+        assert_eq!((n, kept.len()), (1, 2));
+        restore_previous_report(d, "b", 1).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("b.info")).unwrap(), "text");
+        assert_eq!(
+            std::fs::read_to_string(d.join("b.info.json")).unwrap(),
+            "{}"
+        );
+        assert!(kept_sessions(d, "b").is_empty());
+        // Never over a report of the current session
+        keep_previous_report(d, "b").unwrap();
+        std::fs::write(d.join("b.info"), "new").unwrap();
+        assert!(restore_previous_report(d, "b", 1).is_err());
+        assert_eq!(std::fs::read_to_string(d.join("b.info")).unwrap(), "new");
     }
 
     /// A context for the same output as `ctx` (`resume` as given).

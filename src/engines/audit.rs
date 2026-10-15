@@ -48,6 +48,7 @@ pub mod action {
     pub const IMAGE_VERIFICATION: &str = "image_verification";
     pub const CONVERSION_STARTED: &str = "conversion_started";
     pub const CONVERSION_FINISHED: &str = "conversion_finished";
+    pub const CONVERSION_REFUSED: &str = "conversion_refused";
 }
 
 /// The audit log of this host (`DFNIX_AUDIT_LOG` or /run/dfnix/audit.jsonl).
@@ -502,6 +503,36 @@ pub fn conversion_started(
 ) -> Result<String, String> {
     let mut event = Event::new(TOOL, VERSION, action::CONVERSION_STARTED);
     event.details = details;
+    event
+        .details
+        .insert("source".into(), json!(source.to_string_lossy()));
+    event
+        .details
+        .insert("target".into(), json!(target.to_string_lossy()));
+    append(log, event)
+}
+
+/// Record a refused conversion (§13 Converter, before
+/// "conversion_started": nothing was written), mirroring
+/// "acquisition_refused": the source, the intended output, why, and
+/// `details` (target format, output directory, base name when known).
+pub fn conversion_refused(
+    log: &Path,
+    source: &Path,
+    target: &Path,
+    err: &AcquisitionError,
+    details: Map<String, Value>,
+) -> Result<String, String> {
+    let mut event = Event::new(TOOL, VERSION, action::CONVERSION_REFUSED)
+        .outcome(err.audit_outcome(), Some(err.message.clone()));
+    event.details = details;
+    event.details.insert(
+        "error_kind".into(),
+        serde_json::to_value(err.kind).unwrap_or_default(),
+    );
+    event
+        .details
+        .insert("exit_code".into(), json!(err.exit_code()));
     event
         .details
         .insert("source".into(), json!(source.to_string_lossy()));

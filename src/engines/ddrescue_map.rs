@@ -85,8 +85,10 @@ impl BlockStatus {
 
     /// How a block of this status is represented in the image (inside the
     /// image file): finished blocks hold source data (`None`), bad sectors
-    /// hold zeros (`Substituted`: ddrescue never writes them, so they are
-    /// holes or zeros), and areas that were not tried or not finished are
+    /// hold zeros (`Substituted`: ddrescue never writes them, and the rescue
+    /// engine writes zeros over them after every ddrescue run, so data an
+    /// interrupted earlier session left there does not stay), and areas that
+    /// were not tried or not finished are
     /// `Unread`: running the rescue again may still read them.
     pub fn range_kind(&self) -> Option<RangeKind> {
         match self {

@@ -22,7 +22,8 @@
 //! 4. The tool through [`process::run`] (LC_ALL=C, own process group, both
 //!    streams read; abort = SIGINT, 15 s grace, then SIGTERM and SIGKILL; a
 //!    force flag kills at once); progress from its status lines.
-//! 5. fsync and page-cache eviction of every output, then verification:
+//! 5. fsync and page-cache eviction of every output (an output image that
+//!    cannot be fsynced fails the verification), then verification:
 //!    RAW to E01 re-reads the E01 with ewfverify and compares the digests with
 //!    the source's (from its report, or computed by dfdisk while ewfacquire
 //!    reads the image); E01 to RAW hashes the written RAW file and compares
@@ -39,13 +40,13 @@
 use crate::discovery::writeprotect;
 use crate::engines::audit;
 use crate::engines::error::{AcquisitionError, ErrorKind};
+use crate::engines::ewf::{self, RunBlock};
 use crate::engines::preflight::{self, DestinationFacts, DestinationRules};
 use crate::engines::process::{self, ProcessEvent, ProcessOutcome, ProcessSpec, StreamTag};
 use crate::engines::progress::ProgressSink;
-use crate::engines::session::flush_and_evict;
 use crate::models::case::{check_filename_length, sanitize_header, CaseMetadata};
 use crate::models::config::{
-    CompressionLevel, EngineKind, HashAlgorithm, HashSelection, SplitSize,
+    check_segment_bytes, CompressionLevel, EngineKind, HashAlgorithm, HashSelection, SplitSize,
 };
 use crate::models::conversion::{
     ConversionReport, ConversionRequest, ConversionSettings, ConversionTarget, DigestComparison,
@@ -53,7 +54,7 @@ use crate::models::conversion::{
     LONGEST_CONVERSION_SUFFIX,
 };
 use crate::models::info_report::{
-    sha256_file, AuditInfo, AuditStatus, FileDigest, ForensicInfoReport, HashResults,
+    sha256_file, sync_dir, AuditInfo, AuditStatus, FileDigest, ForensicInfoReport, HashResults,
 };
 use crate::models::outcome::{Outcome, RangeKind, ReadErrorTable, VerificationResult};
 use crate::models::protection::RegistryPresence;
@@ -80,8 +81,9 @@ const INFO_TIMEOUT: Duration = Duration::from_secs(600);
 const HASH_BUFFER: usize = 4 << 20;
 /// Lines of tool output kept for parsing.
 const MAX_KEPT_LINES: usize = 20_000;
-/// libewf's smallest segment size.
-const MIN_SEGMENT_BYTES: u64 = 1 << 20;
+/// ewfexport's list of the sectors it could not read (libewf 20140816 and
+/// 20231119), followed by "total number:" and "at sector(s):" lines.
+const EXPORT_ERRORS_TITLE: &str = "Read errors during export";
 /// Values libewf's tools write into an E01 header when none was given; they
 /// are placeholders, never case values.
 const LIBEWF_PLACEHOLDERS: &[&str] = &[
@@ -128,6 +130,38 @@ pub struct ConvertEnv {
     pub grace: Duration,
     /// Copy the audit log into the output directory (`audit-<boot_id>.jsonl`)
     pub export_audit: bool,
+    /// fsync and page-cache eviction of an output file
+    pub flush: FileFlush,
+}
+
+/// fsync and page-cache eviction of one output file ([`ConvertEnv::flush`];
+/// tests inject failures).
+#[derive(Debug, Clone, Copy)]
+pub struct FileFlush {
+    pub sync: fn(&Path, &fs::File) -> io::Result<()>,
+    pub evict: fn(&Path, &fs::File) -> io::Result<()>,
+}
+
+impl Default for FileFlush {
+    fn default() -> Self {
+        Self {
+            sync: |_, f| f.sync_all(),
+            evict: evict_page_cache,
+        }
+    }
+}
+
+/// Drop `f`'s pages from the page cache (POSIX_FADV_DONTNEED), so a re-read
+/// comes from the destination medium.
+fn evict_page_cache(_: &Path, f: &fs::File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: advisory call on a descriptor we own
+    let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(rc))
+    }
 }
 
 impl ConvertEnv {
@@ -141,6 +175,7 @@ impl ConvertEnv {
             mountinfo: None,
             grace: TOOL_GRACE,
             export_audit: true,
+            flush: FileFlush::default(),
         }
     }
 }
@@ -209,8 +244,13 @@ pub async fn convert_with(
 // Notes of a converted rescue (CLI --rescue-to-e01, TUI)
 
 /// Most zero-filled ranges [`rescue_notes`] lists (the rescue report lists
-/// all of them).
+/// all of them; the note says how many there are).
 pub const MAX_RESCUE_NOTE_RANGES: usize = 20;
+/// How [`rescue_notes`] begins its line in the E01 header notes.
+const RESCUE_NOTE_MARKER: &str = "Zero-filled sectors of the rescue";
+/// How [`ewf_notes`] states inherited zero-filled sectors in the E01 header
+/// notes ("<summary> unreadable in the acquisition, zeros in this image").
+const ZEROS_NOTE_MARKER: &str = "unreadable in the acquisition, zeros in this image";
 
 /// E01 notes of a converted rescue beyond what the converter states itself
 /// (where the image came from, the rescue report's verdict and its
@@ -241,13 +281,18 @@ pub fn rescue_notes(report: &ForensicInfoReport, report_json: &Path) -> Vec<Stri
     }
     let shown = ranges.len().min(MAX_RESCUE_NOTE_RANGES);
     let mut line = format!(
-        "Zero-filled sectors of the rescue ({}, {} bytes each): {}",
+        "{RESCUE_NOTE_MARKER} ({}, {} bytes each){}: {}",
         if table.source.is_empty() {
             "ddrescue mapfile"
         } else {
             table.source.as_str()
         },
         sector,
+        if ranges.len() > shown {
+            format!(", the first {shown} of {} ranges", ranges.len())
+        } else {
+            String::new()
+        },
         ranges[..shown].join(", ")
     );
     if ranges.len() > shown {
@@ -455,12 +500,13 @@ pub fn ewf_segments(path: &Path) -> Result<Vec<SourceFile>, AcquisitionError> {
         )));
     }
     let dir = parent_dir(path);
-    let mut segments: Vec<(u32, PathBuf)> = siblings(&dir, stem)
-        .into_iter()
+    let sibs = siblings(&dir, stem);
+    let mut segments: Vec<(u32, PathBuf)> = sibs
+        .iter()
         .filter_map(|(e, p)| {
-            ewf_segment_number(&e)
+            ewf_segment_number(e)
                 .filter(|(f, _)| *f == family)
-                .map(|(_, n)| (n, p))
+                .map(|(_, n)| (n, p.clone()))
         })
         .collect();
     segments.sort();
@@ -480,18 +526,65 @@ pub fn ewf_segments(path: &Path) -> Result<Vec<SourceFile>, AcquisitionError> {
             )));
         }
     }
-    if segments.is_empty() {
+    let Some(first) = segments.first().map(|(_, p)| p.clone()) else {
         return Err(usage(format!("{} does not exist", path.display())));
-    }
-    segments
+    };
+    // Beyond .EZZ libewf continues with .FAA ... .ZZZ: follow its naming
+    let first_ext = first
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut paths: Vec<PathBuf> = segments.into_iter().map(|(_, p)| p).collect();
+    paths.extend(segment_chain(
+        &sibs,
+        &first_ext,
+        paths.len() as u32 + 1,
+        stem,
+    )?);
+    paths
         .into_iter()
-        .map(|(_, p)| {
+        .map(|p| {
             Ok(SourceFile {
                 bytes: file_size(&p)?,
                 path: p,
             })
         })
         .collect()
+}
+
+/// Segments `from`, `from + 1`, ... of the family whose first segment has
+/// the extension `first_ext`, named as libewf names them
+/// ([`ewf::segment_extension`]), among `sibs` (compared without regard to
+/// case), up to the first number that does not exist (libewf reads a family
+/// the same way).
+fn segment_chain(
+    sibs: &[(String, PathBuf)],
+    first_ext: &str,
+    from: u32,
+    stem: &str,
+) -> Result<Vec<PathBuf>, AcquisitionError> {
+    let mut out = Vec::new();
+    let mut n = from;
+    while let Some(ext) = ewf::segment_extension(first_ext, n) {
+        let found: Vec<&PathBuf> = sibs
+            .iter()
+            .filter(|(e, _)| e.eq_ignore_ascii_case(&ext))
+            .map(|(_, p)| p)
+            .collect();
+        match found.as_slice() {
+            [] => break,
+            [p] => out.push((*p).clone()),
+            [a, b, ..] => {
+                return Err(usage(format!(
+                    "the EWF set {stem} is ambiguous: {} and {} are the same segment",
+                    a.display(),
+                    b.display()
+                )))
+            }
+        }
+        n += 1;
+    }
+    Ok(out)
 }
 
 /// Output files of a conversion named `base` in `dir`, compared without
@@ -527,18 +620,55 @@ pub fn existing_conversion_outputs(
     found
 }
 
-/// E01 segments a conversion named `base` wrote into `dir`, in order.
+/// E01 segments a conversion named `base` wrote into `dir`, in order: the
+/// segments as libewf names them (`.E01` .. `.EZZ`, `.FAA` ...) from the
+/// first on, then any other `.E..` segment (after a gap).
 fn written_segments(dir: &Path, base: &str) -> Vec<PathBuf> {
-    let mut segs: Vec<(u32, PathBuf)> = siblings(dir, base)
+    let sibs = siblings(dir, base);
+    let mut out = segment_chain(&sibs, "E01", 1, base).unwrap_or_default();
+    let mut rest: Vec<(u32, PathBuf)> = sibs
         .into_iter()
+        .filter(|(_, p)| !out.contains(p))
         .filter_map(|(e, p)| {
             ewf_segment_number(&e)
                 .filter(|(f, _)| f == "e")
                 .map(|(_, n)| (n, p))
         })
         .collect();
-    segs.sort();
-    segs.into_iter().map(|(_, p)| p).collect()
+    rest.sort();
+    out.extend(rest.into_iter().map(|(_, p)| p));
+    out
+}
+
+/// Files in `dir` named like segments past `.EZZ` (`.FAA` ...) that an E01
+/// conversion of `source_bytes` with segments of `segment_bytes` could
+/// write: ewfacquire -u would overwrite them. Bounded by the number of
+/// segments the output can need (1 % overhead and one more), so a source
+/// like `x.RAW` is never taken for segment 9,000-something.
+fn existing_late_segments(
+    dir: &Path,
+    base: &str,
+    source_bytes: u64,
+    segment_bytes: Option<u64>,
+) -> Vec<PathBuf> {
+    const FIRST_LATE: u32 = 776;
+    let Some(seg) = segment_bytes.filter(|s| *s > 0) else {
+        return Vec::new();
+    };
+    let most = (source_bytes / 100 * 101 / seg).saturating_add(2);
+    let most = u32::try_from(most).unwrap_or(u32::MAX);
+    if most < FIRST_LATE {
+        return Vec::new();
+    }
+    let names: std::collections::HashSet<String> = (FIRST_LATE..=most)
+        .map_while(|n| ewf::segment_extension("E01", n))
+        .map(|e| e.to_ascii_lowercase())
+        .collect();
+    siblings(dir, base)
+        .into_iter()
+        .filter(|(e, _)| names.contains(&e.to_ascii_lowercase()))
+        .map(|(_, p)| p)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +766,9 @@ pub struct EwfInfo {
     pub read_error_total: Option<u64>,
     /// "at sector(s):" lines that could not be parsed
     pub unparsed_errors: Vec<String>,
+    /// "Is corrupted: yes" (EWF information): segments are missing, or the
+    /// image was never finalized (an aborted acquisition)
+    pub corrupted: bool,
 }
 
 impl EwfInfo {
@@ -726,6 +859,7 @@ pub fn parse_ewfinfo(text: &str) -> EwfInfo {
             _ => {}
         }
     }
+    info.corrupted = ewf::parse_ewfinfo_media(text).corrupted;
     info
 }
 
@@ -858,8 +992,9 @@ fn load_report(path: &Path) -> Result<(LoadedReport, Vec<String>), String> {
 }
 
 /// The report of `source`: the given one (must list the image, else a usage
-/// error), or `<base>.info.json` / `<base>.conversion.info.json` next to it
-/// when it lists the image (else ignored with a note).
+/// error; one the caller found itself, `source_report_auto`, is ignored with
+/// a note instead), or `<base>.info.json` / `<base>.conversion.info.json`
+/// next to it when it lists the image (else ignored with a note).
 fn find_report(
     req: &ConversionRequest,
     source: &Path,
@@ -871,22 +1006,38 @@ fn find_report(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let lists = |names: &[String]| names.iter().any(|n| n.eq_ignore_ascii_case(&image));
+    let mut tried: Option<&Path> = None;
     if let Some(given) = &req.source_report {
-        let (loaded, names) = load_report(given).map_err(usage)?;
-        if !lists(&names) {
-            return Err(usage(format!(
-                "the report {} does not list {image} among its image files; it does not describe this image (convert without --report, or give the report of this image)",
-                given.display()
-            )));
+        match load_report(given) {
+            Ok((loaded, names)) if lists(&names) => return Ok(Some(loaded)),
+            // C-5: a report the caller found (not the examiner's choice)
+            // that describes another image is not this image's report
+            Ok(_) if req.source_report_auto => {
+                notes.push(format!(
+                    "{} was not used: it does not list {image} among its image files",
+                    given.display()
+                ));
+                tried = Some(given.as_path());
+            }
+            Err(e) if req.source_report_auto => {
+                notes.push(format!("{} was not used: {e}", given.display()));
+                tried = Some(given.as_path());
+            }
+            Ok(_) => {
+                return Err(usage(format!(
+                    "the report {} does not list {image} among its image files; it does not describe this image (convert without --report, or give the report of this image)",
+                    given.display()
+                )))
+            }
+            Err(e) => return Err(usage(e)),
         }
-        return Ok(Some(loaded));
     }
     let dir = parent_dir(source);
     for candidate in [
         dir.join(format!("{base}.info.json")),
         dir.join(format!("{base}{CONVERSION_STEM}.info.json")),
     ] {
-        if !candidate.is_file() {
+        if !candidate.is_file() || tried.is_some_and(|t| same_path(t, &candidate)) {
             continue;
         }
         match load_report(&candidate) {
@@ -1183,6 +1334,8 @@ struct Plan {
     /// The image was not verified against its medium: a matching conversion
     /// stays "not verified"
     inherited_unverified: Option<String>,
+    /// What the report says about unreadable ranges when none are listed
+    read_errors_note: Option<String>,
     selection: HashSelection,
     settings: ConversionSettings,
     notes: Vec<String>,
@@ -1294,10 +1447,8 @@ async fn plan(
     })?;
     check_filename_length(&base_name, LONGEST_CONVERSION_SUFFIX.len()).map_err(usage)?;
     if let SplitSize::Custom(b) = req.split_size {
-        if req.target == ConversionTarget::E01 && b < MIN_SEGMENT_BYTES {
-            return Err(usage(format!(
-                "segment size {b} bytes is below libewf's minimum of 1 MiB"
-            )));
+        if req.target == ConversionTarget::E01 {
+            check_segment_bytes(b).map_err(usage)?;
         }
     }
 
@@ -1466,6 +1617,29 @@ async fn plan(
     }
     let mut inherited_stop = None;
     let mut inherited_unverified = None;
+    // C-4: an E01 dfdisk made from an image with zero-filled sectors (e.g.
+    // --rescue-to-e01) states them in its header notes only; without the
+    // report that lists them the output must not pass for a verified copy
+    let mut read_errors_note = None;
+    if let Some(stated) = ewf_source
+        .as_ref()
+        .and_then(|i| zero_filled_in_notes(i.notes.as_deref()?))
+    {
+        if inherited_errors.summary(RangeKind::Substituted).is_none() {
+            read_errors_note = Some(format!(
+                "not in the error list of {} and in no report found; its header notes (written by dfdisk) state: {stated}",
+                source_name(&source)
+            ));
+            inherited_unverified = Some(format!(
+                "the header notes of {} state that sectors of the medium were unreadable and are zeros in the image ({stated}), but their positions are not in its error list and no report of its acquisition that lists them was found",
+                source_name(&source)
+            ));
+            notes.push(format!(
+                "{} records zero-filled sectors only in its header notes ({stated}); give the report of its acquisition or conversion (--report) to list them",
+                source_name(&source)
+            ));
+        }
+    }
     if let Some(r) = &report {
         let rr = &r.reference;
         let what = format!(
@@ -1487,9 +1661,20 @@ async fn plan(
                     rr.outcome_reason
                 ));
             }
-            Outcome::Mismatch | Outcome::VerificationFailed => notes.push(format!(
-                "the source image's {what}; this conversion compares the image with the report's digests again"
-            )),
+            // C-3: a matching conversion of such an image is no verified
+            // copy of the medium
+            Outcome::Mismatch => {
+                inherited_unverified = Some(format!(
+                    "the source image is not confirmed to reproduce its medium: {what} (a digest of the image or of a second read of the source differed: {})",
+                    rr.outcome_reason
+                ));
+            }
+            Outcome::VerificationFailed => {
+                inherited_unverified = Some(format!(
+                    "the source image is not confirmed to reproduce its medium: {what} (its verification could not run or complete: {})",
+                    rr.outcome_reason
+                ));
+            }
             Outcome::Verified | Outcome::CompletedWithReadErrors => {}
         }
         if rr.hashes.is_empty() {
@@ -1573,10 +1758,22 @@ async fn plan(
         inherited_errors,
         inherited_stop,
         inherited_unverified,
+        read_errors_note,
         selection,
         settings,
         notes,
     })
+}
+
+/// The parts of E01 header notes in which dfdisk stated zero-filled
+/// sectors ([`ewf_notes`], [`rescue_notes`]), joined; `None` without.
+fn zero_filled_in_notes(notes: &str) -> Option<String> {
+    let parts: Vec<&str> = notes
+        .split("; ")
+        .map(str::trim)
+        .filter(|p| p.contains(ZEROS_NOTE_MARKER) || p.starts_with(RESCUE_NOTE_MARKER))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// Notes for the E01 header (`-N`): the case fields without an own header
@@ -1618,9 +1815,7 @@ fn ewf_notes(
         ));
     }
     if let Some(s) = errors.summary(RangeKind::Substituted) {
-        parts.push(format!(
-            "{s} unreadable in the acquisition, zeros in this image"
-        ));
+        parts.push(format!("{s} {ZEROS_NOTE_MARKER}"));
     }
     if let Some(s) = errors.summary(RangeKind::Unread) {
         parts.push(format!("{s} never read by the acquisition"));
@@ -1672,7 +1867,15 @@ fn check_destination(
         resumed_image_bytes: 0,
     };
     let notes = preflight::evaluate(&rules, &facts)?;
-    let existing = existing_conversion_outputs(&plan.output_dir, &plan.base_name, plan.target);
+    let mut existing = existing_conversion_outputs(&plan.output_dir, &plan.base_name, plan.target);
+    if plan.target == ConversionTarget::E01 {
+        existing.extend(existing_late_segments(
+            &plan.output_dir,
+            &plan.base_name,
+            plan.expected_bytes,
+            req.split_size.bytes(),
+        ));
+    }
     if !existing.is_empty() {
         let list = existing
             .iter()
@@ -1692,7 +1895,7 @@ fn check_destination(
             == primary
                 .file_name()
                 .map(|n| n.to_string_lossy().to_lowercase())
-            && same_dir(&parent_dir(&f.path), &plan.output_dir)
+            && same_path(&parent_dir(&f.path), &plan.output_dir)
         {
             return Err(AcquisitionError::refused(format!(
                 "the output {} would be the source {} itself",
@@ -1704,7 +1907,8 @@ fn check_destination(
     Ok((facts, notes))
 }
 
-fn same_dir(a: &Path, b: &Path) -> bool {
+/// The same file or directory (after resolving links), else the same path.
+fn same_path(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
@@ -1761,6 +1965,40 @@ impl Drop for ConversionAudit {
             self.write(Err(&AcquisitionError::failed(message)));
         }
     }
+}
+
+/// T8: a refused conversion (before "conversion_started", nothing written)
+/// is in the audit log as "conversion_refused", as a refused acquisition is
+/// ("acquisition_refused"); usage errors and failures are not. Returns
+/// `err` unchanged.
+fn record_refusal(
+    env: &ConvertEnv,
+    req: &ConversionRequest,
+    plan: Option<&Plan>,
+    err: AcquisitionError,
+    sink: &ProgressSink,
+) -> AcquisitionError {
+    if err.kind != ErrorKind::Refused {
+        return err;
+    }
+    let mut details = Map::new();
+    details.insert("target_format".into(), json!(req.target));
+    details.insert("output_dir".into(), json!(req.output_dir.to_string_lossy()));
+    let (source, target) = match plan {
+        Some(p) => {
+            details.insert("base_name".into(), json!(p.base_name));
+            details.insert("source_files".into(), json!(p.source_files));
+            (p.source.clone(), p.primary_output())
+        }
+        None => (req.source.clone(), req.output_dir.clone()),
+    };
+    if let Err(reason) = audit::conversion_refused(&env.audit_log, &source, &target, &err, details)
+    {
+        sink.warn(format!(
+            "the refusal was not recorded in the audit log: {reason}"
+        ));
+    }
+    err
 }
 
 fn started_details(plan: &Plan, destination: &DestinationFacts) -> Map<String, Value> {
@@ -1826,6 +2064,18 @@ fn finished_details(report: &ConversionReport) -> Map<String, Value> {
             "unread_sectors": t.unread_sectors(),
         }),
     );
+    if !report.conversion_errors.is_empty() {
+        let c = &report.conversion_errors;
+        put(
+            "conversion_errors",
+            json!({
+                "source": c.source,
+                "ranges": c.ranges.len(),
+                "substituted_bytes": c.substituted_bytes(),
+                "substituted_sectors": c.substituted_sectors(),
+            }),
+        );
+    }
     put("source_hashes", json!(report.source_hashes));
     put("output_hashes", json!(report.output_hashes));
     put("verification", json!(report.verification));
@@ -1864,6 +2114,10 @@ struct ToolRun {
     last_done: Option<u64>,
     /// "<tool>: SUCCESS" printed
     success_line: bool,
+    /// "Read errors during export:" (ewfexport): sectors it could not read
+    /// correctly from the EWF image (missing data: zeros in the output; a
+    /// checksum error: the data as stored)
+    export_errors: Option<RunBlock>,
 }
 
 impl ToolRun {
@@ -1922,6 +2176,7 @@ async fn run_tool(
     let mut calculated = HashResults::default();
     let mut last_done = None;
     let mut success_line = false;
+    let mut export_errors = ExportErrors::default();
     let started = Instant::now();
     let outcome = process::run(spec, &stop.stop_control(), Some(recorder), |ev| {
         let ProcessEvent::Line { stream, text, .. } = ev else {
@@ -1934,6 +2189,7 @@ async fn run_tool(
         if line == success_marker {
             success_line = true;
         }
+        export_errors.feed(line);
         if let Some((DigestOrigin::Calculated, alg, v)) = parse_digest_line(line) {
             set_digest(&mut calculated, alg, v);
         }
@@ -1987,7 +2243,31 @@ async fn run_tool(
         calculated,
         last_done,
         success_line,
+        export_errors: export_errors.block,
     })
+}
+
+/// Collects ewfexport's "Read errors during export:" block from its output
+/// lines (indentation already removed).
+#[derive(Debug, Default)]
+struct ExportErrors {
+    block: Option<RunBlock>,
+    inside: bool,
+}
+
+impl ExportErrors {
+    fn feed(&mut self, line: &str) {
+        if self.inside {
+            self.inside = self
+                .block
+                .get_or_insert_with(RunBlock::default)
+                .feed_trimmed(line);
+        }
+        if line.trim().trim_end_matches(':') == EXPORT_ERRORS_TITLE {
+            self.inside = true;
+            self.block.get_or_insert_with(RunBlock::default);
+        }
+    }
 }
 
 /// The ewfacquire command of a RAW to E01 conversion.
@@ -2069,6 +2349,8 @@ struct Measured {
     verification: Option<VerificationResult>,
     verification_method: String,
     notes: Vec<String>,
+    /// Sectors the tool could not read correctly from the source image
+    conversion_errors: ReadErrorTable,
 }
 
 /// Hash `paths` on a blocking thread, with the bytes done in `counter`.
@@ -2208,7 +2490,7 @@ async fn raw_to_e01(
         m.verification = Some(VerificationResult::NotPossible {
             reason: "the conversion did not complete".into(),
         });
-        flush(&m, plan, sink);
+        flush(env, &m, plan, sink);
         return Ok(m);
     }
     if let Some(seen) = tool
@@ -2225,20 +2507,25 @@ async fn raw_to_e01(
         }
     }
 
-    flush(&m, plan, sink);
+    let flushed = flush(env, &m, plan, sink);
 
     // Verification: what the E01 says, then a full re-read by ewfverify
     sink.phase(
         AcquisitionStatus::Verifying,
-        "Verifying the E01 (ewfverify, after fsync and page-cache eviction)",
+        format!("Verifying the E01 (ewfverify, {})", flushed.method()),
     );
     let first = m.output_files[0].clone();
-    let mut failure = None;
+    // T1: an output that is not durable on the destination is not verified
+    let mut failure = flushed.failure();
     match ewfinfo(env, &first, stop, recorder).await {
         Ok(info) => {
             m.bytes_converted = info.media_size.unwrap_or(0);
             if info.media_size.is_none() {
                 failure = Some("ewfinfo did not report the media size of the E01".to_string());
+            } else if info.corrupted {
+                failure = Some(
+                    "ewfinfo reports the written E01 as corrupted (\"Is corrupted: yes\")".into(),
+                );
             }
         }
         Err(e) if e.kind == ErrorKind::Aborted => {
@@ -2317,13 +2604,14 @@ async fn raw_to_e01(
     }
     m.verification = Some(overall(&m.comparisons, failure));
     m.verification_method = format!(
-        "ewfverify -d {} of the E01 after fsync and page-cache eviction, compared with {}",
+        "ewfverify -d {} of the E01 {}, compared with {}",
         plan.selection
             .algorithms()
             .iter()
             .map(|a| a.label())
             .collect::<Vec<_>>()
             .join(","),
+        flushed.method(),
         match report_ref {
             Some(r) => format!(
                 "the digests of the {} report {}",
@@ -2337,20 +2625,161 @@ async fn raw_to_e01(
     Ok(m)
 }
 
-fn flush(m: &Measured, plan: &Plan, sink: &ProgressSink) {
+/// What flushing the outputs left (T1).
+#[derive(Debug, Default)]
+struct Flushed {
+    /// Why an output image (or its directory entry) may not be durable on
+    /// the destination
+    not_durable: Vec<String>,
+    /// Why an output image may still be in the page cache
+    not_evicted: Vec<String>,
+}
+
+impl Flushed {
+    /// The verification failure when an output image is not durable.
+    fn failure(&self) -> Option<String> {
+        (!self.not_durable.is_empty()).then(|| {
+            format!(
+                "the output could not be flushed durably to the destination: {}",
+                self.not_durable.join("; ")
+            )
+        })
+    }
+
+    /// How the output was flushed before it was re-read: only what happened.
+    fn method(&self) -> String {
+        if !self.not_durable.is_empty() {
+            "after a failed fsync of the output".into()
+        } else if !self.not_evicted.is_empty() {
+            format!(
+                "after fsync; the output could not be evicted from the page cache ({}), so the re-read may have come from memory",
+                self.not_evicted.join("; ")
+            )
+        } else {
+            "after fsync and page-cache eviction".into()
+        }
+    }
+}
+
+/// fsync every output and auxiliary file, evict it from the page cache,
+/// fsync the directory. Every problem is a warning (a note of the report);
+/// those of output images are returned for the verification.
+fn flush(env: &ConvertEnv, m: &Measured, plan: &Plan, sink: &ProgressSink) -> Flushed {
     sink.phase(
         AcquisitionStatus::Flushing,
         "Flushing the output to the destination and evicting it from the page cache",
     );
-    let files: Vec<PathBuf> = m
+    let mut out = Flushed::default();
+    let files = m
         .output_files
         .iter()
-        .chain(m.auxiliary.iter())
-        .cloned()
-        .collect();
-    for problem in flush_and_evict(&files, &plan.output_dir) {
-        sink.warn(problem);
+        .map(|p| (p, true))
+        .chain(m.auxiliary.iter().map(|p| (p, false)));
+    for (path, image) in files {
+        let problem = |p: String, list: &mut Vec<String>| {
+            sink.warn(p.clone());
+            if image {
+                list.push(p);
+            }
+        };
+        match fs::File::open(path) {
+            Ok(f) => {
+                if let Err(e) = (env.flush.sync)(path, &f) {
+                    problem(
+                        format!("fsync of {} failed: {e}", path.display()),
+                        &mut out.not_durable,
+                    );
+                }
+                if let Err(e) = (env.flush.evict)(path, &f) {
+                    problem(
+                        format!(
+                            "{} could not be evicted from the page cache: {e}",
+                            path.display()
+                        ),
+                        &mut out.not_evicted,
+                    );
+                }
+            }
+            Err(e) => problem(
+                format!("{} cannot be opened to flush it: {e}", path.display()),
+                &mut out.not_durable,
+            ),
+        }
     }
+    if let Err(e) = sync_dir(&plan.output_dir) {
+        let p = format!(
+            "fsync of the output directory {} failed: {e}",
+            plan.output_dir.display()
+        );
+        sink.warn(p.clone());
+        if !m.output_files.is_empty() {
+            out.not_durable.push(p);
+        }
+    }
+    out
+}
+
+/// Why an E01 to RAW output is not the whole source image, and the sectors
+/// ewfexport could not read correctly (C-1): ewfinfo's "Is corrupted: yes"
+/// (segments missing, or never finalized) and ewfexport's "Read errors
+/// during export" (both libewf lines: zeros where data is missing from the
+/// image, the data as stored where a chunk's checksum does not match).
+fn export_problems(plan: &Plan, tool: &ToolRun, out_len: u64) -> (Vec<String>, ReadErrorTable) {
+    let src = source_name(&plan.source);
+    let mut problems = Vec::new();
+    if plan.ewf_source.as_ref().is_some_and(|i| i.corrupted) {
+        problems.push(format!(
+            "ewfinfo reports {src} as corrupted (\"Is corrupted: yes\"): segments of it are missing or it was never finalized (an interrupted acquisition), so it does not hold the whole source image"
+        ));
+    }
+    let mut table = ReadErrorTable::new(
+        plan.settings.bytes_per_sector,
+        format!("ewfexport (read errors during export of {src})"),
+    );
+    if let Some(block) = &tool.export_errors {
+        for r in &block.runs {
+            table.push_sectors(r.first, r.count, RangeKind::Unread);
+        }
+        table.normalise();
+        let what = table
+            .summary(RangeKind::Unread)
+            .unwrap_or_else(|| "sectors".into());
+        // Measured on both libewf lines: data missing from the E01 is
+        // written as zeros, a chunk whose checksum does not match as stored
+        let mut p = format!(
+            "ewfexport could not read {what} of {src} correctly (data missing from the image, or a checksum that does not match): the output holds zeros or unchecked data there, not verified data of the image (listed under the read errors of this conversion)"
+        );
+        if block.incomplete() {
+            p.push_str(&format!(
+                "; it reported {} whose positions could not all be determined{}",
+                block
+                    .total
+                    .map(|n| crate::models::text::plural(n, "read error", "read errors"))
+                    .unwrap_or_else(|| "read errors".into()),
+                if block.unparsed.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (not understood: {})", block.unparsed.join(" | "))
+                }
+            ));
+        }
+        if out_len < table.ranges.last().map(|r| r.end()).unwrap_or(0) {
+            p.push_str(&format!(
+                "; the output file ends at byte {out_len}, before the last of them"
+            ));
+        }
+        problems.push(p);
+    }
+    (problems, table)
+}
+
+/// Bytes of `table` that lie inside an output of `len` bytes.
+fn zeros_within(table: &ReadErrorTable, len: u64) -> u64 {
+    table
+        .ranges
+        .iter()
+        .map(|r| r.end().min(len).saturating_sub(r.offset.min(len)))
+        .sum()
 }
 
 /// E01 to RAW: ewfexport, then dfdisk hashes the written RAW file and
@@ -2404,10 +2833,18 @@ async fn e01_to_raw(
             AcquisitionError::failed(tool.failure("ewfexport"))
         });
     }
-    m.bytes_converted = fs::metadata(&raw).map(|md| md.len()).unwrap_or(0);
+    let out_len = fs::metadata(&raw).map(|md| md.len()).unwrap_or(0);
+    m.bytes_converted = out_len;
+    // C-1: what the E01 lacks. libewf 20140816 exports a corrupted E01
+    // (missing segments, never finalized) with zeros where it cannot read
+    // and ends with SUCCESS; the output then is not the whole source image
+    let (problems, errors) = export_problems(plan, &tool, out_len);
+    m.bytes_converted = out_len.saturating_sub(zeros_within(&errors, out_len));
+    m.conversion_errors = errors;
     if !tool.completed() || m.output_files.is_empty() {
+        let mut reasons = problems;
         if !m.aborted {
-            m.stop_reason = Some(if m.output_files.is_empty() {
+            reasons.push(if m.output_files.is_empty() {
                 format!(
                     "ewfexport wrote no RAW file {}: {}",
                     raw.display(),
@@ -2417,27 +2854,25 @@ async fn e01_to_raw(
                 tool.failure("ewfexport")
             });
         }
+        m.stop_reason = (!reasons.is_empty()).then(|| reasons.join("; "));
         m.verification = Some(VerificationResult::NotPossible {
             reason: "the conversion did not complete".into(),
         });
-        flush(&m, plan, sink);
+        flush(env, &m, plan, sink);
         return Ok(m);
     }
-    flush(&m, plan, sink);
+    if !problems.is_empty() {
+        m.stop_reason = Some(problems.join("; "));
+    }
+    let flushed = flush(env, &m, plan, sink);
 
     sink.phase(
         AcquisitionStatus::Verifying,
-        "Hashing the written RAW file (after fsync and page-cache eviction)",
+        format!("Hashing the written RAW file ({})", flushed.method()),
     );
-    let mut failure = None;
-    let output = match hash_with_gauge(
-        vec![raw.clone()],
-        plan.selection,
-        stop,
-        sink,
-        m.bytes_converted,
-    )
-    .await
+    // T1: an output that is not durable on the destination is not verified
+    let mut failure = flushed.failure();
+    let output = match hash_with_gauge(vec![raw.clone()], plan.selection, stop, sink, out_len).await
     {
         Ok(h) => h,
         Err(HashError::Aborted) => {
@@ -2477,6 +2912,11 @@ async fn e01_to_raw(
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+    } else if plan.ewf_source.as_ref().is_some_and(|i| i.corrupted) {
+        m.notes.push(format!(
+            "no digest stored in {} could be read: an E01 stores its digests in its last segment, which is missing or was never written (ewfinfo: corrupted)",
+            source_name(&plan.source)
+        ));
     } else {
         m.notes.push(format!(
             "{} stores no digest of its media data",
@@ -2511,7 +2951,8 @@ async fn e01_to_raw(
     ));
     m.verification = Some(overall(&m.comparisons, failure));
     m.verification_method = format!(
-        "RAW file hashed by dfdisk after fsync and page-cache eviction, compared with {}",
+        "RAW file hashed by dfdisk {}, compared with {}",
+        flushed.method(),
         if references.is_empty() {
             "nothing independent".to_string()
         } else {
@@ -2537,9 +2978,12 @@ async fn run(
     let recorder = ProvenanceRecorder::new();
     sink.phase(AcquisitionStatus::Preparing, "Checking the conversion");
 
-    // 1-2: nothing is written before these pass
-    let plan = plan(env, req, stop, &recorder).await?;
-    let (destination, destination_notes) = check_destination(env, req, &plan)?;
+    // 1-2: nothing is written before these pass; a refusal is recorded
+    let plan = plan(env, req, stop, &recorder)
+        .await
+        .map_err(|e| record_refusal(env, req, None, e, sink))?;
+    let (destination, destination_notes) = check_destination(env, req, &plan)
+        .map_err(|e| record_refusal(env, req, Some(&plan), e, sink))?;
     if stop.is_aborted() {
         return Err(AcquisitionError::aborted(
             "the conversion was aborted before anything was written",
@@ -2547,7 +2991,8 @@ async fn run(
     }
 
     // 3: first write, then "conversion_started"
-    let mut output = preflight::prepare_output(&plan.output_dir, &plan.report_base(), false)?;
+    let mut output = preflight::prepare_output(&plan.output_dir, &plan.report_base(), false)
+        .map_err(|e| record_refusal(env, req, Some(&plan), e, sink))?;
     let target_path = plan.primary_output();
     let audit_info = match audit::conversion_started(
         &env.audit_log,
@@ -2668,6 +3113,8 @@ async fn build_report(
     report.bytes_converted = m.bytes_converted;
     report.aborted = m.aborted;
     report.read_errors = plan.inherited_errors.clone();
+    report.read_errors_note = plan.read_errors_note.clone();
+    report.conversion_errors = m.conversion_errors;
     report.stop_reason = match (m.stop_reason, plan.inherited_stop.clone()) {
         (Some(a), Some(b)) => Some(format!("{a}; {b}")),
         (a, b) => a.or(b),
@@ -2776,6 +3223,61 @@ mod tests {
 
     /// ewfacquire 20140816 status block (sentences end with a period).
     const EWFACQUIRE_LEGACY_STATUS: &str = "Status: at 30%.\n        acquired 61 MiB (64749568 bytes) of total 200 MiB (209715200 bytes).\n        completion in 9 second(s) with 15 MiB/s (16131938 bytes/second).\n";
+
+    /// ewfinfo of an E01 whose last segment is missing (libewf 20231119;
+    /// 20140816 prints the same lines without the colons after the titles).
+    const EWFINFO_CORRUPTED: &str = "ewfinfo 20231119\n\nAcquiry information:\n\tCase number:\t\tc\n\nEWF information:\n\tFile format:\t\tEnCase 6\n\tSectors per chunk:\t64\n\tError granularity:\t64\n\tCompression method:\tdeflate\n\tCompression level:\tno compression\n\tIs corrupted:\t\tyes\n\nMedia information:\n\tMedia type:\t\tfixed disk\n\tIs physical:\t\tyes\n\tBytes per sector:\t512\n\tNumber of sectors:\t6144\n\tMedia size:\t\t3.0 MiB (3145728 bytes)\n\n";
+
+    /// ewfexport 20140816 on that E01: zeros for what it cannot read, then
+    /// SUCCESS (standard error, then standard output), captured.
+    const EWFEXPORT_LEGACY_ERRORS: &str = "ewfexport 20140816\n\n\nExport started at: Oct 15, 2026 08:07:33\nThis could take a while.\n\nExport completed at: Oct 15, 2026 08:07:33\n\nWritten: 3.0 MiB (3145728 bytes) in 0 second(s).\nMD5 hash calculated over data:\t\t6e17beab9ec6f8bbe2610f26664b87ad\nRead errors during export:\n\ttotal number: 1\n\tat sector(s): 5952 - 6143 (number: 192) in segment file(s):\n\newfexport: SUCCESS\n";
+
+    #[test]
+    fn a_corrupted_e01_and_ewfexports_read_errors_are_recognised() {
+        let info = parse_ewfinfo(EWFINFO_CORRUPTED);
+        assert!(info.corrupted);
+        assert_eq!(info.media_size, Some(3_145_728));
+        assert!(info.stored.is_empty());
+        let legacy = EWFINFO_CORRUPTED
+            .replace("information:", "information")
+            .replace("ewfinfo 20231119", "ewfinfo 20140816");
+        assert!(parse_ewfinfo(&legacy).corrupted);
+        assert!(!parse_ewfinfo(EWFINFO_WITH_ERRORS).corrupted);
+
+        let mut e = ExportErrors::default();
+        for line in EWFEXPORT_LEGACY_ERRORS.lines() {
+            let t = line.trim();
+            if !t.is_empty() {
+                e.feed(t);
+            }
+        }
+        let block = e.block.unwrap();
+        assert_eq!(block.total, Some(1));
+        assert_eq!(block.runs.len(), 1);
+        assert_eq!((block.runs[0].first, block.runs[0].count), (5952, 192));
+        assert!(!block.incomplete());
+        // A count without positions fails closed
+        let mut e = ExportErrors::default();
+        for t in [
+            "Read errors during export:",
+            "total number: 2",
+            "at sector(s): somewhere",
+            "ewfexport: SUCCESS",
+        ] {
+            e.feed(t);
+        }
+        assert!(e.block.unwrap().incomplete());
+        // No block: nothing
+        let mut e = ExportErrors::default();
+        e.feed("ewfexport: SUCCESS");
+        assert!(e.block.is_none());
+
+        let mut t = ReadErrorTable::new(512, "x");
+        t.push_sectors(5952, 192, RangeKind::Unread);
+        assert_eq!(zeros_within(&t, 3 << 20), 192 * 512);
+        assert_eq!(zeros_within(&t, 5952 * 512 + 512), 512);
+        assert_eq!(zeros_within(&t, 1000), 0);
+    }
 
     #[test]
     fn both_libewf_lines_parse_the_same() {
@@ -3012,6 +3514,40 @@ mod tests {
     }
 
     #[test]
+    fn ewf_families_beyond_ezz_are_complete() {
+        // C-2: 811 segments, as ewfacquire writes 811 MiB with -S 1MiB
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let names: Vec<String> = (1..=811)
+            .map(|n| ewf::segment_extension("E01", n).unwrap())
+            .collect();
+        assert_eq!(names[774], "EZZ");
+        assert_eq!(names[775], "FAA");
+        assert_eq!(names[810], "FBJ");
+        for ext in &names {
+            touch(d, &format!("x.{ext}"), 1);
+        }
+        touch(d, "x.raw", 1);
+        touch(d, "x.RAW", 1);
+        let set = ewf_segments(&d.join("x.E01")).unwrap();
+        assert_eq!(set.len(), 811);
+        assert!(set[775].path.ends_with("x.FAA"));
+        assert!(set[810].path.ends_with("x.FBJ"));
+        let written = written_segments(d, "x");
+        assert_eq!(written.len(), 811);
+        assert_eq!(
+            written,
+            set.iter().map(|f| f.path.clone()).collect::<Vec<_>>()
+        );
+        // Existing late segments refuse an E01 output that can reach them,
+        // never a source named like one when it cannot
+        let late = existing_late_segments(d, "x", 811 << 20, Some(1 << 20));
+        assert_eq!(late.len(), 811 - 775, "{late:?}");
+        assert!(existing_late_segments(d, "x", 3 << 20, Some(1 << 20)).is_empty());
+        assert!(existing_late_segments(d, "x", 811 << 20, None).is_empty());
+    }
+
+    #[test]
     fn existing_outputs_are_found_case_insensitively() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
@@ -3172,6 +3708,55 @@ mod tests {
             ),
             Err(HashError::Io(_))
         ));
+    }
+
+    #[test]
+    fn rescue_notes_say_how_many_ranges_they_list() {
+        use crate::models::config::{AcquisitionConfig, EffectiveConfig};
+        let config = AcquisitionConfig::rescue("/out");
+        let mut report = ForensicInfoReport::new(
+            EngineKind::Rescue,
+            &CaseMetadata::default(),
+            Default::default(),
+            EffectiveConfig::build(&config, None),
+        );
+        let json = Path::new("/out/b.info.json");
+        let mut t = ReadErrorTable::new(512, "ddrescue mapfile");
+        for i in 0..25u64 {
+            t.push(i * 4096, 512, RangeKind::Substituted);
+        }
+        report.read_errors = t;
+        let notes = rescue_notes(&report, json);
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].starts_with(
+                "Zero-filled sectors of the rescue (ddrescue mapfile, 512 bytes each), the first 20 of 25 ranges: 0-0, 8-8,"
+            ),
+            "{notes:?}"
+        );
+        assert!(
+            notes[0].ends_with("152-152 and 5 more ranges (see b.info.json)"),
+            "{notes:?}"
+        );
+        // All listed: no count
+        report.read_errors.ranges.truncate(2);
+        let notes = rescue_notes(&report, json);
+        assert_eq!(
+            notes[0],
+            "Zero-filled sectors of the rescue (ddrescue mapfile, 512 bytes each): 0-0, 8-8"
+        );
+        // Both forms are found again in E01 header notes
+        let header = format!(
+            "Notes: x; Converted by dfdisk 0.2.0 from b.raw; 2 sectors (1 KiB) in 2 ranges {ZEROS_NOTE_MARKER}; {}",
+            notes[0]
+        );
+        let found = zero_filled_in_notes(&header).unwrap();
+        assert!(
+            found.starts_with("2 sectors (1 KiB) in 2 ranges unreadable"),
+            "{found}"
+        );
+        assert!(found.ends_with("0-0, 8-8"), "{found}");
+        assert_eq!(zero_filled_in_notes("Notes: x; Converted by dfdisk"), None);
     }
 
     #[test]

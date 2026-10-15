@@ -8,7 +8,7 @@
 
 mod common;
 
-use dfdisk::engines::converter::{convert_with, ConvertEnv, ConverterTools};
+use dfdisk::engines::converter::{convert_with, ConvertEnv, ConverterTools, FileFlush};
 use dfdisk::engines::ErrorKind;
 use dfdisk::models::case::CaseMetadata;
 use dfdisk::models::config::{
@@ -97,6 +97,7 @@ fn fixture() -> Fixture {
         mountinfo: None,
         grace: Duration::from_secs(15),
         export_audit: false,
+        flush: FileFlush::default(),
     };
     Fixture {
         _tmp: tmp,
@@ -144,6 +145,22 @@ fn audit_actions(log: &Path) -> Vec<Value> {
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).unwrap())
         .collect()
+}
+
+/// Abort `stop` once `file` exists with more than `min_len` bytes (at most
+/// 30 s later): a fixed delay raced with a slow tool start under load, and an
+/// abort before the tool wrote anything is (correctly) an error, not a report.
+fn abort_once_written(stop: &StopFlags, file: PathBuf, min_len: u64) {
+    let flag = stop.clone();
+    tokio::spawn(async move {
+        for _ in 0..1500 {
+            if std::fs::metadata(&file).is_ok_and(|m| m.len() > min_len) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        flag.abort.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
 }
 
 fn ewfinfo(image: &Path) -> String {
@@ -378,7 +395,17 @@ async fn existing_output_is_refused_before_any_tool_runs() {
         b"earlier evidence"
     );
     assert_eq!(files_in(&f.out), vec!["X.e01"]);
-    assert!(audit_actions(&f.env.audit_log).is_empty());
+    // T8: the refusal is in the audit log, and nothing else
+    let records = audit_actions(&f.env.audit_log);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["action"], "conversion_refused");
+    assert_eq!(records[0]["outcome"], "refused");
+    assert_eq!(records[0]["details"]["exit_code"], 3);
+    assert_eq!(records[0]["details"]["base_name"], "x");
+    assert!(records[0]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Refusing to overwrite"));
 
     // E01 to RAW: an existing RAW (here the image the E01 was made from) refuses too
     let mut req = request(&raw, ConversionTarget::E01, &f.src);
@@ -553,6 +580,46 @@ async fn read_errors_and_verdicts_of_the_source_acquisition_are_inherited() {
         "{}",
         r.outcome_reason
     );
+
+    // C-3: an acquisition whose verification found a mismatch or failed:
+    // a matching conversion is not a verified copy of the medium
+    for (n, result) in [
+        VerificationResult::Mismatched {
+            method: "second read of the source".into(),
+            details: "source changed or unstable: MD5 differs".into(),
+        },
+        VerificationResult::Failed {
+            reason: "the second source read failed: EIO".into(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let label = match &result {
+            VerificationResult::Mismatched { .. } => "HASH MISMATCH",
+            _ => "VERIFICATION FAILED",
+        };
+        acquisition_report(&raw, &content, |r| r.verification.result = result);
+        let r = run(
+            &f.env,
+            request(&raw, ConversionTarget::E01, &f.root.join(format!("c3-{n}"))),
+            StopFlags::new(),
+        )
+        .await
+        .unwrap();
+        let text = r.render_text();
+        assert_eq!(r.outcome, Outcome::CompleteUnverified, "{text}");
+        assert_eq!(r.exit_code, exit_code::UNVERIFIED);
+        assert!(r.comparisons[0].result.is_matched(), "{text}");
+        assert!(
+            r.outcome_reason
+                .contains("not confirmed to reproduce its medium"),
+            "{}",
+            r.outcome_reason
+        );
+        assert!(r.outcome_reason.contains(label), "{}", r.outcome_reason);
+        assert!(!text.contains("ALL COMPARED DIGESTS MATCH"), "{text}");
+    }
 
     // An incomplete acquisition: the converted image is incomplete too
     acquisition_report(&raw, &content, |r| {
@@ -788,11 +855,7 @@ async fn abort_stops_ewfacquire_and_reports_aborted() {
     req.case = Some(case());
     req.compression = CompressionLevel::Best;
     let stop = StopFlags::new();
-    let flag = stop.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        flag.abort.store(true, std::sync::atomic::Ordering::SeqCst);
-    });
+    abort_once_written(&stop, f.out.join("x.E01"), 0);
     let started = std::time::Instant::now();
     let r = run(&f.env, req, stop).await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(20));
@@ -830,6 +893,390 @@ async fn abort_stops_ewfacquire_and_reports_aborted() {
     }
 }
 
+/// libewf 20140816 (the Debian/Ubuntu ewf-tools line) is the one on PATH.
+fn legacy_libewf() -> bool {
+    std::process::Command::new("ewfexport")
+        .arg("-V")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("20140816"))
+}
+
+/// What every conversion of a corrupted E01 must state (C-1), on both
+/// libewf lines: 20231119's ewfexport fails, 20140816's writes zeros for
+/// what it cannot read and ends with SUCCESS.
+fn assert_corrupted_e01_conversion(r: &ConversionReport, out_raw: &Path) {
+    let text = r.render_text();
+    assert_eq!(r.outcome, Outcome::Incomplete, "{text}");
+    assert_eq!(r.exit_code, exit_code::INCOMPLETE);
+    let stop = r.stop_reason.clone().unwrap_or_default();
+    assert!(stop.contains("\"Is corrupted: yes\""), "{stop}");
+    assert!(
+        !text.contains("The whole source image was converted"),
+        "{text}"
+    );
+    assert!(r.bytes_converted < r.expected_bytes, "{text}");
+    assert!(!text.contains("100.0%"), "{text}");
+    assert!(
+        !text.contains("stores no digest of its media data"),
+        "{text}"
+    );
+    if legacy_libewf() {
+        // Zeros for the missing part, listed with their positions
+        assert!(r.conversion_errors.unread_bytes() > 0, "{text}");
+        assert!(stop.contains("ewfexport could not read"), "{stop}");
+        assert!(text.contains("[READ ERRORS OF THIS CONVERSION]"), "{text}");
+        assert_eq!(
+            r.bytes_converted + r.conversion_errors.unread_bytes(),
+            r.expected_bytes,
+            "{text}"
+        );
+        let out = std::fs::read(out_raw).unwrap();
+        for range in &r.conversion_errors.ranges {
+            let (a, b) = (range.offset as usize, range.end() as usize);
+            assert!(out[a..b.min(out.len())].iter().all(|x| *x == 0));
+        }
+    }
+}
+
+/// C-1: a chunk whose checksum does not match is exported as stored (both
+/// libewf lines report it under "Read errors during export"); the report
+/// lists it and never calls it zeros or converted.
+#[tokio::test]
+async fn a_chunk_that_fails_its_checksum_is_listed_not_converted() {
+    if !have_libewf() {
+        return;
+    }
+    let f = fixture();
+    let content = data(1 << 20, 26);
+    let raw = f.src.join("x.raw");
+    std::fs::write(&raw, &content).unwrap();
+    let mut req = request(&raw, ConversionTarget::E01, &f.root.join("e01"));
+    req.case = Some(case());
+    req.compression = CompressionLevel::None;
+    run(&f.env, req, StopFlags::new()).await.unwrap();
+    let e01 = f.root.join("e01").join("x.E01");
+    // Overwrite 8 bytes of chunk data (uncompressed E01, past the headers)
+    {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::OpenOptions::new().write(true).open(&e01).unwrap();
+        file.write_all_at(b"XXXXXXXX", 300_000).unwrap();
+    }
+    let alone = f.root.join("alone");
+    std::fs::create_dir_all(&alone).unwrap();
+    std::fs::copy(&e01, alone.join("x.E01")).unwrap();
+    let mut req = request(&alone.join("x.E01"), ConversionTarget::Raw, &f.out);
+    req.case = Some(case());
+    let r = run(&f.env, req, StopFlags::new()).await.unwrap();
+    let text = r.render_text();
+    assert_eq!(r.outcome, Outcome::Incomplete, "{text}");
+    assert_eq!(r.conversion_errors.ranges.len(), 1, "{text}");
+    assert_eq!(r.conversion_errors.unread_bytes(), 64 * 512);
+    assert_eq!(r.bytes_converted, (1 << 20) - 64 * 512);
+    let stop = r.stop_reason.clone().unwrap();
+    assert!(stop.contains("could not read 64 sectors"), "{stop}");
+    assert!(stop.contains("zeros or unchecked data"), "{stop}");
+    assert!(!text.contains("zero-filled"), "{text}");
+    // The output holds the data as stored, not zeros
+    let out = std::fs::read(f.out.join("x.raw")).unwrap();
+    assert_eq!(out.len(), 1 << 20);
+    assert!(out[288 * 1024..320 * 1024].iter().any(|b| *b != 0));
+}
+
+/// C-4: an E01 made from a rescue (as --rescue-to-e01 does) records its
+/// zero-filled sectors only in its header notes; converted back without the
+/// reports that list them, the output must not pass for a verified copy.
+#[tokio::test]
+async fn zero_filled_sectors_recorded_only_in_the_e01_notes_are_never_verified() {
+    if !have_libewf() {
+        return;
+    }
+    let f = fixture();
+    let mut content = data(1 << 20, 23);
+    content[4096..5120].fill(0);
+    let raw = f.src.join("x.raw");
+    std::fs::write(&raw, &content).unwrap();
+    let report_json = acquisition_report(&raw, &content, |r| {
+        r.engine = EngineKind::Rescue;
+        r.acquisition_hashes = HashResults::default();
+        let mut t = ReadErrorTable::new(512, "ddrescue mapfile");
+        t.push(4096, 1024, RangeKind::Substituted);
+        r.read_errors = t;
+        r.verification.result = VerificationResult::NotPossible {
+            reason: "ddrescue computes no digest".into(),
+        };
+    });
+    let rescue =
+        ForensicInfoReport::from_json(&std::fs::read_to_string(&report_json).unwrap()).unwrap();
+    assert_eq!(rescue.outcome, Outcome::CompletedWithReadErrors);
+    let e01_dir = f.root.join("e01");
+    let mut req = request(&raw, ConversionTarget::E01, &e01_dir);
+    req.notes = dfdisk::engines::converter::rescue_notes(&rescue, &report_json);
+    req.source_report = Some(report_json.clone());
+    let made = run(&f.env, req, StopFlags::new()).await.unwrap();
+    assert_eq!(made.outcome, Outcome::CompletedWithReadErrors);
+    let e01 = e01_dir.join("x.E01");
+    let info = ewfinfo(&e01);
+    assert!(info.contains("Zero-filled sectors of the rescue"), "{info}");
+
+    // Next to its conversion report: the ranges are inherited from it
+    let r = run(
+        &f.env,
+        request(&e01, ConversionTarget::Raw, &f.root.join("with")),
+        StopFlags::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        r.outcome,
+        Outcome::CompletedWithReadErrors,
+        "{}",
+        r.render_text()
+    );
+    assert_eq!(r.read_errors.substituted_bytes(), 1024);
+
+    // Alone: never VERIFIED, and the report does not say "none recorded"
+    let alone = f.root.join("alone");
+    std::fs::create_dir_all(&alone).unwrap();
+    std::fs::copy(&e01, alone.join("x.E01")).unwrap();
+    let r = run(
+        &f.env,
+        request(&alone.join("x.E01"), ConversionTarget::Raw, &f.out),
+        StopFlags::new(),
+    )
+    .await
+    .unwrap();
+    let text = r.render_text();
+    assert_eq!(r.outcome, Outcome::CompleteUnverified, "{text}");
+    assert_eq!(r.exit_code, exit_code::UNVERIFIED);
+    assert!(r.comparisons[0].result.is_matched(), "{text}");
+    assert!(
+        r.outcome_reason.contains("header notes"),
+        "{}",
+        r.outcome_reason
+    );
+    assert!(!text.contains("none recorded"), "{text}");
+    assert!(
+        text.contains("its header notes (written by dfdisk) state: 2 sectors (1 KiB) in 1 range unreadable in the acquisition, zeros in this image; Zero-filled sectors of the rescue (ddrescue mapfile, 512 bytes each): 8-9"),
+        "{text}"
+    );
+}
+
+/// fsync fails for output images (`.E01` segments, the `.raw` output).
+fn failing_image_sync(path: &Path, f: &std::fs::File) -> std::io::Result<()> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext.starts_with('e') || ext == "raw" {
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
+    } else {
+        f.sync_all()
+    }
+}
+
+/// Eviction from the page cache fails for every file.
+fn failing_evict(_: &Path, _: &std::fs::File) -> std::io::Result<()> {
+    Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// T1: an output image that cannot be fsynced is not verified (exit 4), and
+/// no method text claims an fsync or an eviction that failed.
+#[tokio::test]
+async fn an_output_that_cannot_be_flushed_is_never_verified() {
+    if !have_libewf() {
+        return;
+    }
+    let f = fixture();
+    let content = data(1 << 20, 25);
+    let raw = f.src.join("x.raw");
+    std::fs::write(&raw, &content).unwrap();
+    let mut env = f.env.clone();
+    env.flush.sync = failing_image_sync;
+    let mut req = request(&raw, ConversionTarget::E01, &f.root.join("e01"));
+    req.case = Some(case());
+    let r = run(&env, req, StopFlags::new()).await.unwrap();
+    let text = r.render_text();
+    assert_eq!(r.outcome, Outcome::VerificationFailed, "{text}");
+    assert_eq!(r.exit_code, exit_code::FAILED);
+    let VerificationResult::Failed { reason } = &r.verification else {
+        panic!("{:?}", r.verification)
+    };
+    assert!(
+        reason.contains("could not be flushed durably to the destination"),
+        "{reason}"
+    );
+    assert!(reason.contains("x.E01"), "{reason}");
+    assert!(!r
+        .verification_method
+        .contains("fsync and page-cache eviction"));
+    assert!(!text.contains("after fsync and"), "{text}");
+
+    // E01 to RAW: the RAW output (of an E01 converted without trouble)
+    let mut req = request(&raw, ConversionTarget::E01, &f.root.join("good"));
+    req.case = Some(case());
+    let good = run(&f.env, req, StopFlags::new()).await.unwrap();
+    assert_eq!(good.outcome, Outcome::Verified, "{}", good.render_text());
+    let made = f.root.join("good").join("x.E01");
+    let r = run(
+        &env,
+        request(&made, ConversionTarget::Raw, &f.out),
+        StopFlags::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        r.outcome,
+        Outcome::VerificationFailed,
+        "{}",
+        r.render_text()
+    );
+    assert!(!r.verification_method.contains("page-cache eviction"));
+
+    // Eviction alone fails: verified, but the method says the re-read may
+    // have come from memory
+    let mut env = f.env.clone();
+    env.flush.evict = failing_evict;
+    let r = run(
+        &env,
+        request(&made, ConversionTarget::Raw, &f.root.join("evict")),
+        StopFlags::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.outcome, Outcome::Verified, "{}", r.render_text());
+    assert!(
+        r.verification_method
+            .contains("so the re-read may have come from memory"),
+        "{}",
+        r.verification_method
+    );
+}
+
+/// C-5: a report the caller found next to the image (not the examiner's
+/// --report) that describes another image of the same base name is ignored
+/// with a note; the converter then finds the image's own report.
+#[tokio::test]
+async fn a_report_found_by_the_caller_for_another_image_is_ignored() {
+    if !have_libewf() {
+        return;
+    }
+    let f = fixture();
+    let content = data(1 << 20, 24);
+    let raw = f.src.join("x.raw");
+    std::fs::write(&raw, &content).unwrap();
+    // A rescue next to its E01 (as --rescue-to-e01 leaves it): x.info.json
+    // lists x.raw, x.conversion.info.json lists x.E01
+    let rescue_json = acquisition_report(&raw, &content, |r| {
+        r.engine = EngineKind::Rescue;
+        r.acquisition_hashes = HashResults::default();
+        r.verification.result = VerificationResult::NotPossible {
+            reason: "ddrescue computes no digest".into(),
+        };
+    });
+    let made = run(
+        &f.env,
+        request(&raw, ConversionTarget::E01, &f.src),
+        StopFlags::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(made.outcome, Outcome::CompleteUnverified);
+    let e01 = f.src.join("x.E01");
+
+    // As the CLI found it (`<stem>.info.json` next to the image)
+    let mut req = request(&e01, ConversionTarget::Raw, &f.out);
+    req.source_report = Some(rescue_json.clone());
+    req.source_report_auto = true;
+    let r = run(&f.env, req, StopFlags::new()).await.unwrap();
+    let used = r.source_report.as_ref().expect("the E01's own report");
+    assert!(
+        used.path.ends_with("x.conversion.info.json"),
+        "{}",
+        r.render_text()
+    );
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("x.info.json was not used: it does not list x.E01")),
+        "{:?}",
+        r.notes
+    );
+
+    // Given by the examiner: it must describe the image
+    let mut req = request(&e01, ConversionTarget::Raw, &f.root.join("given"));
+    req.source_report = Some(rescue_json);
+    let e = run(&f.env, req, StopFlags::new()).await.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Usage, "{e}");
+    assert!(e.message.contains("does not list x.E01"), "{e}");
+}
+
+#[tokio::test]
+async fn an_e01_missing_its_last_segment_is_never_converted_whole() {
+    if !have_libewf() {
+        return;
+    }
+    let f = fixture();
+    let content = data(3 << 20, 21);
+    let raw = f.src.join("x.raw");
+    std::fs::write(&raw, &content).unwrap();
+    let mut req = request(&raw, ConversionTarget::E01, &f.root.join("e01"));
+    req.case = Some(case());
+    req.split_size = SplitSize::Custom(1 << 20);
+    req.compression = CompressionLevel::None;
+    let made = run(&f.env, req, StopFlags::new()).await.unwrap();
+    let segments = made.output_files.len();
+    assert!(segments >= 4, "{:?}", made.output_files);
+    // The family without its last segment, and without its reports
+    let copy = f.root.join("copy");
+    std::fs::create_dir_all(&copy).unwrap();
+    for seg in &made.output_files[..segments - 1] {
+        std::fs::copy(seg, copy.join(seg.file_name().unwrap())).unwrap();
+    }
+    let mut req = request(&copy.join("x.E01"), ConversionTarget::Raw, &f.out);
+    req.case = Some(case());
+    let r = run(&f.env, req, StopFlags::new()).await.unwrap();
+    assert_eq!(r.source_files.len(), segments - 1);
+    assert_corrupted_e01_conversion(&r, &f.out.join("x.raw"));
+    if legacy_libewf() {
+        // Not "stores no digest": the digests are in the missing segment
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("which is missing or was never written")),
+            "{:?}",
+            r.notes
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_aborted_e01_is_never_converted_whole() {
+    if !have_libewf() {
+        return;
+    }
+    let f = fixture();
+    // Incompressible data with best compression: long enough to abort
+    let raw = f.src.join("x.raw");
+    std::fs::write(&raw, data(96 << 20, 22)).unwrap();
+    let mut req = request(&raw, ConversionTarget::E01, &f.root.join("e01"));
+    req.case = Some(case());
+    req.compression = CompressionLevel::Best;
+    let stop = StopFlags::new();
+    // Abort once ewfacquire has written a few MiB
+    abort_once_written(&stop, f.root.join("e01").join("x.E01"), 4 << 20);
+    let made = run(&f.env, req, stop).await.unwrap();
+    assert_eq!(made.outcome, Outcome::Aborted, "{}", made.render_text());
+    // The unfinalized E01 alone, away from its report
+    let alone = f.root.join("alone");
+    std::fs::create_dir_all(&alone).unwrap();
+    std::fs::copy(&made.output_files[0], alone.join("x.E01")).unwrap();
+    assert!(ewfinfo(&alone.join("x.E01")).contains("Is corrupted:\t\tyes"));
+    let mut req = request(&alone.join("x.E01"), ConversionTarget::Raw, &f.out);
+    req.case = Some(case());
+    let r = run(&f.env, req, StopFlags::new()).await.unwrap();
+    assert_corrupted_e01_conversion(&r, &f.out.join("x.raw"));
+}
+
 #[tokio::test]
 async fn abort_escalates_when_the_tool_ignores_sigint() {
     use std::os::unix::fs::PermissionsExt;
@@ -855,11 +1302,7 @@ async fn abort_escalates_when_the_tool_ignores_sigint() {
     let mut req = request(&raw, ConversionTarget::E01, &f.out);
     req.case = Some(case());
     let stop = StopFlags::new();
-    let flag = stop.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        flag.abort.store(true, std::sync::atomic::Ordering::SeqCst);
-    });
+    abort_once_written(&stop, f.out.join("x.E01"), 0);
     let started = std::time::Instant::now();
     let r = run(&env, req, stop).await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(20));
@@ -943,6 +1386,24 @@ async fn a_destination_in_memory_is_refused_unless_allowed() {
     assert_eq!(e.kind, ErrorKind::Refused);
     assert!(e.message.contains("--allow-tmpfs"), "{e}");
     assert!(!f.out.exists());
+    // T8: recorded as "conversion_refused" (no libewf needed)
+    let records = audit_actions(&env.audit_log);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["action"], "conversion_refused");
+    assert_eq!(records[0]["outcome"], "refused");
+    assert_eq!(records[0]["details"]["error_kind"], "refused");
+    assert!(records[0]["details"]["target"]
+        .as_str()
+        .unwrap()
+        .ends_with("x.E01"));
+    assert!(dfcore::audit::verify(&env.audit_log).is_ok());
+    // A usage error is not recorded
+    let mut req = ConversionRequest::new(&raw, ConversionTarget::E01, &f.out);
+    req.case = Some(case());
+    req.split_size = SplitSize::Custom(4096);
+    let e = run(&env, req, StopFlags::new()).await.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Usage, "{e}");
+    assert_eq!(audit_actions(&env.audit_log).len(), 1);
 }
 
 #[tokio::test]
