@@ -524,7 +524,7 @@ pub fn unmount_source_tree_with(
     let mut notes = Vec::new();
     if !holders.is_empty() {
         notes.push(format!(
-            "devices stacked on the source stay open ({}); dfdisk does not close LUKS, LVM or md devices. Close them, or acquire with --allow-holders",
+            "devices stacked on the source stay open ({}); dfdisk does not close LUKS, LVM or md devices; close them before the acquisition",
             holders.join(", ")
         ));
     }
