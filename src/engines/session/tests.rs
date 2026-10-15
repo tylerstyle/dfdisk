@@ -705,6 +705,26 @@ async fn identity_refusals() {
     config.expect.serial = Some("SOMETHING-ELSE".into());
     assert_refused_before_writing(&fake, config, ErrorKind::Refused, "not the expected device")
         .await;
+
+    // An empty source (no medium, unknown size) is refused for every engine,
+    // and the dry run says so too
+    for config in [
+        AcquisitionConfig::raw(Fake::new().out()),
+        AcquisitionConfig::rescue(Fake::new().out()),
+        AcquisitionConfig::for_engine(EngineKind::Ewf, Fake::new().out()),
+    ] {
+        let mut fake = Fake::new();
+        fake.identity = disk_identity(0);
+        let config = AcquisitionConfig {
+            output_dir: fake.out(),
+            ..config
+        };
+        assert_refused_before_writing(&fake, config.clone(), ErrorKind::Refused, "size of 0 bytes")
+            .await;
+        let check = check_with(&fake, fake.request(config)).await;
+        assert_eq!(check.exit_code(), 3);
+        assert!(check.problems[0].message.contains("size of 0 bytes"));
+    }
 }
 
 fn protecting_registry() -> Registry {

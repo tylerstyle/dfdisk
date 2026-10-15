@@ -5,8 +5,9 @@
 //!
 //! Order of [`run`] (R7; numbers are the steps of §4):
 //! - 1 validate the request (case fields, digests, options, file name length)
-//! - 2 identify the source (sysfs/udev probe) and compare it with the device
-//!   the examiner selected and with `--expect-*`
+//! - 2 identify the source (sysfs/udev probe), refuse an empty one (size 0
+//!   or unknown), and compare it with the device the examiner selected and
+//!   with `--expect-*`
 //! - 3 source safety: dfnix registry by pinned major:minor, system disk,
 //!   active swap (R8) and mounts in the source tree, holders, O_EXCL open
 //!   held for the whole run (R1)
@@ -388,6 +389,14 @@ fn identify(
     let identity = host.probe_identity(path).map_err(|e| {
         AcquisitionError::refused(format!("the source {path} cannot be identified: {e}"))
     })?;
+    // An empty source (no medium in a card reader, a size the kernel could
+    // not read) would be "acquired" as an empty, verified image
+    if identity.size_bytes == 0 {
+        return Err(AcquisitionError::refused(format!(
+            "the source {} reports a size of 0 bytes: no medium is present or its size is unknown, so there is nothing to acquire",
+            identity.path
+        )));
+    }
     identity
         .same_attachment(&request.device.device_identity())
         .map_err(AcquisitionError::refused)?;

@@ -41,8 +41,9 @@ and when something was not done the report says so.
 - **Stricter refusals.** Mounted sources are refused (unmounting is the explicit
   `dfdisk unmount` / `--auto-unmount`), as are sources with holders (they have
   to be closed first), sources with active swap, sources in use (`O_EXCL`), tmpfs
-  destinations (unless `--allow-tmpfs`) and E01 destinations with less free space
-  than the source (unless `--allow-low-space`).
+  destinations (unless `--allow-tmpfs`), E01 destinations with less free space
+  than the source (unless `--allow-low-space`) and empty sources (size 0: no
+  medium, or the size is unknown).
 - **Write protection on by default.** `--write-protect auto` sets the kernel
   read-only flag (BLKROSET) on the source and leaves it set; `off` only records.
 - **SMART** is no longer queried during device scans; `list --smart` asks for it

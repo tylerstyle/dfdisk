@@ -46,6 +46,8 @@ applied in this order; the first that matches wins:
 dfdisk refuses, before anything is written to the destination or sent to the
 source device, when for example:
 
+- the device reports a size of 0 bytes (no medium present, or the size is
+  unknown): there is nothing to acquire;
 - the device no longer matches the one that was selected (kernel device number,
   diskseq, serial, WWN or size changed), or does not match `--expect-serial`,
   `--expect-wwn` or `--expect-size`;

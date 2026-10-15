@@ -386,7 +386,8 @@ identify-class queries that the report records.
   one that changes or disappears during the run makes the verdict INCOMPLETE.
   External tools read through `/dev/disk/by-diskseq/<N>` when that link points
   at the pinned device.
-- **Refusals.** dfdisk refuses (exit 3) a device listed in the dfnix
+- **Refusals.** dfdisk refuses (exit 3) an empty device (size 0: no medium,
+  or the size is unknown), a device listed in the dfnix
   protected-device registry (and fails closed when the registry exists but cannot
   be read), a system disk, a device with mounted filesystems (in dfdisk's mount
   namespace; a mount in another namespace makes the exclusive open below fail)
