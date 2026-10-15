@@ -130,10 +130,13 @@ pub async fn acquire_with(
     ctx.provenance.set_tool_version(DDRESCUE, &version);
 
     let mut resume_sessions = Vec::new();
+    // The previous report kept by a resume: put back when ddrescue never ran
+    let mut kept_report: Option<u32> = None;
     if config.resume {
-        let (sessions, resume_notes) = prepare_resume(ctx, &map)?;
-        resume_sessions = sessions;
-        notes.extend(resume_notes);
+        let prepared = prepare_resume(ctx, &map)?;
+        resume_sessions = prepared.sessions;
+        kept_report = prepared.kept;
+        notes.extend(prepared.notes);
     } else {
         write_identity_record(&sidecar, ctx)?;
     }
@@ -237,9 +240,16 @@ pub async fn acquire_with(
         Ok(o) => o,
         Err(e) => {
             discard_unused_record(config.resume, &sidecar, &image, &map);
-            return Err(AcquisitionError::failed(format!(
-                "cannot start ddrescue: {e}"
-            )));
+            let mut message = format!("cannot start ddrescue: {e}");
+            if let Some(n) = kept_report {
+                // ddrescue never ran: the previous report is the last word again
+                if let Err(r) = restore_previous_report(&ctx.output_dir, &ctx.base_name, n) {
+                    message.push_str(&format!(
+                        "; the report of the previous session stays kept as session {n} ({r})"
+                    ));
+                }
+            }
+            return Err(AcquisitionError::failed(message));
         }
     };
     let aborted = outcome.aborted || outcome.force_killed || ctx.is_aborted();
@@ -963,38 +973,76 @@ fn kept_sessions(dir: &Path, base: &str) -> Vec<KeptSession> {
         .collect()
 }
 
+/// The report files of the current session (`<base>.info`,
+/// `<base>.info.json`) and of kept session `n`, pairwise.
+fn report_and_kept(dir: &Path, base: &str, n: u32) -> [(PathBuf, PathBuf); 2] {
+    [
+        (
+            dir.join(format!("{base}{INFO_SUFFIX}")),
+            dir.join(format!("{base}{SESSION_SUFFIX}{n}")),
+        ),
+        (
+            dir.join(format!("{base}{INFO_JSON_SUFFIX}")),
+            dir.join(format!("{base}{SESSION_SUFFIX}{n}.json")),
+        ),
+    ]
+}
+
 /// Keep the report of the previous session (`<base>.info`, `<base>.info.json`)
 /// as `<base>.info.session-N` and `<base>.info.session-N.json`, N one past the
 /// highest kept session. Returns N and the kept files, `None` when there was
-/// no report. Never overwrites.
+/// no report. Never overwrites; a failure part way renames back what was
+/// already renamed, so an error leaves the previous report where it was.
 pub fn keep_previous_report(dir: &Path, base: &str) -> io::Result<Option<(u32, Vec<PathBuf>)>> {
-    let text = dir.join(format!("{base}{INFO_SUFFIX}"));
-    let json = dir.join(format!("{base}{INFO_JSON_SUFFIX}"));
-    if !text.exists() && !json.exists() {
-        return Ok(None);
-    }
     let n = kept_sessions(dir, base)
         .last()
         .map(|(n, _, _)| n + 1)
         .unwrap_or(1);
-    let text_to = dir.join(format!("{base}{SESSION_SUFFIX}{n}"));
-    let json_to = dir.join(format!("{base}{SESSION_SUFFIX}{n}.json"));
-    let mut kept = Vec::new();
-    for (from, to) in [(&text, &text_to), (&json, &json_to)] {
-        if !from.exists() {
-            continue;
+    let pairs: Vec<(PathBuf, PathBuf)> = report_and_kept(dir, base, n)
+        .into_iter()
+        .filter(|(from, _)| from.exists())
+        .collect();
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    if let Some((_, to)) = pairs.iter().find(|(_, to)| to.exists()) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", to.display()),
+        ));
+    }
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for (i, (from, to)) in pairs.iter().enumerate() {
+        if let Err(e) = fs::rename(from, to) {
+            for (back_from, back_to) in &pairs[..i] {
+                let _ = fs::rename(back_to, back_from);
+            }
+            let _ = sync_dir(dir);
+            return Err(e);
         }
-        if to.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("{} already exists", to.display()),
-            ));
-        }
-        fs::rename(from, to)?;
         kept.push(to.clone());
     }
     sync_dir(dir)?;
     Ok(Some((n, kept)))
+}
+
+/// Undo [`keep_previous_report`] for kept session `n` (the resume ended
+/// before ddrescue ran): its files get their previous names again. Never
+/// overwrites a report of the current session.
+fn restore_previous_report(dir: &Path, base: &str, n: u32) -> io::Result<()> {
+    for (current, kept) in report_and_kept(dir, base, n) {
+        if !kept.exists() {
+            continue;
+        }
+        if current.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists", current.display()),
+            ));
+        }
+        fs::rename(&kept, &current)?;
+    }
+    sync_dir(dir)
 }
 
 /// Every kept session report of `base` in `dir`, with the digest of the
@@ -1031,35 +1079,52 @@ fn map_digest_in_report(dir: &Path, base: &str, session: u32) -> Option<String> 
         .map(|f| f.sha256.clone())
 }
 
-/// Resume: keep the previous report, list the sessions, state whether the
-/// map changed since the last report, and check the identity again (now
-/// with the SMART IDENTIFY serial, when SMART ran). The previous report is
-/// kept before anything can refuse, so it is never overwritten.
-fn prepare_resume(
-    ctx: &EngineContext,
-    map: &Path,
-) -> Result<(Vec<SessionInfo>, Vec<String>), AcquisitionError> {
+/// What [`prepare_resume`] found and did.
+struct PreparedResume {
+    sessions: Vec<SessionInfo>,
+    notes: Vec<String>,
+    /// Number under which the previous report was kept
+    kept: Option<u32>,
+}
+
+/// Resume: check the identity again (now with the SMART IDENTIFY serial,
+/// when SMART ran), keep the previous report, list the sessions and state
+/// whether the map changed since the last report. The identity is checked
+/// before the previous report is renamed: a refused resume leaves every file
+/// as it was (the previous report stays `<base>.info`). The previous report
+/// is kept before ddrescue runs, so it is never overwritten.
+fn prepare_resume(ctx: &EngineContext, map: &Path) -> Result<PreparedResume, AcquisitionError> {
     let dir = &ctx.output_dir;
     let base = &ctx.base_name;
+    // The session checked the identity before anything was written; now the
+    // identity includes a SMART IDENTIFY serial when SMART ran. Its
+    // statement is the session's (step 4), not repeated here
+    check_resume_identity(dir, base, &ctx.identity)?;
     let mut notes = Vec::new();
-    match keep_previous_report(dir, base) {
-        Ok(Some((_, files))) => notes.push(format!(
-            "the report of the previous session was kept as {}",
-            files
-                .iter()
-                .map(|f| file_name(f))
-                .collect::<Vec<_>>()
-                .join(" and ")
-        )),
-        Ok(None) => notes.push(
-            "no report of the previous session was found: it ended without writing one".into(),
-        ),
+    let kept = match keep_previous_report(dir, base) {
+        Ok(Some((n, files))) => {
+            notes.push(format!(
+                "the report of the previous session was kept as {}",
+                files
+                    .iter()
+                    .map(|f| file_name(f))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ));
+            Some(n)
+        }
+        Ok(None) => {
+            notes.push(
+                "no report of the previous session was found: it ended without writing one".into(),
+            );
+            None
+        }
         Err(e) => {
             return Err(AcquisitionError::failed(format!(
                 "cannot keep the report of the previous session: {e}"
             )))
         }
-    }
+    };
     let sessions = list_sessions(dir, base);
     for s in &sessions {
         let when =
@@ -1105,10 +1170,11 @@ fn prepare_resume(
             "the map could not be hashed before this session: {e}"
         )),
     }
-    // Defence in depth: the session checked the identity before anything was
-    // written; now the identity includes a SMART IDENTIFY serial when SMART ran
-    check_resume_identity(dir, base, &ctx.identity)?;
-    Ok((sessions, notes))
+    Ok(PreparedResume {
+        sessions,
+        notes,
+        kept,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2021,16 +2087,84 @@ mod tests {
             .join("\n")
             .contains("the map changed after the report of session 2"));
 
-        // Another file at the same path: refused, the previous report kept anyway
+        // Another file at the same path: refused before anything is renamed;
+        // the previous report stays the report of the rescue (R-1)
         std::fs::write(ctx.output_path(".info"), "report 3").unwrap();
+        std::fs::write(
+            ctx.output_path(".info.json"),
+            report_json(Outcome::Incomplete, "00"),
+        )
+        .unwrap();
         let mut ctx3 = context_again(&ctx, true);
         ctx3.identity.file_id = Some("0:0".into());
         let e = acquire_with(&ctx3, fake.as_os_str()).await.unwrap_err();
         assert!(e.is_refusal(), "{e}");
         assert_eq!(
-            std::fs::read_to_string(ctx.output_path(".info.session-3")).unwrap(),
+            std::fs::read_to_string(ctx.output_path(".info")).unwrap(),
             "report 3"
         );
+        assert!(ctx.output_path(".info.json").exists());
+        assert!(!ctx.output_path(".info.session-3").exists());
+        assert!(!ctx.output_path(".info.session-3.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_never_starts_ddrescue_puts_the_previous_report_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ok = fake_ddrescue(
+            tmp.path(),
+            &format!("printf '%s' '{BAD_MIDDLE}' > \"$MAP\"\nexit 0\n"),
+        );
+        let ctx = context(tmp.path(), MIB, false);
+        std::fs::write(ctx.output_path(".raw"), vec![0u8; MIB as usize]).unwrap();
+        acquire_with(&ctx, ok.as_os_str()).await.unwrap();
+        std::fs::write(ctx.output_path(".info"), "report 1").unwrap();
+        std::fs::write(
+            ctx.output_path(".info.json"),
+            report_json(Outcome::Aborted, "aa"),
+        )
+        .unwrap();
+        // Answers --version, then is gone when the rescue starts it
+        let vanishing = script(
+            tmp.path(),
+            "vanishing-ddrescue",
+            "if [ \"$1\" = --version ]; then echo 'GNU ddrescue 1.30 (fake)'; \
+             if [ -f \"$0.vanish\" ]; then rm -f \"$0\"; fi; exit 0; fi\nexit 0\n",
+        );
+        std::fs::write(tmp.path().join("vanishing-ddrescue.vanish"), "").unwrap();
+        let e = acquire_with(&context_again(&ctx, true), vanishing.as_os_str())
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind, crate::engines::ErrorKind::Failed, "{e}");
+        assert!(e.message.contains("cannot start ddrescue"), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(ctx.output_path(".info")).unwrap(),
+            "report 1"
+        );
+        assert!(ctx.output_path(".info.json").exists());
+        assert!(kept_sessions(&ctx.output_dir, "b").is_empty());
+    }
+
+    #[test]
+    fn a_kept_report_can_be_put_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join("b.info"), "text").unwrap();
+        std::fs::write(d.join("b.info.json"), "{}").unwrap();
+        let (n, kept) = keep_previous_report(d, "b").unwrap().unwrap();
+        assert_eq!((n, kept.len()), (1, 2));
+        restore_previous_report(d, "b", 1).unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("b.info")).unwrap(), "text");
+        assert_eq!(
+            std::fs::read_to_string(d.join("b.info.json")).unwrap(),
+            "{}"
+        );
+        assert!(kept_sessions(d, "b").is_empty());
+        // Never over a report of the current session
+        keep_previous_report(d, "b").unwrap();
+        std::fs::write(d.join("b.info"), "new").unwrap();
+        assert!(restore_previous_report(d, "b", 1).is_err());
+        assert_eq!(std::fs::read_to_string(d.join("b.info")).unwrap(), "new");
     }
 
     /// A context for the same output as `ctx` (`resume` as given).
