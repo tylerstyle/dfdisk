@@ -20,7 +20,7 @@ macro_rules! exit_code_table {
   5  hash mismatch
   6  incomplete: not all of the source was acquired
   7  completed with read errors: unreadable sectors were replaced by zeros
-  8  aborted by the examiner or a signal (SIGINT, SIGTERM)
+  8  aborted by the examiner or a signal (SIGINT, SIGTERM, SIGQUIT)
   9  complete but not verified: no independent comparison was possible"
     };
 }
@@ -37,10 +37,11 @@ Source: a path (/dev/sdb, /dev/disk/by-id/..., ./image.dd) or a bare device name
 (sdb). A bare name means /dev/<name>; it is refused when ./<name> exists as well.
 Regular files are accepted as sources (image files).
 
-Signals: the first SIGINT (Ctrl+C) or a SIGTERM stops the acquisition gracefully;
-the outputs are kept and the report says ABORTED (exit 8). A second SIGINT kills
-external tools at once; the report is still written. SIGHUP (terminal closed)
-keeps the acquisition running without terminal output until its report is written.
+Signals: the first SIGINT (Ctrl+C), a SIGTERM or a SIGQUIT (Ctrl+\\) stops the
+acquisition gracefully; the outputs are kept and the report says ABORTED (exit 8).
+A second SIGINT kills external tools at once; the report is still written. SIGHUP
+(terminal closed) keeps the acquisition running without terminal output until its
+report is written.
 
 The exit code is the verdict of the report (0, 4-9; 4 when the verification
 could not run or complete), or 2, 3 or 4 when no acquisition ran. With
@@ -66,7 +67,7 @@ Exit codes:
   3  refused: the acquisition would be refused (every reason is listed)
   4  a check could not run, or a tool the engine runs (ewfacquire, ewfinfo,
      ewfverify, ddrescue) is not installed
-  8  interrupted (SIGINT, SIGTERM)";
+  8  interrupted (SIGINT, SIGTERM, SIGQUIT)";
 
 const VERIFY_AFTER_HELP: &str = "\
 Expected digests come from --md5/--sha1/--sha256 or from a dfdisk report
@@ -83,7 +84,7 @@ Exit codes:
   4  verification failed: the image could not be read completely, or an expected
      digest was not computed
   5  hash mismatch (a digest or a piece differs)
-  8  aborted (SIGINT, SIGTERM)
+  8  aborted (SIGINT, SIGTERM, SIGQUIT)
   9  digests computed, but nothing to compare them against";
 
 const CONVERT_AFTER_HELP: &str = "\
@@ -91,17 +92,20 @@ Without case flags the case fields are taken from the source's dfdisk report;
 without such a report --case, --evidence and --examiner are required. Existing
 outputs are never overwritten. The conversion is verified and writes its own
 report (<base>.conversion.info + <base>.conversion.info.json, <base>: the source
-name without its extensions) and audit records. SIGINT/SIGTERM abort it (exit 8).
+name without its extensions) and audit records. SIGINT, SIGTERM and SIGQUIT abort
+it (exit 8).
 
 Exit codes: the verdict of the conversion report (0, 4, 5, 6, 7, 8, 9), or 2
 (usage), 3 (refused) or 4 (failed) when no conversion ran; see dfdisk --help.";
 
 const UNMOUNT_AFTER_HELP: &str = "\
 Unmounts every filesystem of the device and of everything stacked on it
-(partitions, device-mapper/LUKS mappings), deepest first, and verifies that
-nothing stays mounted. Refused for devices protected by the dfnix registry, system
-mounts and active swap. Never lazy, never forced. Holders (open LUKS/LVM/md) are
-reported, not closed. Every unmount is recorded in the audit log.
+(partitions, device-mapper/LUKS mappings, loop devices set up over it), deepest
+first, and verifies that nothing stays mounted. Refused for devices protected by
+the dfnix registry, system mounts and active swap. Never lazy, never forced.
+Holders (open LUKS/LVM/md, loop devices) are reported, not closed. Every unmount
+is recorded in the audit log. A signal does not cut the unmount short: it is
+finished, checked and recorded before dfdisk exits.
 
 Exit codes:
   0  nothing of the device is mounted any more (or nothing was mounted)
@@ -650,8 +654,8 @@ pub struct ConvertArgs {
 
     /// The dfdisk report of the acquisition the source came from; referenced in
     /// the conversion report and its digests compared; it must list the source
-    /// image [default: <base>.info.json next to the source, used when it lists
-    /// the image, else ignored with a note]
+    /// image [default: <base>.info.json or <base>.conversion.info.json next to
+    /// the source, used when it lists the image, else ignored with a note]
     #[arg(long, value_name = "INFO_JSON")]
     pub report: Option<PathBuf>,
 
