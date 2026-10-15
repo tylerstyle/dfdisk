@@ -47,7 +47,7 @@ use crate::engines::audit::{self, FinishedGuard, StartedRecord};
 use crate::engines::error::{AcquisitionError, ErrorKind};
 use crate::engines::preflight::{self, DestinationFacts, DestinationRules, OutputGuard};
 use crate::engines::process::StopControl;
-use crate::engines::{ewf, raw, rescue};
+use crate::engines::{ddrescue_map, ewf, raw, rescue};
 use crate::models::capacity::CapacityInfo;
 use crate::models::case::CaseMetadata;
 use crate::models::config::{
@@ -915,6 +915,17 @@ fn engine_error_output(
     Ok(out)
 }
 
+/// Bytes of the source a resumed rescue had already rescued before this
+/// session (from the map and image it continues; read or bad sectors that
+/// are in the image), `None` when the map cannot be read.
+fn rescued_before_resume(dir: &Path, base: &str, expected: u64, sector_size: u32) -> Option<u64> {
+    let map = ddrescue_map::read(&dir.join(format!("{base}{}", rescue::MAP_SUFFIX))).ok()?;
+    let image_len = std::fs::metadata(dir.join(format!("{base}{}", rescue::IMAGE_SUFFIX)))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    Some(map.assess(expected, image_len, sector_size).bytes_acquired)
+}
+
 /// Step 9: the source is still the device probed at the start.
 fn recheck_identity(
     host: &dyn SessionHost,
@@ -1292,6 +1303,17 @@ async fn acquire_phase(
         }
     }
 
+    // R-7: what earlier sessions of a resumed rescue had rescued, so the
+    // average speed counts only this session's bytes
+    let resumed_from = (v.engine == EngineKind::Rescue && config.resume).then(|| {
+        rescued_before_resume(
+            &dir,
+            &v.base_name,
+            identity.size_bytes,
+            identity.logical_sector_size.max(512),
+        )
+    });
+
     // 8: the engine
     let ctx = EngineContext {
         request: request.clone(),
@@ -1447,8 +1469,25 @@ async fn acquire_phase(
     clock.finish(elapsed);
     report.ended_at = clock.end_utc.unwrap_or_else(chrono::Utc::now);
     report.elapsed_seconds = elapsed.as_secs();
+    let session_bytes = match resumed_from {
+        None => out.bytes_acquired,
+        Some(Some(before)) => {
+            let added = out.bytes_acquired.saturating_sub(before);
+            notes.push(format!(
+                "resumed rescue: the average speed counts the {added} bytes this session added to the image over this session's time; earlier sessions had rescued {before} bytes"
+            ));
+            added
+        }
+        Some(None) => {
+            notes.push(
+                "resumed rescue: the bytes earlier sessions rescued are not known (the map could not be read at the start), so the average speed counts every byte in the image over this session's time"
+                    .into(),
+            );
+            out.bytes_acquired
+        }
+    };
     report.average_speed_bytes_sec = if elapsed.as_secs_f64() > 0.0 {
-        out.bytes_acquired as f64 / elapsed.as_secs_f64()
+        session_bytes as f64 / elapsed.as_secs_f64()
     } else {
         0.0
     };

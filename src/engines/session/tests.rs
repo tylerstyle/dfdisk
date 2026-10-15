@@ -1383,6 +1383,78 @@ async fn rescue_is_unverified_unless_the_source_is_read_again() {
 }
 
 #[tokio::test]
+async fn a_resumed_rescue_reports_the_speed_of_this_session() {
+    // R-7: half of the source was rescued by an earlier session; this
+    // session's average speed counts only the half it added
+    let mut fake = Fake::new();
+    let out = fake.out();
+    std::fs::create_dir_all(&out).unwrap();
+    let half = SIZE / 2;
+    std::fs::write(out.join(format!("{BASE}.raw")), &fake.data[..half as usize]).unwrap();
+    std::fs::write(
+        out.join(format!("{BASE}.map")),
+        format!(
+            "# Mapfile. Created by GNU ddrescue version 1.30\n\
+             # current_pos  current_status  current_pass\n\
+             0x{half:08X}     ?               1\n\
+             #      pos        size  status\n\
+             0x00000000  0x{half:08X}  +\n\
+             0x{half:08X}  0x{half:08X}  ?\n"
+        ),
+    )
+    .unwrap();
+    let record = rescue::IdentityRecord::new(&fake.identity, BASE, "/dev/disk/by-diskseq/7", 512);
+    std::fs::write(
+        rescue::identity_record_path(&out, BASE),
+        serde_json::to_string_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        rescued_before_resume(&out, BASE, SIZE, 512),
+        Some(half),
+        "the map before the resume"
+    );
+    let data = fake.data.clone();
+    fake.engine = Some(Box::new(move |ctx| {
+        let img = ctx.output_path(".raw");
+        std::fs::write(&img, &data).unwrap();
+        Ok(EngineOutput {
+            bytes_acquired: data.len() as u64,
+            expected_bytes: data.len() as u64,
+            image_files: vec![img],
+            resume_sessions: vec![SessionInfo {
+                session: 1,
+                report_file: "earlier.info.session-1".into(),
+                report_sha256: None,
+                started_at: None,
+                ended_at: None,
+                outcome: Some(Outcome::Aborted),
+            }],
+            ..Default::default()
+        })
+    }));
+    let config = AcquisitionConfig {
+        resume: true,
+        smart: SmartPolicy::Off,
+        ..AcquisitionConfig::rescue(out.clone())
+    };
+    let report = run_fake(&fake, config).await.0.unwrap();
+    assert!(
+        report.notes.iter().any(|n| n.contains(&format!(
+            "the {half} bytes this session added to the image over this session's time; earlier sessions had rescued {half} bytes"
+        ))),
+        "{:?}",
+        report.notes
+    );
+    assert!(report
+        .render_text()
+        .contains("MiB/s (this session; see the notes)"));
+    // Without a readable map the note says what the speed counts
+    std::fs::write(out.join(format!("{BASE}.map")), b"not a map").unwrap();
+    assert_eq!(rescued_before_resume(&out, BASE, SIZE, 512), None);
+}
+
+#[tokio::test]
 async fn abort_keeps_outputs_and_reports_aborted() {
     let mut fake = Fake::new();
     let half = fake.data[..1024].to_vec();

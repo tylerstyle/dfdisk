@@ -142,7 +142,7 @@ report prints "(not provided)").
 | `output_dir`, `base_name` | string | where the files are |
 | `started_at`, `ended_at` | string | RFC 3339, UTC, host system clock (see `clock`) |
 | `elapsed_seconds` | number | from the monotonic clock |
-| `average_speed_bytes_sec` | number | bytes acquired per second |
+| `average_speed_bytes_sec` | number | bytes acquired per second of this run; for a resumed rescue only the bytes this session added (a note says how many earlier sessions had rescued) |
 | `expected_bytes` | number | size of the source |
 | `bytes_acquired` | number | bytes of the source in the image |
 | `stop_reason` | string or null | why the run stopped early (source lost, destination full, read error with `--on-read-error stop`, …) |

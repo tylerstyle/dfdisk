@@ -962,8 +962,13 @@ impl ForensicInfoReport {
             out,
             "Average Speed",
             format!(
-                "{:.2} MiB/s",
-                self.average_speed_bytes_sec / (1024.0 * 1024.0)
+                "{:.2} MiB/s{}",
+                self.average_speed_bytes_sec / (1024.0 * 1024.0),
+                if self.resume_sessions.is_empty() {
+                    ""
+                } else {
+                    " (this session; see the notes)"
+                }
             ),
         );
         row(
