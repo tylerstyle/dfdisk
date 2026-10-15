@@ -1053,7 +1053,7 @@ impl ForensicInfoReport {
                 out,
                 "Piecewise SHA-256",
                 format!(
-                    "{} of {} in {} (SHA-256 {})",
+                    "{} of up to {} in {} (SHA-256 {})",
                     plural(p.count, "piece", "pieces"),
                     format_iec(p.piece_size),
                     p.file,
@@ -1500,9 +1500,14 @@ mod tests {
             count: 1,
         });
         let text = r.render_text();
-        assert!(text.contains("1 piece of 1 GiB in b.pieces.tsv"), "{text}");
+        // The piece size is a maximum: a 1 MiB image has one 1 MiB piece
+        assert!(
+            text.contains("1 piece of up to 1 GiB in b.pieces.tsv"),
+            "{text}"
+        );
+        assert!(!text.contains("1 piece of 1 GiB"), "{text}");
         r.piecewise.as_mut().unwrap().count = 3;
-        assert!(r.render_text().contains("3 pieces of 1 GiB"));
+        assert!(r.render_text().contains("3 pieces of up to 1 GiB"));
     }
 
     #[test]

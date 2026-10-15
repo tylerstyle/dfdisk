@@ -213,6 +213,8 @@ fn acquire_help_documents_every_flag_and_the_required_fields() {
         "SIGHUP",
         "second SIGINT",
         "1, 2, 8, 5, 4, 3, 6, 7, 9, 0",
+        // 4 is a verdict too (VERIFICATION FAILED)
+        "verdict of the report (0, 4-9;",
     ] {
         assert!(stdout.contains(flag), "{flag}\n{stdout}");
     }

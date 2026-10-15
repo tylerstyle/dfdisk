@@ -39,8 +39,8 @@ the outputs are kept and the report says ABORTED (exit 8). A second SIGINT kills
 external tools at once; the report is still written. SIGHUP (terminal closed)
 keeps the acquisition running without terminal output until its report is written.
 
-The exit code is the verdict of the report (0, 5-9), or 2, 3 or 4 when no
-acquisition ran. With --rescue-to-e01 it is the more severe of the rescue and the
+The exit code is the verdict of the report (0, 4-9; 4 when the verification
+could not run or complete), or 2, 3 or 4 when no acquisition ran. With --rescue-to-e01 it is the more severe of the rescue and the
 conversion, from most to least severe: 1, 2, 8, 5, 4, 3, 6, 7, 9, 0.
 
 ",
