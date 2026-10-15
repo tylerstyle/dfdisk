@@ -1108,6 +1108,13 @@ async fn conversion_goes_through_the_confirmation_sheet() {
     })
     .await;
     assert!(app.confirm.as_ref().unwrap().ready());
+    // Only the source file was looked at: the sheet does not claim more
+    let sheet = sheet_text(&app);
+    assert!(
+        sheet[0].starts_with("READY TO START: the source image exists."),
+        "{sheet:?}"
+    );
+    assert!(!sheet.iter().any(|l| l.contains("every pre-flight check")));
     // No serial known: the evidence number confirms
     typ(&mut app, "ev");
     app.handle_key(key(KeyCode::Enter));

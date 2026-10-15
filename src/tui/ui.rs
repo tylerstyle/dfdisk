@@ -910,24 +910,32 @@ pub fn sheet_lines(app: &App) -> Vec<Line<'static>> {
     };
     let white = Style::default().fg(Color::White);
     let strong = bold(Color::Yellow);
+    let conversion = matches!(c.subject, ConfirmSubject::Conversion { .. });
+    // What was checked differs: the acquisition's dry run runs every check of
+    // the session; the converter's sheet only looked at the source file (and
+    // the destination's filesystem), the converter checks the rest at start
+    let (pending, ready, not_ready) = if conversion {
+        (
+            "Looking at the source image and the destination…",
+            "READY TO START: the source image exists. The converter checks the image, the destination and existing outputs when it starts. Nothing has been written yet.",
+            "NOT READY: the source image was not found or is not a regular file. Nothing has been written or changed.",
+        )
+    } else {
+        (
+            "Running the pre-flight checks (identity, safety, destination, hidden areas)…",
+            "READY: every pre-flight check passed. Nothing has been written or changed yet.",
+            "NOT READY: this would be refused. Nothing has been written or changed.",
+        )
+    };
     if c.pending {
         out.push(Line::from(Span::styled(
-            format!(
-                "{} Running the pre-flight checks (identity, safety, destination, hidden areas)…",
-                spinner(app)
-            ),
+            format!("{} {pending}", spinner(app)),
             bold(Color::Cyan),
         )));
     } else if c.ready() {
-        out.push(Line::from(Span::styled(
-            "READY: every pre-flight check passed. Nothing has been written or changed yet.",
-            bold(Color::Green),
-        )));
+        out.push(Line::from(Span::styled(ready, bold(Color::Green))));
     } else {
-        out.push(Line::from(Span::styled(
-            "NOT READY: this would be refused. Nothing has been written or changed.",
-            bold(Color::Red),
-        )));
+        out.push(Line::from(Span::styled(not_ready, bold(Color::Red))));
     }
     match &c.subject {
         ConfirmSubject::Acquisition {
