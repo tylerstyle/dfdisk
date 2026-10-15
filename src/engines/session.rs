@@ -26,7 +26,9 @@
 //!
 //! `run` returns `Ok(report)` for every outcome once anything was written
 //! (Aborted, Incomplete, ... included); `Err` only for refusals and usage
-//! errors before the first write, or failures that left no output.
+//! errors before the first write, failures that left no output, or a verdict
+//! whose report could not be written (the error carries its digests, the
+//! audit "finished" record everything the report would have said).
 
 mod check;
 mod host;
@@ -717,7 +719,15 @@ async fn run_inner(
         t0,
     };
     match acquire_phase(host, request, prepared, source_fd, sink, stop, &mut output).await {
-        Ok((report, files)) => {
+        Ok((report, Err(e))) => {
+            // A verdict without a report: the finished record keeps what the
+            // report would have said (digests, read errors, files), and the
+            // error message carries the digests to the examiner (T3)
+            output.keep();
+            let _ = guard.report_not_written(&report, &e);
+            Err(e)
+        }
+        Ok((report, Ok(files))) => {
             output.keep();
             let _ = guard.report(&report, &files);
             // 16: the case directory's copy now includes the finished record
@@ -1164,7 +1174,7 @@ async fn acquire_phase(
     sink: &ProgressSink,
     stop: &StopFlags,
     output: &mut OutputGuard,
-) -> Result<(ForensicInfoReport, ReportFiles), AcquisitionError> {
+) -> Result<(ForensicInfoReport, Result<ReportFiles, AcquisitionError>), AcquisitionError> {
     let Prepared {
         v,
         identity,
@@ -1484,12 +1494,20 @@ async fn acquire_phase(
     output.keep();
     let files = report.write_reports(&dir, &v.base_name).map_err(|e| {
         AcquisitionError::failed(format!(
-            "the acquisition ended {} (exit code {}), but its report could not be written to {}: {e}",
+            "the acquisition ended {} (exit code {}), but its report could not be written to {}: {e}. {} Image files: {}.",
             report.outcome.label(),
             report.exit_code,
-            dir.display()
+            dir.display(),
+            report.digest_summary(),
+            if report.image_files.is_empty() {
+                "(none)".to_string()
+            } else {
+                report.image_files.join(", ")
+            }
         ))
-    })?;
-    sink.log(format!("Report written: {}", files.text.display()));
+    });
+    if let Ok(files) = &files {
+        sink.log(format!("Report written: {}", files.text.display()));
+    }
     Ok((report, files))
 }

@@ -535,6 +535,34 @@ impl ForensicInfoReport {
         }
     }
 
+    /// "Digests: acquisition stream MD5 <hex>, SHA-256 <hex>; image re-read
+    /// MD5 <hex>, ..." (or "No digest was computed."), for messages that
+    /// must carry the digests when no report could be written.
+    pub fn digest_summary(&self) -> String {
+        let list = |h: &HashResults| {
+            h.present()
+                .iter()
+                .map(|(label, digest)| format!("{label} {digest}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut parts = Vec::new();
+        if !self.acquisition_hashes.is_empty() {
+            parts.push(format!(
+                "acquisition stream {}",
+                list(&self.acquisition_hashes)
+            ));
+        }
+        if !self.image_hashes.is_empty() {
+            parts.push(format!("image re-read {}", list(&self.image_hashes)));
+        }
+        if parts.is_empty() {
+            "No digest was computed.".to_string()
+        } else {
+            format!("Digests: {}.", parts.join("; "))
+        }
+    }
+
     /// The numbers behind the verdict, one sentence each.
     pub fn key_numbers(&self) -> Vec<String> {
         let mut out = Vec::new();

@@ -105,7 +105,11 @@ and when something was not done the report says so.
 - **H6** Audit trail gaps: (a) the export is per boot and never replaces another
   boot's chain; (b) refusals are recognised by type, not by message text;
   (c) the "finished" record always carries the outcome, the digests known and
-  the SHA-256 of both reports; (d) an unwritable audit log refuses on dfnix and
+  the SHA-256 of both reports, and when the report cannot be written it still
+  carries the verdict, digests, read errors and files (`report_written: false`);
+  records of MISMATCH, INCOMPLETE, ABORTED and VERIFICATION FAILED runs,
+  verifications and conversions have the outcome `error` and the verdict as
+  message; (d) an unwritable audit log refuses on dfnix and
   is stated in the report and the UI elsewhere; (e) tests no longer mirror
   records into the host journal (dfcore 0.2.0).
 - **H7** Unmount: `dfdisk unmount` and `--auto-unmount` collect the mounts of

@@ -1143,6 +1143,62 @@ async fn an_image_that_cannot_be_flushed_is_never_verified() {
 }
 
 #[tokio::test]
+async fn a_report_that_cannot_be_written_keeps_the_facts_in_the_audit_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fake = Fake::new();
+    let data = fake.data.clone();
+    fake.engine = Some(Box::new(move |ctx| {
+        let p = ctx.output_path(".raw");
+        std::fs::write(&p, &data).unwrap();
+        // The destination turns read-only: the reports cannot be written
+        std::fs::set_permissions(&ctx.output_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        Ok(EngineOutput {
+            image_files: vec![p],
+            ..complete(&data)
+        })
+    }));
+    let config = AcquisitionConfig {
+        smart: SmartPolicy::Off,
+        piece_size: None,
+        ..fake.raw()
+    };
+    let (r, progress) = run_fake(&fake, config).await;
+    std::fs::set_permissions(fake.out(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let e = r.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Failed);
+    assert_eq!(e.exit_code(), 4);
+    // The message (printed by the CLI on stderr, shown by the TUI) names the
+    // verdict, the digests and the image
+    let sha256 = hashes(&fake.data).sha256.unwrap();
+    assert!(e.message.contains("ended VERIFIED (exit code 0)"), "{e}");
+    assert!(e.message.contains("could not be written"), "{e}");
+    assert!(e.message.contains(&format!("SHA-256 {sha256}")), "{e}");
+    assert!(e.message.contains(&format!("{BASE}.raw")), "{e}");
+    assert!(matches!(progress.status, AcquisitionStatus::Failed(_)));
+    // The finished record carries what the report would have said
+    let finished = fake.records().pop().unwrap();
+    assert_eq!(finished["action"], "acquisition_finished");
+    assert_eq!(finished["outcome"], "error");
+    let d = &finished["details"];
+    assert_eq!(d["report_written"], false);
+    assert_eq!(d["exit_code"], 4);
+    assert_eq!(d["verdict_exit_code"], 0);
+    assert_eq!(d["outcome"], "verified");
+    assert_eq!(d["acquisition_hashes"]["sha256"], sha256.as_str());
+    assert_eq!(d["image_hashes"]["sha256"], sha256.as_str());
+    assert_eq!(d["bytes_acquired"], SIZE);
+    assert!(d["read_errors"]["ranges"].is_number());
+    assert!(d["files"][0].as_str().unwrap().ends_with(".raw"));
+    assert!(d["report_sha256"].is_null());
+    assert!(d["error"]
+        .as_str()
+        .unwrap()
+        .contains("could not be written"));
+    // The image is kept
+    assert!(fake.out().join(format!("{BASE}.raw")).exists());
+}
+
+#[tokio::test]
 async fn substituted_sectors_are_completed_with_read_errors() {
     let mut fake = Fake::new();
     let mut out = complete(&fake.data);

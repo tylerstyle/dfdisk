@@ -233,11 +233,17 @@ lines, `/run/dfnix/audit.jsonl` by default; `DFNIX_AUDIT_LOG` overrides the path
 | Action | When |
 |--------|------|
 | `acquisition_started` | before anything is sent to the device: identity (with major:minor and diskseq), case fields, applied settings, destination, the path tools read the source through. Its hash is the report's **audit anchor**. |
-| `acquisition_finished` | always after a "started" record, also after errors, aborts, signals and panics: outcome, exit code, read-error summary, every known digest, write protection, capacity and SMART summaries, SHA-256 of both reports, the files |
+| `acquisition_finished` | always after a "started" record, also after errors, aborts, signals and panics: outcome, exit code, read-error summary, every known digest, write protection, capacity and SMART summaries, SHA-256 of both reports (`report_written`), the files. When the verdict was reached but the report could not be written, the record still carries all of that except the report digests (null), with `report_written: false`, the error, `exit_code` 4 and the verdict's code as `verdict_exit_code` |
 | `acquisition_refused` | a refusal after the device was selected and before "started" (identity, source safety, destination); nothing was written to the destination |
 | `unmount` | `dfdisk unmount` and `--auto-unmount`: the mounts and what happened to them |
 | `image_verification` | `dfdisk verify` |
 | `conversion_started`, `conversion_finished` | `dfdisk convert` and `--rescue-to-e01`; a conversion refused before it started (usage, destination checks, existing outputs) writes no record |
+
+The top-level `outcome` of a record that carries a verdict
+(`acquisition_finished`, `image_verification`, `conversion_finished`) is `ok`
+for exit codes 0, 7 and 9 and `error` for 4 (verification failed), 5
+(mismatch), 6 (incomplete) and 8 (aborted); its `message` is the verdict with
+its exit code, for example "INCOMPLETE (exit code 6)". Refusals are `refused`.
 
 Usage errors are not recorded (nothing was sent to the device). On dfnix
 (protected-device registry present) an audit log that cannot be written refuses

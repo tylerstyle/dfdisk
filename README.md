@@ -426,7 +426,11 @@ identify-class queries that the report records.
   conversions are recorded in the hash-chained dfnix audit log (dfcore); usage
   errors and conversions refused before they started are not. The
   "acquisition_finished" record is written on every path, including errors,
-  aborts and signals, and carries the SHA-256 of both reports.
+  aborts and signals, and carries the SHA-256 of both reports; when the report
+  itself cannot be written, the record still carries the verdict, the digests,
+  the read errors and the files, and the error message printed by dfdisk names
+  the digests. Records of a MISMATCH, INCOMPLETE, ABORTED or VERIFICATION
+  FAILED run have the outcome `error`.
 
 ## Screenshots
 
