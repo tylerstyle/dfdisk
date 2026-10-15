@@ -213,8 +213,13 @@ pub async fn convert_with(
 // Notes of a converted rescue (CLI --rescue-to-e01, TUI)
 
 /// Most zero-filled ranges [`rescue_notes`] lists (the rescue report lists
-/// all of them).
+/// all of them; the note says how many there are).
 pub const MAX_RESCUE_NOTE_RANGES: usize = 20;
+/// How [`rescue_notes`] begins its line in the E01 header notes.
+const RESCUE_NOTE_MARKER: &str = "Zero-filled sectors of the rescue";
+/// How [`ewf_notes`] states inherited zero-filled sectors in the E01 header
+/// notes ("<summary> unreadable in the acquisition, zeros in this image").
+const ZEROS_NOTE_MARKER: &str = "unreadable in the acquisition, zeros in this image";
 
 /// E01 notes of a converted rescue beyond what the converter states itself
 /// (where the image came from, the rescue report's verdict and its
@@ -245,13 +250,18 @@ pub fn rescue_notes(report: &ForensicInfoReport, report_json: &Path) -> Vec<Stri
     }
     let shown = ranges.len().min(MAX_RESCUE_NOTE_RANGES);
     let mut line = format!(
-        "Zero-filled sectors of the rescue ({}, {} bytes each): {}",
+        "{RESCUE_NOTE_MARKER} ({}, {} bytes each){}: {}",
         if table.source.is_empty() {
             "ddrescue mapfile"
         } else {
             table.source.as_str()
         },
         sector,
+        if ranges.len() > shown {
+            format!(", the first {shown} of {} ranges", ranges.len())
+        } else {
+            String::new()
+        },
         ranges[..shown].join(", ")
     );
     if ranges.len() > shown {
@@ -1276,6 +1286,8 @@ struct Plan {
     /// The image was not verified against its medium: a matching conversion
     /// stays "not verified"
     inherited_unverified: Option<String>,
+    /// What the report says about unreadable ranges when none are listed
+    read_errors_note: Option<String>,
     selection: HashSelection,
     settings: ConversionSettings,
     notes: Vec<String>,
@@ -1559,6 +1571,29 @@ async fn plan(
     }
     let mut inherited_stop = None;
     let mut inherited_unverified = None;
+    // C-4: an E01 dfdisk made from an image with zero-filled sectors (e.g.
+    // --rescue-to-e01) states them in its header notes only; without the
+    // report that lists them the output must not pass for a verified copy
+    let mut read_errors_note = None;
+    if let Some(stated) = ewf_source
+        .as_ref()
+        .and_then(|i| zero_filled_in_notes(i.notes.as_deref()?))
+    {
+        if inherited_errors.summary(RangeKind::Substituted).is_none() {
+            read_errors_note = Some(format!(
+                "not in the error list of {} and in no report found; its header notes (written by dfdisk) state: {stated}",
+                source_name(&source)
+            ));
+            inherited_unverified = Some(format!(
+                "the header notes of {} state that sectors of the medium were unreadable and are zeros in the image ({stated}), but their positions are not in its error list and no report of its acquisition that lists them was found",
+                source_name(&source)
+            ));
+            notes.push(format!(
+                "{} records zero-filled sectors only in its header notes ({stated}); give the report of its acquisition or conversion (--report) to list them",
+                source_name(&source)
+            ));
+        }
+    }
     if let Some(r) = &report {
         let rr = &r.reference;
         let what = format!(
@@ -1677,10 +1712,22 @@ async fn plan(
         inherited_errors,
         inherited_stop,
         inherited_unverified,
+        read_errors_note,
         selection,
         settings,
         notes,
     })
+}
+
+/// The parts of E01 header notes in which dfdisk stated zero-filled
+/// sectors ([`ewf_notes`], [`rescue_notes`]), joined; `None` without.
+fn zero_filled_in_notes(notes: &str) -> Option<String> {
+    let parts: Vec<&str> = notes
+        .split("; ")
+        .map(str::trim)
+        .filter(|p| p.contains(ZEROS_NOTE_MARKER) || p.starts_with(RESCUE_NOTE_MARKER))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// Notes for the E01 header (`-N`): the case fields without an own header
@@ -1722,9 +1769,7 @@ fn ewf_notes(
         ));
     }
     if let Some(s) = errors.summary(RangeKind::Substituted) {
-        parts.push(format!(
-            "{s} unreadable in the acquisition, zeros in this image"
-        ));
+        parts.push(format!("{s} {ZEROS_NOTE_MARKER}"));
     }
     if let Some(s) = errors.summary(RangeKind::Unread) {
         parts.push(format!("{s} never read by the acquisition"));
@@ -2898,6 +2943,7 @@ async fn build_report(
     report.bytes_converted = m.bytes_converted;
     report.aborted = m.aborted;
     report.read_errors = plan.inherited_errors.clone();
+    report.read_errors_note = plan.read_errors_note.clone();
     report.conversion_errors = m.conversion_errors;
     report.stop_reason = match (m.stop_reason, plan.inherited_stop.clone()) {
         (Some(a), Some(b)) => Some(format!("{a}; {b}")),
@@ -3492,6 +3538,55 @@ mod tests {
             ),
             Err(HashError::Io(_))
         ));
+    }
+
+    #[test]
+    fn rescue_notes_say_how_many_ranges_they_list() {
+        use crate::models::config::{AcquisitionConfig, EffectiveConfig};
+        let config = AcquisitionConfig::rescue("/out");
+        let mut report = ForensicInfoReport::new(
+            EngineKind::Rescue,
+            &CaseMetadata::default(),
+            Default::default(),
+            EffectiveConfig::build(&config, None),
+        );
+        let json = Path::new("/out/b.info.json");
+        let mut t = ReadErrorTable::new(512, "ddrescue mapfile");
+        for i in 0..25u64 {
+            t.push(i * 4096, 512, RangeKind::Substituted);
+        }
+        report.read_errors = t;
+        let notes = rescue_notes(&report, json);
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].starts_with(
+                "Zero-filled sectors of the rescue (ddrescue mapfile, 512 bytes each), the first 20 of 25 ranges: 0-0, 8-8,"
+            ),
+            "{notes:?}"
+        );
+        assert!(
+            notes[0].ends_with("152-152 and 5 more ranges (see b.info.json)"),
+            "{notes:?}"
+        );
+        // All listed: no count
+        report.read_errors.ranges.truncate(2);
+        let notes = rescue_notes(&report, json);
+        assert_eq!(
+            notes[0],
+            "Zero-filled sectors of the rescue (ddrescue mapfile, 512 bytes each): 0-0, 8-8"
+        );
+        // Both forms are found again in E01 header notes
+        let header = format!(
+            "Notes: x; Converted by dfdisk 0.2.0 from b.raw; 2 sectors (1 KiB) in 2 ranges {ZEROS_NOTE_MARKER}; {}",
+            notes[0]
+        );
+        let found = zero_filled_in_notes(&header).unwrap();
+        assert!(
+            found.starts_with("2 sectors (1 KiB) in 2 ranges unreadable"),
+            "{found}"
+        );
+        assert!(found.ends_with("0-0, 8-8"), "{found}");
+        assert_eq!(zero_filled_in_notes("Notes: x; Converted by dfdisk"), None);
     }
 
     #[test]

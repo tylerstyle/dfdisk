@@ -307,6 +307,10 @@ pub struct ConversionReport {
     /// medium, inherited from its acquisition (the source report, and for an
     /// E01 source the error list stored in the E01)
     pub read_errors: ReadErrorTable,
+    /// What is known about unreadable ranges the table cannot list, e.g. an
+    /// E01 whose header notes alone record zero-filled sectors
+    #[serde(default)]
+    pub read_errors_note: Option<String>,
     /// Sectors of the source image the conversion tool could not read and
     /// wrote as zeros into the output (ewfexport's "Read errors during
     /// export"); empty when it read every sector
@@ -404,6 +408,7 @@ impl ConversionReport {
             stop_reason: None,
             aborted: false,
             read_errors: ReadErrorTable::default(),
+            read_errors_note: None,
             conversion_errors: ReadErrorTable::default(),
             comparisons: Vec::new(),
             verification_method: String::new(),
@@ -719,10 +724,10 @@ impl ConversionReport {
             row(
                 out,
                 "Unreadable Ranges",
-                if known {
-                    "none recorded"
-                } else {
-                    "unknown (no acquisition report)"
+                match &self.read_errors_note {
+                    Some(note) => note.as_str(),
+                    None if known => "none recorded",
+                    None => "unknown (no acquisition report)",
                 },
             );
         } else {

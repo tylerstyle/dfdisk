@@ -915,6 +915,85 @@ fn assert_corrupted_e01_conversion(r: &ConversionReport, out_raw: &Path) {
     }
 }
 
+/// C-4: an E01 made from a rescue (as --rescue-to-e01 does) records its
+/// zero-filled sectors only in its header notes; converted back without the
+/// reports that list them, the output must not pass for a verified copy.
+#[tokio::test]
+async fn zero_filled_sectors_recorded_only_in_the_e01_notes_are_never_verified() {
+    if !have_libewf() {
+        return;
+    }
+    let f = fixture();
+    let mut content = data(1 << 20, 23);
+    content[4096..5120].fill(0);
+    let raw = f.src.join("x.raw");
+    std::fs::write(&raw, &content).unwrap();
+    let report_json = acquisition_report(&raw, &content, |r| {
+        r.engine = EngineKind::Rescue;
+        r.acquisition_hashes = HashResults::default();
+        let mut t = ReadErrorTable::new(512, "ddrescue mapfile");
+        t.push(4096, 1024, RangeKind::Substituted);
+        r.read_errors = t;
+        r.verification.result = VerificationResult::NotPossible {
+            reason: "ddrescue computes no digest".into(),
+        };
+    });
+    let rescue =
+        ForensicInfoReport::from_json(&std::fs::read_to_string(&report_json).unwrap()).unwrap();
+    assert_eq!(rescue.outcome, Outcome::CompletedWithReadErrors);
+    let e01_dir = f.root.join("e01");
+    let mut req = request(&raw, ConversionTarget::E01, &e01_dir);
+    req.notes = dfdisk::engines::converter::rescue_notes(&rescue, &report_json);
+    req.source_report = Some(report_json.clone());
+    let made = run(&f.env, req, StopFlags::new()).await.unwrap();
+    assert_eq!(made.outcome, Outcome::CompletedWithReadErrors);
+    let e01 = e01_dir.join("x.E01");
+    let info = ewfinfo(&e01);
+    assert!(info.contains("Zero-filled sectors of the rescue"), "{info}");
+
+    // Next to its conversion report: the ranges are inherited from it
+    let r = run(
+        &f.env,
+        request(&e01, ConversionTarget::Raw, &f.root.join("with")),
+        StopFlags::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        r.outcome,
+        Outcome::CompletedWithReadErrors,
+        "{}",
+        r.render_text()
+    );
+    assert_eq!(r.read_errors.substituted_bytes(), 1024);
+
+    // Alone: never VERIFIED, and the report does not say "none recorded"
+    let alone = f.root.join("alone");
+    std::fs::create_dir_all(&alone).unwrap();
+    std::fs::copy(&e01, alone.join("x.E01")).unwrap();
+    let r = run(
+        &f.env,
+        request(&alone.join("x.E01"), ConversionTarget::Raw, &f.out),
+        StopFlags::new(),
+    )
+    .await
+    .unwrap();
+    let text = r.render_text();
+    assert_eq!(r.outcome, Outcome::CompleteUnverified, "{text}");
+    assert_eq!(r.exit_code, exit_code::UNVERIFIED);
+    assert!(r.comparisons[0].result.is_matched(), "{text}");
+    assert!(
+        r.outcome_reason.contains("header notes"),
+        "{}",
+        r.outcome_reason
+    );
+    assert!(!text.contains("none recorded"), "{text}");
+    assert!(
+        text.contains("its header notes (written by dfdisk) state: 2 sectors (1 KiB) in 1 range unreadable in the acquisition, zeros in this image; Zero-filled sectors of the rescue (ddrescue mapfile, 512 bytes each): 8-9"),
+        "{text}"
+    );
+}
+
 #[tokio::test]
 async fn an_e01_missing_its_last_segment_is_never_converted_whole() {
     if !have_libewf() {
