@@ -508,6 +508,21 @@ impl ForensicInfoReport {
                 {
                     // R12: the map really lists unread or unfinished areas
                     self.outcome.explanation_for(self.engine).to_string()
+                } else if self.stop_reason.is_some()
+                    && self.expected_bytes > 0
+                    && self.bytes_acquired >= self.expected_bytes
+                    && self.read_errors.unread_bytes() == 0
+                {
+                    // N1: everything was acquired, but the run ended with a
+                    // problem (ddrescue's exit status, a failed fsync, ...)
+                    let covered = if self.read_errors.substituted_bytes() > 0 {
+                        "The image covers the whole source (its unreadable sectors are zeros in it)"
+                    } else {
+                        "Every byte of the source is in the image"
+                    };
+                    format!(
+                        "{covered}, but the run did not end cleanly (the reason follows), so it is not counted as complete."
+                    )
                 } else if self.stop_reason.is_some() {
                     format!(
                         "{lead} the acquisition stopped before the end (the reason follows), so the image is partial and {digests}."
@@ -1826,13 +1841,46 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Incomplete);
         let e = r.explanation();
         assert!(!e.contains(MAP_TEXT), "{e}");
+        // N1: every byte is in the image; the run is incomplete only because
+        // it did not end cleanly, and the image is not called partial
+        assert_eq!(r.bytes_acquired, r.expected_bytes);
+        assert_eq!(
+            e,
+            "Every byte of the source is in the image, but the run did not end cleanly (the reason follows), so it is not counted as complete."
+        );
+        // ... with bad sectors: the image covers the source, with zeros
+        let r = rescue_report(|r| {
+            r.stop_reason = Some("ddrescue ended abnormally (ended by signal 9)".into());
+            r.read_errors.push(4096, 4096, RangeKind::Substituted);
+        });
+        assert_eq!(r.outcome, Outcome::Incomplete);
+        let e = r.explanation();
+        assert!(
+            e.starts_with("The image covers the whole source (its unreadable sectors are zeros in it), but the run did not end cleanly"),
+            "{e}"
+        );
+        assert!(!e.contains("partial"), "{e}");
+        // ... also for a RAW run whose image could not be fsynced
+        let mut r = verified();
+        r.stop_reason = Some("fsync of the image failed".into());
+        r.apply_classification();
+        assert_eq!(r.outcome, Outcome::Incomplete);
+        assert!(r.explanation().starts_with(
+            "Every byte of the source is in the image, but the run did not end cleanly"
+        ));
+        // A stop before the end: partial
+        r.bytes_acquired = 512;
+        r.apply_classification();
+        let e = r.explanation();
         assert!(e.contains("stopped before the end"), "{e}");
+        assert!(e.contains("the image is partial"), "{e}");
         // ... also when the map has unread areas besides the stop reason
         let r = rescue_report(|r| {
             r.stop_reason = Some("ddrescue ended abnormally (exit status 1)".into());
             r.read_errors.push(0, 4096, RangeKind::Unread);
         });
         assert!(!r.explanation().contains(MAP_TEXT));
+        assert!(r.explanation().contains("stopped before the end"));
         // The identity changed: that is the cause
         let r = rescue_report(|r| {
             r.read_errors.push(0, 4096, RangeKind::Unread);

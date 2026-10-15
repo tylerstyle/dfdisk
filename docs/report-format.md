@@ -221,7 +221,13 @@ lists areas that were not tried or not finished" only when the map has such
 areas and nothing else stopped the run (otherwise the explanation names the
 stop or the identity change); a VERIFIED rescue says that its image digests
 equal a second, independent read of the source; an ABORTED or INCOMPLETE run
-says "its digests cover only what was acquired" only when digests exist.
+says "its digests cover only what was acquired" only when digests exist; an
+INCOMPLETE run that has every byte of the source in its image and no unread
+area, but did not end cleanly (ddrescue's exit status, an image that could not
+be fsynced, …), says "every byte of the source is in the image, but the run did
+not end cleanly (the reason follows), so it is not counted as complete" (with
+bad sectors: "the image covers the whole source (its unreadable sectors are
+zeros in it)") instead of calling the image partial.
 
 ## Other JSON output (`--json`)
 
