@@ -223,12 +223,14 @@ areas and nothing else stopped the run (otherwise the explanation names the
 stop or the identity change); a VERIFIED rescue says that its image digests
 equal a second, independent read of the source; an ABORTED or INCOMPLETE run
 says "its digests cover only what was acquired" only when digests exist; an
-INCOMPLETE run that has every byte of the source in its image and no unread
-area, but did not end cleanly (ddrescue's exit status, an image that could not
-be fsynced, …), says "every byte of the source is in the image, but the run did
-not end cleanly (the reason follows), so it is not counted as complete" (with
-bad sectors: "the image covers the whole source (its unreadable sectors are
-zeros in it)") instead of calling the image partial.
+INCOMPLETE run whose image has the full length of the source and no known
+unread area, but that did not end cleanly (ddrescue's exit status, an image that
+could not be fsynced, E01 read errors whose positions could not be determined,
+…), says "the image has the full length of the source, but the run did not end
+cleanly (the reason follows), so it is not counted as complete" (with bad
+sectors: "the image has the full length of the source (its unreadable sectors
+are zeros in it)") instead of calling the image partial; it does not claim that
+every byte of the source is in the image, which the problem may contradict.
 
 ## Other JSON output (`--json`)
 

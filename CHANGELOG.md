@@ -155,8 +155,8 @@ and when something was not done the report says so.
   the report's HASHES section says that the re-read failed and why; a rescue
   image without digests is not compared with a second read ("nothing to compare
   with"; the source is not read again), and "the second source read failed"
-  names only a second read that failed itself. An INCOMPLETE run that has every
-  byte of the source in its image but did not end cleanly (for example ddrescue
+  names only a second read that failed itself. An INCOMPLETE run whose image has
+  the full length of the source but that did not end cleanly (for example ddrescue
   ending with an error status after a complete run) no longer calls its image
   partial.
 - **H5** Write protection was not checked or recorded: the read-only state of
