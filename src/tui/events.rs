@@ -1,12 +1,15 @@
+//! Terminal input for the TUI: key presses and resizes from crossterm's event
+//! stream, forwarded over a channel. The channel closes when the terminal
+//! goes away (end of input or repeated read errors, e.g. after SIGHUP), so
+//! the main loop never spins on a dead terminal.
+
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEvent, KeyEventKind};
 use futures::StreamExt;
-use std::time::Duration;
 use tokio::sync::mpsc;
 
-#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub enum AppEvent {
     Key(KeyEvent),
-    Tick,
     Resize(u16, u16),
 }
 
@@ -14,50 +17,46 @@ pub struct EventHandler {
     rx: mpsc::Receiver<AppEvent>,
 }
 
-impl EventHandler {
-    pub fn new(tick_rate: Duration) -> Self {
-        let (tx, rx) = mpsc::channel(100);
+impl Default for EventHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
+impl EventHandler {
+    /// Start reading terminal events (needs a tokio runtime).
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::channel(100);
         tokio::spawn(async move {
             let mut reader = EventStream::new();
-            let mut interval = tokio::time::interval(tick_rate);
-
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if tx.send(AppEvent::Tick).await.is_err() {
+            let mut errors = 0u32;
+            while let Some(event) = reader.next().await {
+                let forward = match event {
+                    Ok(CrosstermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
+                        Some(AppEvent::Key(key))
+                    }
+                    Ok(CrosstermEvent::Resize(w, h)) => Some(AppEvent::Resize(w, h)),
+                    Ok(_) => None,
+                    Err(_) => {
+                        errors += 1;
+                        if errors >= 10 {
                             break;
                         }
+                        continue;
                     }
-                    maybe_event = reader.next() => {
-                        match maybe_event {
-                            Some(Ok(crossterm_event)) => {
-                                match crossterm_event {
-                                    CrosstermEvent::Key(key)
-                                        if key.kind == KeyEventKind::Press
-                                            && tx.send(AppEvent::Key(key)).await.is_err() =>
-                                    {
-                                        break;
-                                    }
-                                    CrosstermEvent::Resize(w, h)
-                                        if tx.send(AppEvent::Resize(w, h)).await.is_err() =>
-                                    {
-                                        break;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            Some(Err(_)) => {}
-                            None => break,
-                        }
+                };
+                errors = 0;
+                if let Some(ev) = forward {
+                    if tx.send(ev).await.is_err() {
+                        break;
                     }
                 }
             }
         });
-
         Self { rx }
     }
 
+    /// The next event; `None` once the terminal input is gone.
     pub async fn next(&mut self) -> Option<AppEvent> {
         self.rx.recv().await
     }

@@ -1,49 +1,29 @@
+//! Path completion for the path inputs (destination, converter source,
+//! re-verification image). The App runs [`find_path_completions`] off the UI
+//! thread on an explicit key (F4) and shows the candidates as a list (§16).
+
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PathAutocompleteState {
-    pub original_prefix: String,
-    pub suffix: String,
-    pub matches: Vec<String>,
-    pub match_index: usize,
-    pub has_cycled: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AutocompleteOutcome {
-    /// Exactly one match was found and applied
-    SingleMatch { completed: String, suffix: String },
-    /// Multiple matches found; input was extended to their longest common prefix
-    PrefixExtended {
-        common_prefix: String,
-        suffix: String,
-        total: usize,
-    },
-    /// Cycled to a candidate among multiple matches
-    Cycled {
-        candidate: String,
-        suffix: String,
-        index: usize,
-        total: usize,
-    },
-    /// No matches were found
-    NoMatches,
-}
-
 /// Expands a leading `~` or `~/` to the user's home directory.
 pub fn expand_tilde(path: &Path) -> PathBuf {
+    expand_tilde_with(path, std::env::var_os("HOME").as_deref())
+}
+
+/// [`expand_tilde`] with an explicit home directory (`None`: unchanged).
+pub fn expand_tilde_with(path: &Path, home: Option<&OsStr>) -> PathBuf {
+    let Some(home) = home.filter(|h| !h.is_empty()) else {
+        return path.to_path_buf();
+    };
     let path_str = path.to_string_lossy();
     if path_str == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home);
-        }
+        PathBuf::from(home)
     } else if let Some(rest) = path_str.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+        PathBuf::from(home).join(rest)
+    } else {
+        path.to_path_buf()
     }
-    path.to_path_buf()
 }
 
 /// Finds the longest common prefix across a slice of strings, respecting UTF-8 char boundaries.
@@ -158,101 +138,6 @@ pub fn find_path_completions(prefix: &str, dirs_only: bool) -> Vec<String> {
     final_matches
 }
 
-/// Performs path autocompletion on `text` at cursor position `cursor_pos`.
-/// Repeated calls with an active `state` cycle through candidates.
-pub fn complete_path(
-    text: &str,
-    cursor_pos: usize,
-    dirs_only: bool,
-    state: &mut Option<PathAutocompleteState>,
-) -> Option<AutocompleteOutcome> {
-    // Check if existing state is still relevant to current input
-    if let Some(ref s) = state {
-        let is_relevant = s.matches.iter().any(|m| text.starts_with(m))
-            || (!s.original_prefix.is_empty() && text.starts_with(&s.original_prefix));
-        if !is_relevant {
-            *state = None;
-        }
-    }
-
-    // If state is active with matches, continue cycling:
-    if let Some(ref mut s) = state {
-        if !s.matches.is_empty() {
-            if !s.has_cycled {
-                s.has_cycled = true;
-                s.match_index = 0;
-            } else {
-                s.match_index = (s.match_index + 1) % s.matches.len();
-            }
-            let candidate = s.matches[s.match_index].clone();
-            let suffix = s.suffix.clone();
-            return Some(AutocompleteOutcome::Cycled {
-                candidate,
-                suffix,
-                index: s.match_index + 1,
-                total: s.matches.len(),
-            });
-        }
-    }
-
-    // New autocompletion attempt:
-    let prefix = if cursor_pos <= text.len() {
-        &text[..cursor_pos]
-    } else {
-        text
-    };
-    let suffix = if cursor_pos < text.len() {
-        text[cursor_pos..].to_string()
-    } else {
-        String::new()
-    };
-
-    let candidates = find_path_completions(prefix, dirs_only);
-
-    if candidates.is_empty() {
-        *state = None;
-        return Some(AutocompleteOutcome::NoMatches);
-    }
-
-    if candidates.len() == 1 {
-        let completed = candidates[0].clone();
-        *state = None;
-        return Some(AutocompleteOutcome::SingleMatch { completed, suffix });
-    }
-
-    // Multiple candidates: compute longest common prefix
-    let lcp = longest_common_prefix(&candidates);
-    if lcp.len() > prefix.len() {
-        *state = Some(PathAutocompleteState {
-            original_prefix: prefix.to_string(),
-            suffix: suffix.clone(),
-            matches: candidates.clone(),
-            match_index: 0,
-            has_cycled: false,
-        });
-        Some(AutocompleteOutcome::PrefixExtended {
-            common_prefix: lcp,
-            suffix,
-            total: candidates.len(),
-        })
-    } else {
-        // Already at LCP: start cycling with first candidate
-        *state = Some(PathAutocompleteState {
-            original_prefix: prefix.to_string(),
-            suffix: suffix.clone(),
-            matches: candidates.clone(),
-            match_index: 0,
-            has_cycled: true,
-        });
-        Some(AutocompleteOutcome::Cycled {
-            candidate: candidates[0].clone(),
-            suffix,
-            index: 1,
-            total: candidates.len(),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,7 +162,6 @@ mod tests {
             longest_common_prefix(&["/foo".to_string(), "/bar".to_string()]),
             "/"
         );
-        // Multibyte unicode
         assert_eq!(
             longest_common_prefix(&["/データ/ケース1".to_string(), "/データ/ケース2".to_string(),]),
             "/データ/ケース"
@@ -286,31 +170,37 @@ mod tests {
 
     #[test]
     fn test_expand_tilde() {
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", "/custom/home");
-
-        let p1 = Path::new("~");
-        assert_eq!(expand_tilde(p1), PathBuf::from("/custom/home"));
-
-        let p2 = Path::new("~/cases/ev01");
-        assert_eq!(expand_tilde(p2), PathBuf::from("/custom/home/cases/ev01"));
-
-        let p3 = Path::new("/var/log");
-        assert_eq!(expand_tilde(p3), PathBuf::from("/var/log"));
-
-        let p4 = Path::new("relative/path");
-        assert_eq!(expand_tilde(p4), PathBuf::from("relative/path"));
-
-        if let Some(h) = original_home {
-            std::env::set_var("HOME", h);
-        }
+        let home = Some(OsStr::new("/custom/home"));
+        assert_eq!(
+            expand_tilde_with(Path::new("~"), home),
+            PathBuf::from("/custom/home")
+        );
+        assert_eq!(
+            expand_tilde_with(Path::new("~/cases/ev01"), home),
+            PathBuf::from("/custom/home/cases/ev01")
+        );
+        assert_eq!(
+            expand_tilde_with(Path::new("/var/log"), home),
+            PathBuf::from("/var/log")
+        );
+        assert_eq!(
+            expand_tilde_with(Path::new("relative/path"), home),
+            PathBuf::from("relative/path")
+        );
+        assert_eq!(
+            expand_tilde_with(Path::new("~/x"), None),
+            PathBuf::from("~/x")
+        );
+        assert_eq!(
+            expand_tilde_with(Path::new("~user/x"), home),
+            PathBuf::from("~user/x")
+        );
     }
 
     #[test]
     fn test_find_completions_in_tempdir() {
-        let temp = std::env::temp_dir().join(format!("dfdisk_test_ac_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp);
-        fs::create_dir_all(&temp).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let temp = tmp.path();
 
         create_dir(temp.join("evidence_dir")).unwrap();
         create_dir(temp.join("export_dir")).unwrap();
@@ -321,124 +211,29 @@ mod tests {
         let temp_str = temp.to_string_lossy().to_string();
 
         // 1. Dirs only on temp/e
-        let prefix = format!("{}/e", temp_str);
-        let dir_matches = find_path_completions(&prefix, true);
+        let dir_matches = find_path_completions(&format!("{}/e", temp_str), true);
         assert_eq!(dir_matches.len(), 2);
         assert!(dir_matches.contains(&format!("{}/evidence_dir/", temp_str)));
         assert!(dir_matches.contains(&format!("{}/export_dir/", temp_str)));
 
         // 2. Both files and dirs on temp/evi
-        let prefix2 = format!("{}/evi", temp_str);
-        let all_matches = find_path_completions(&prefix2, false);
+        let all_matches = find_path_completions(&format!("{}/evi", temp_str), false);
         assert_eq!(all_matches.len(), 3);
         assert!(all_matches.contains(&format!("{}/evidence_dir/", temp_str)));
         assert!(all_matches.contains(&format!("{}/evidence.raw", temp_str)));
         assert!(all_matches.contains(&format!("{}/evidence.E01", temp_str)));
 
         // 3. Hidden file not included unless requested
-        let prefix3 = format!("{}/", temp_str);
-        let without_hidden = find_path_completions(&prefix3, false);
+        let without_hidden = find_path_completions(&format!("{}/", temp_str), false);
         assert!(!without_hidden.iter().any(|m| m.contains(".hidden_file")));
-
-        let prefix_hidden = format!("{}/.", temp_str);
-        let with_hidden = find_path_completions(&prefix_hidden, false);
+        let with_hidden = find_path_completions(&format!("{}/.", temp_str), false);
         assert!(with_hidden.iter().any(|m| m.contains(".hidden_file")));
 
         // 4. Case-insensitive fallback
-        let prefix_ci = format!("{}/EVI", temp_str);
-        let ci_results = find_path_completions(&prefix_ci, false);
+        let ci_results = find_path_completions(&format!("{}/EVI", temp_str), false);
         assert_eq!(ci_results.len(), 3);
 
-        let _ = fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn test_complete_path_cycle_and_lcp() {
-        let temp = std::env::temp_dir().join(format!("dfdisk_test_cycle_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp);
-        fs::create_dir_all(&temp).unwrap();
-
-        create_dir(temp.join("case_alpha")).unwrap();
-        create_dir(temp.join("case_beta")).unwrap();
-
-        let temp_str = temp.to_string_lossy().to_string();
-        let mut state = None;
-
-        // First Tab on temp/c -> extends to temp/case_
-        let input = format!("{}/c", temp_str);
-        let outcome1 = complete_path(&input, input.len(), true, &mut state);
-        match outcome1 {
-            Some(AutocompleteOutcome::PrefixExtended {
-                common_prefix,
-                total,
-                ..
-            }) => {
-                assert_eq!(common_prefix, format!("{}/case_", temp_str));
-                assert_eq!(total, 2);
-            }
-            other => panic!("Expected PrefixExtended, got {:?}", other),
-        }
-        assert!(state.is_some());
-
-        // Second Tab -> cycles to first match (case_alpha/)
-        let outcome2 = complete_path(
-            &format!("{}/case_", temp_str),
-            format!("{}/case_", temp_str).len(),
-            true,
-            &mut state,
-        );
-        match outcome2 {
-            Some(AutocompleteOutcome::Cycled {
-                candidate,
-                index,
-                total,
-                ..
-            }) => {
-                assert_eq!(candidate, format!("{}/case_alpha/", temp_str));
-                assert_eq!(index, 1);
-                assert_eq!(total, 2);
-            }
-            other => panic!("Expected Cycled 1, got {:?}", other),
-        }
-
-        // Third Tab -> cycles to second match (case_beta/)
-        let outcome3 = complete_path(
-            &format!("{}/case_alpha/", temp_str),
-            format!("{}/case_alpha/", temp_str).len(),
-            true,
-            &mut state,
-        );
-        match outcome3 {
-            Some(AutocompleteOutcome::Cycled {
-                candidate,
-                index,
-                total,
-                ..
-            }) => {
-                assert_eq!(candidate, format!("{}/case_beta/", temp_str));
-                assert_eq!(index, 2);
-                assert_eq!(total, 2);
-            }
-            other => panic!("Expected Cycled 2, got {:?}", other),
-        }
-
-        // Fourth Tab -> wraps back to first match (case_alpha/)
-        let outcome4 = complete_path(
-            &format!("{}/case_beta/", temp_str),
-            format!("{}/case_beta/", temp_str).len(),
-            true,
-            &mut state,
-        );
-        match outcome4 {
-            Some(AutocompleteOutcome::Cycled {
-                candidate, index, ..
-            }) => {
-                assert_eq!(candidate, format!("{}/case_alpha/", temp_str));
-                assert_eq!(index, 1);
-            }
-            other => panic!("Expected Cycled wrap, got {:?}", other),
-        }
-
-        let _ = fs::remove_dir_all(&temp);
+        // 5. Missing directory: nothing, no error
+        assert!(find_path_completions(&format!("{}/missing/x", temp_str), false).is_empty());
     }
 }
