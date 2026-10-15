@@ -27,7 +27,7 @@ and when something was not done the report says so.
   `--evidence` and `--examiner`. The 0.1 placeholder defaults (`CASE001`, `cf01`,
   `Forensic Examiner`, `Law Enforcement / DFIR Unit`, `Physical Storage Media`)
   are gone; no placeholder is ever recorded. `convert` takes the case fields from
-  `<source>.info.json` or requires them.
+  the source image's report (and an E01's header) or requires them.
 - **Exit codes.** One documented table (docs/exit-codes.md): 0 verified,
   1 internal error, 2 usage, 3 refused, 4 failed, 5 mismatch, 6 incomplete,
   7 completed with read errors, 8 aborted, 9 complete but not verified. In 0.1
@@ -48,13 +48,17 @@ and when something was not done the report says so.
 - **dfcore 0.2.0** is required (registry matching by device number, typed
   refusals, per-boot audit export, `DeviceIdentity::same_attachment`).
 - **Stricter refusals.** Mounted sources are refused (unmounting is the explicit
-  `dfdisk unmount` / `--auto-unmount`), as are sources with holders (they have
+  `dfdisk unmount` / `--auto-unmount`), as are sources with holders
+  (device-mapper, LVM, md, or a loop device set up over the source; they have
   to be closed first), sources with active swap, sources in use (`O_EXCL`), tmpfs
   destinations (unless `--allow-tmpfs`), E01 destinations with less free space
   than the source (unless `--allow-low-space`) and empty sources (size 0: no
   medium, or the size is unknown).
 - **Write protection on by default.** `--write-protect auto` sets the kernel
-  read-only flag (BLKROSET) on the source and leaves it set; `off` only records.
+  read-only flag (BLKROSET) on the source, the nodes it sits on and the disk it
+  is stored on with all its partitions (except nodes another mounted filesystem
+  needs writable, which the report names) and leaves it set; `off` only
+  records.
 - **SMART** is no longer queried during device scans; `list --smart` asks for it
   (with `-n standby`, so a sleeping disk is not woken).
 - **`list --json`** prints one object (`schema_version` 1: registry state,
@@ -62,7 +66,9 @@ and when something was not done the report says so.
   in `children`) instead of 0.1's array of devices.
 - **TUI exit code.** The TUI exits with the exit code of a result the examiner
   did not acknowledge on screen (for example a run that finished after SIGHUP),
-  0 otherwise, and 1 on a terminal failure.
+  0 otherwise, 1 on a terminal failure or an internal error of the UI itself,
+  and 4 when the signal handlers cannot be installed. A run that stops on an
+  internal error (a panic) is shown as FAILED (INTERNAL ERROR), exit code 4.
 - **TUI keys.** Esc never aborts; aborting needs a y/N confirmation; Tab and
   Shift-Tab always move between fields and path completion has its own key.
 - **Packaging.** The .deb depends on `$auto, ewf-tools, gddrescue, smartmontools,
@@ -84,33 +90,60 @@ and when something was not done the report says so.
   again at the start and at the end; the source is held open with `O_EXCL` for
   the whole run; external tools read through `/dev/disk/by-diskseq/<N>` when it
   points at the pinned device; the TUI keys its selection on the identity and
-  shows a confirmation sheet.
+  shows a confirmation sheet. An E01 acquisition of a source that ends before
+  its size while it stays attached no longer waits forever: after 60 s without
+  progress dfdisk checks the source and, when it is gone or smaller, stops
+  ewfacquire (INCOMPLETE, "source lost at offset X").
 - **H1** The TUI hid the verdict: the result screen starts with the verdict
   banner, coloured by outcome, shows the key numbers and paths, scrolls the full
-  report and stays until acknowledged; errors no longer expire.
-- **H2** No signal handling: SIGINT/SIGTERM abort gracefully (SIGINT to the
-  tool's process group, grace period, then SIGTERM and SIGKILL), a second SIGINT
-  kills at once, SIGHUP lets the run finish headless; every engine keeps its
-  partial output; the report and the audit "finished" record are written on
-  every path.
+  report and stays until acknowledged; errors no longer expire. Notices are
+  wrapped instead of cut at the terminal width, the ones that do not fit are
+  counted, and Ctrl+X dismisses only the notices shown.
+- **H2** No signal handling: SIGINT, SIGTERM and SIGQUIT abort gracefully
+  (SIGINT to the tool's process group, grace period, then SIGTERM and SIGKILL),
+  a second SIGINT kills at once, SIGHUP lets the run finish headless; every
+  engine keeps its partial output; the report and the audit "finished" record
+  are written on every path. A tool started by dfdisk gets SIGTERM when dfdisk
+  dies in a way it cannot handle (SIGKILL, the OOM killer, a crash:
+  `PR_SET_PDEATHSIG`) and does not run on unsupervised.
 - **H3** The converter overwrote outputs and verified nothing: existing outputs
-  are refused before any tool runs, destination checks apply, the output is
+  are refused before any tool writes, destination checks apply, the output is
   verified against the source digests, it writes `<base>.conversion.info` /
   `.conversion.info.json` and audit records, abort works, sizes that are not a
   multiple of 512 bytes are refused, split RAW inputs are converted completely
-  or refused.
+  or refused. An E01 that ewfinfo reports as corrupted (segments missing, or
+  never finalized) is INCOMPLETE (exit 6), and the sectors ewfexport could not
+  read correctly are listed as the conversion's own read errors (libewf
+  20140816 exports such an image with zeros and "SUCCESS"); segments beyond
+  `.EZZ` (`.FAA` …) are listed, flushed and refused like the others; a source
+  image whose report says HASH MISMATCH or VERIFICATION FAILED gives at best
+  COMPLETE, NOT VERIFIED (exit 9); a report found next to the image that
+  describes another image is ignored with a note (only a report given with
+  `--report` must describe it).
 - **H4** Rescue reports were not truthful: read-error ranges and counts come
   from the ddrescue mapfile, untried areas make the run INCOMPLETE, the map is
   hashed and listed, a resume requires the same device (identity sidecar) and
   passes `-I`, the earlier report is kept as `<base>.info.session-N`, and the TUI
-  offers to resume. The verdict explanation follows what happened: a rescue is
-  INCOMPLETE "because the map lists unfinished areas" only when it does and
-  nothing else stopped it, a VERIFIED rescue names the second read of the
-  source it was compared with, and a second read that differs is labelled by
-  what was compared (acquisition digests or the image).
+  offers to resume. A resume refuses an identity record whose SHA-256 differs
+  from the one the last report lists, and behind a USB bridge without a WWN it
+  ties the drive only by its own ATA IDENTIFY serial (recorded when SMART runs)
+  or the same attachment, not by the bridge's serial; a refused resume leaves
+  the previous report as `<base>.info`. After every ddrescue run dfdisk writes
+  zeros over the bad-sector areas of the map, so they are zeros in the image
+  also after an interrupted session was resumed. The verdict explanation
+  follows what happened: a rescue is INCOMPLETE "because the map lists
+  unfinished areas" only when it does and nothing else stopped it, a VERIFIED
+  rescue names the second read of the source it was compared with, and a second
+  read that differs is labelled by what was compared (acquisition digests or
+  the image).
 - **H5** Write protection was not checked or recorded: the read-only state of
   the source and its partitions, holders, mounts and the exclusive open are
-  recorded; BLKROSET is set by default.
+  recorded; BLKROSET is set by default on the source, its partitions, the nodes
+  it sits on (the partition and intermediate dm/md devices under a LUKS, LVM or
+  md source) and its disk with every partition; a node that has to stay
+  writable because of another mount is named in the report. A loop device set
+  up over the source or its partitions is a holder and its mounts are mounts
+  of the source; a loop or md source's own partitions belong to it.
 - **H6** Audit trail gaps: (a) the export is per boot and never replaces another
   boot's chain; (b) refusals are recognised by type, not by message text;
   (c) the "finished" record always carries the outcome, the digests known and
@@ -120,19 +153,28 @@ and when something was not done the report says so.
   verifications and conversions have the outcome `error` and the verdict as
   message; (d) an unwritable audit log refuses on dfnix and
   is stated in the report and the UI elsewhere; (e) tests no longer mirror
-  records into the host journal (dfcore 0.2.0).
+  records into the host journal (dfcore 0.2.0); (f) a refused conversion is
+  recorded (`conversion_refused`), as a refused acquisition is.
 - **H7** Unmount: `dfdisk unmount` and `--auto-unmount` collect the mounts of
   the source and all its descendants by device number, check the registry and
   system mounts before unmounting anything, unmount deepest first, verify that
-  nothing remains and write an audit record. The output directory is created
+  nothing remains and write an audit record (loop devices set up over the
+  source and a loop or md source's own partitions included). SIGINT, SIGTERM,
+  SIGQUIT, SIGHUP or a quit do not cut an unmount short: it is finished,
+  checked and recorded before dfdisk exits. The output directory is created
   only after every destination check. The registry is matched by device number
   (device-mapper paths), and an ambiguous bare device name is refused.
 - **H8** TUI start and abort hazards: required fields, typed confirmation
   (last four characters of the serial, the whole serial when shorter, the
   evidence number without a serial), source identity on every screen, a
   scrolling device table that keeps the serial visible, abort with confirmation.
+  The confirmation sheet shows the settings the run uses and says "refused"
+  only for a refusal (a missing tool is named); nothing starts while a run or
+  an unmount is in progress.
 - **H9** Exit codes: see Breaking changes; errors are printed once; a panic
-  exits 1 (internal error) with a message instead of Rust's 101.
+  exits 1 (internal error) with a message instead of Rust's 101; a tool the
+  engine runs that is not installed fails the run (exit 4) before anything is
+  written, sent to the device or recorded as started, and `check` reports it.
 - **H10** Release and packaging: releases are built only after the test job
   passed; tag, Cargo.toml, Cargo.lock and package.nix versions must agree;
   pinned Rust toolchain; `cargo install --locked --version` for cross and
@@ -150,10 +192,10 @@ and when something was not done the report says so.
   with timeouts) are recorded; `--refuse-hidden-areas` refuses.
 - **M3** Verification read the page cache: images, auxiliary files and the
   directory are fsynced and evicted from the page cache before verification. An
-  image that cannot be fsynced fails the verification (exit 4); one that cannot
-  be evicted is noted in the verification method ("the re-read may have come
-  from memory"); the method states the fsync and eviction only when they
-  happened.
+  image (or a conversion's output) that cannot be fsynced fails the
+  verification (exit 4); one that cannot be evicted is noted in the
+  verification method ("the re-read may have come from memory"); the method
+  states the fsync and eviction only when they happened.
 - **M4** Metadata: control characters are sanitised (no shifted E01 header
   fields), placeholders are never recorded, file names are capped at 255 bytes
   (refused, never truncated), tokens are NFC-normalised, existing outputs are
@@ -172,7 +214,11 @@ and when something was not done the report says so.
   progress is shown per phase (acquire, flush, verify, source re-read).
 - **M9** TUI ergonomics: probes run off the UI thread, Tab moves between fields,
   path completion has its own key, modals fit their content, help overlay, no
-  mouse capture, partitions can be selected.
+  mouse capture, partitions can be selected (a partition whose LUKS or LVM
+  mapping is mounted is shown MOUNTED and IN-USE and can be unmounted with U; a
+  device on several disks borrows no disk's serial). The converter fills only
+  the case fields it shows from the image's report, names them, and empties
+  the ones not edited when the source changes.
 - **M10** Tests: no host disks, fake tools on PATH, tool tests fail instead of
   skipping when `DFDISK_REQUIRE_TOOLS=1` (set in the Nix build and in CI),
   modules are compiled once (the binary uses the library).
@@ -184,12 +230,15 @@ and when something was not done the report says so.
   never a pass; `.Ex01` and `.E02` segment families are recognised as EWF; an
   expected digest that is not 32/40/64 hex digits is a usage error (exit 2)
   instead of a HASH MISMATCH with an addendum.
-- Low: `-r` above 255 is a usage error instead of silently becoming 2; `-m` and
-  `-M` (media type and flags) are set from the source; firmware and other device
-  strings are sanitised; false README claims removed; runtime tools are no longer
-  build inputs of the Nix package; the Debian copyright covers both licenses;
-  `rust-version` is declared; active swap files on the source are refused by
-  name; `/iso`, `/run/initramfs` and swap join the system-mount list.
+- Low: `--split none` passes the largest segment size both libewf lines accept
+  (9223372036854775806 bytes; 0.1.10 passed 7900 GiB, so a larger source got
+  several segments); `-r` above 255 is a usage error instead of silently
+  becoming 2; `-m` and `-M` (media type and flags) are set from the source;
+  firmware and other device strings are sanitised; false README claims removed;
+  runtime tools are no longer build inputs of the Nix package; the Debian
+  copyright covers both licenses; `rust-version` is declared; active swap files
+  on the source are refused by name; `/iso`, `/run/initramfs` and swap join the
+  system-mount list.
 
 ### Added
 
@@ -201,8 +250,9 @@ and when something was not done the report says so.
   holders, `O_EXCL`, BLKROSET), recorded in the report and the audit log.
 - **F4** HPA/DCO and NVMe capacity detection.
 - **F5** `<base>.info.json`, tool versions and command lines, kernel, host and
-  dfnix revision, dfdisk and dfcore git revisions (`dfdisk --version`), clock and
-  NTP state with the RTC offset, documented exit codes, `dfdisk check` (dry run),
+  dfnix revision, dfdisk and dfcore git revisions (`dfdisk --version`; "-dirty"
+  when built with uncommitted changes to tracked files), clock and NTP state
+  with the RTC offset, documented exit codes, `dfdisk check` (dry run),
   `acquire --json`, `list --json`; `check`, `verify` and `unmount` with
   `--json` and the error object carry `schema_version` 1 and are documented in
   docs/report-format.md.
@@ -215,9 +265,11 @@ and when something was not done the report says so.
   warning when the TUI runs over SSH outside tmux or screen.
 - **F10** `--rescue-to-e01`: a finished rescue is converted to E01 next to the
   rescue image; the rescue's verdict, read-error summary and zero-filled sector
-  ranges go into the E01 notes and the conversion report, which names the rescue
-  report by path and SHA-256. The ddrescue map is not imported into the E01 as
-  EWF error ranges.
+  ranges (in the notes the first 20, with the number of ranges) go into the E01
+  notes and the conversion report, which names the rescue report by path and
+  SHA-256. The ddrescue map is not imported into the E01 as EWF error ranges:
+  converted back to RAW without a report that lists those ranges, such an E01
+  is at best COMPLETE, NOT VERIFIED (exit 9), and the report quotes its notes.
 - **F11** Chain-of-custody fields `--seal`, `--seized-at`, `--seized-location`;
   required examiner, case and evidence number; a TUI case profile
   (`$XDG_CONFIG_HOME/dfdisk/profile.toml`) with an evidence-number suggestion.

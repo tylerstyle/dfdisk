@@ -5,10 +5,10 @@
 , makeWrapper
   # External tools dfdisk runs. None is linked: they go on the wrapper's PATH
   # only (and, where tests need them, into the check phase).
-, libewf # ewfacquire, ewfacquirestream, ewfverify, ewfinfo, ewfexport
+, libewf # ewfacquire, ewfverify, ewfinfo, ewfexport
 , ddrescue
 , smartmontools # smartctl
-, util-linux # lsblk, blockdev, umount
+, util-linux # lsblk, umount
 , systemd # udevadm, timedatectl
 , hdparm # hdparm -N, --dco-identify (HPA/DCO, read-only queries)
 , nvme-cli # nvme id-ns

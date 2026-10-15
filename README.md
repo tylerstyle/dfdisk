@@ -53,15 +53,20 @@ registry and writes to the hash-chained dfnix audit log.
 
 | Engine | Selected with | Output | Digests | Unreadable sectors |
 |--------|---------------|--------|---------|--------------------|
-| E01 | `--format e01` (default) | `<base>.E01`, `.E02`, … written by `ewfacquire` (compression and segment size selectable) | MD5 always, SHA-1 and SHA-256 selectable; verified with `ewfverify` | ewfacquire replaces them with zeros; dfdisk takes the exact ranges from the error list stored in the image (`ewfinfo -e`) and from ewfacquire's output |
+| E01 | `--format e01` (default) | `<base>.E01`, `.E02`, … written by `ewfacquire` (compression and segment size selectable) | MD5 always, SHA-1 and SHA-256 selectable; verified with `ewfverify` | ewfacquire replaces them with zeros; dfdisk takes the exact ranges from the error list stored in the image (`ewfinfo -e`) and from ewfacquire's output. A source that ends before its size while ewfacquire waits for it (60 s without progress, and the source is gone or smaller) is stopped by dfdisk: INCOMPLETE, "source lost at offset X" |
 | RAW | `--format raw` | `<base>.raw`, one file | MD5, SHA-1, SHA-256 computed by dfdisk while reading, plus a piecewise SHA-256 per `--piece-size` (default 1 GiB); the image is re-read and hashed again | `--on-read-error stop` (default): stop at the first unreadable sector, report its exact offset, verdict INCOMPLETE; `--on-read-error zero-fill`: replace each unreadable sector by zeros, record every range, continue |
-| Rescue | `--rescue` | `<base>.raw` and the ddrescue mapfile `<base>.map` | computed from the image after the rescue; `--verify-source` reads the source a second time and compares | taken from the ddrescue map: bad sectors are zeros in the image, untried or unfinished areas make the run INCOMPLETE; a rescue can be resumed on the same device |
+| Rescue | `--rescue` | `<base>.raw` and the ddrescue mapfile `<base>.map` | computed from the image after the rescue; `--verify-source` reads the source a second time and compares | taken from the ddrescue map: bad sectors are zeros in the image (after every ddrescue run dfdisk writes the zeros itself, so data an interrupted earlier session left there does not stay), untried or unfinished areas make the run INCOMPLETE; a rescue can be resumed on the same device |
 
-`--rescue-to-e01` converts a finished rescue image into an E01 next to it and
-puts the read-error summary of the rescue (and its zero-filled sector ranges)
-into the E01 notes and the conversion report, which references the rescue
-report by path and SHA-256. `dfdisk convert` converts RAW to E01 and E01 to RAW
-with the same checks and a report of its own.
+`--rescue-to-e01` converts a finished rescue image into an E01 next to it. The
+read-error summary of the rescue goes into the E01 notes, with its zero-filled
+sector ranges (the first 20 and the number of ranges; the rescue's `.info.json`
+lists all), and into the conversion report, which inherits the rescue's
+read-error table and references the rescue report by path and SHA-256. The
+E01's own error list stays empty (ewfacquire read a file without errors):
+converted back to RAW without a report that lists those ranges, such an E01 is
+at best COMPLETE, NOT VERIFIED, and the conversion report quotes its notes.
+`dfdisk convert` converts RAW to E01 and E01 to RAW with the same checks and a
+report of its own.
 
 ### A verdict you can rely on
 
@@ -70,8 +75,8 @@ never choose it.
 
 | Verdict | Exit code | Meaning |
 |---------|----------:|---------|
-| VERIFIED | 0 | complete, no read errors, the image re-read digests equal the digests computed while reading the source |
-| COMPLETE, NOT VERIFIED | 9 | complete, no read errors, but nothing independent to compare with (rescue without `--verify-source`) |
+| VERIFIED | 0 | complete, no read errors, the image re-read digests equal the digests computed while reading the source (a rescue: those of a second read of the source) |
+| COMPLETE, NOT VERIFIED | 9 | complete, no read errors, but nothing independent to compare with (for example a rescue without `--verify-source`) |
 | COMPLETED WITH READ ERRORS | 7 | full length written, some sectors unreadable and replaced by zeros; the digests describe the image with the zeros, not the medium |
 | INCOMPLETE | 6 | not all of the source was acquired (stopped early, untried areas, source lost or changed, destination full) |
 | HASH MISMATCH | 5 | a recomputed digest differs (image, or a second read of the source) |
@@ -81,7 +86,10 @@ never choose it.
 "ALL HASHES MATCH" is printed only for VERIFIED. Images are fsynced and dropped
 from the page cache (POSIX_FADV_DONTNEED) before they are verified, so the
 verification reads them back from the destination rather than from memory; the
-RAW engine re-reads with `O_DIRECT` where the filesystem supports it.
+RAW engine re-reads with `O_DIRECT` where the filesystem supports it. An image
+that cannot be fsynced fails the verification (exit 4); for one that cannot be
+dropped from the page cache the verification method says that the re-read may
+have come from memory.
 
 ### Evidence handling
 
@@ -218,7 +226,8 @@ sudo install -m 755 target/release/dfdisk /usr/local/bin/
 ```
 
 `dfdisk --version` prints the git revisions of dfdisk and dfcore it was built
-from; every report records them too.
+from, with "-dirty" when a tracked file differed from that commit; every report
+records them too.
 
 ## Usage
 
@@ -236,11 +245,19 @@ destination and settings; starting requires typing the last four characters of
 the serial number (the whole serial when it is shorter, the evidence number when
 the device has no serial). The result screen shows the verdict first and stays
 until it is acknowledged; when the TUI ends before a result was acknowledged
-(for example after SIGHUP) it exits with that result's exit code. `?` or F1 shows the keys of the current screen. Esc goes back and
-never aborts an acquisition; aborting asks for confirmation. The TUI also
-converts images, re-verifies an image against its report, resumes a rescue, and
-remembers examiner, authority and the last destination in
-`$XDG_CONFIG_HOME/dfdisk/profile.toml`.
+(for example after SIGHUP) it exits with that result's exit code. `?` or F1
+shows the keys of the current screen. Esc goes back and never aborts an
+acquisition; aborting asks for confirmation. The TUI also converts images,
+re-verifies an image against its report, resumes a rescue, and remembers
+examiner, authority and the last destination in
+`$XDG_CONFIG_HOME/dfdisk/profile.toml`. The converter fills its empty case
+number, evidence number, examiner and description fields from the image's
+`.info.json` and names the fields it took; when the source changes, the values
+taken from the earlier image's report that were not edited are emptied. Case
+values the converter form has no field for (EA, authority, seal number, seizure
+time and place) come from the report the converter uses. Notices are wrapped
+rather than cut, the ones that do not fit are counted, and Ctrl+X dismisses only
+the notices shown.
 
 ### Command line
 
@@ -280,7 +297,7 @@ Acquisition options:
 | `--case`, `--evidence`, `--examiner` | required case fields |
 | `--ea`, `--authority`, `--description`, `--notes`, `--seal`, `--seized-at`, `--seized-location` | optional case and chain-of-custody fields |
 | `--format e01\|raw` | engine (default `e01`) |
-| `--compression none\|fast\|best`, `--split none\|2G\|4G` | E01 only |
+| `--compression none\|fast\|best`, `--split none\|2G\|4G` | E01 only; `none` writes one segment (libewf's largest EnCase 6 segment size, 9223372036854775806 bytes) |
 | `-r, --retries <N>` | read retries of ewfacquire or ddrescue, 0 to 255 |
 | `--rescue` | GNU ddrescue engine; `--resume` continues an interrupted rescue of the same device |
 | `--rescue-to-e01` | after a rescue, convert the image to E01 |
@@ -297,6 +314,17 @@ Acquisition options:
 | `--error-granularity <SECTORS>` | E01: ewfacquire error granularity (default physical / logical sector size) |
 | `--json` | print the final `.info.json` on stdout; progress and messages go to stderr |
 | `-v, --verbose` | print every log line of the engines and tools |
+
+`--resume` continues a rescue only on the device it started on. The identity
+record `<base>.identity.json` (written at the first start, never changed) must
+have the SHA-256 the last report lists for it (a report that lists none is
+noted) and must describe the source (kind, size, sector size, model, WWN,
+serial; a device with neither WWN nor serial is accepted only in the same
+attachment). Behind a USB bridge without a WWN the serial the bridge reports is
+not enough: only the drive's own ATA IDENTIFY serial, recorded when SMART runs
+at the first start and at the resume, or the same attachment (not unplugged
+since) ties the drive. A refused resume leaves the image and the map untouched
+and the previous report as `<base>.info`.
 
 `dfdisk acquire --help` lists every option with its default.
 
@@ -320,23 +348,38 @@ described in [docs/report-format.md](docs/report-format.md#other-json-output---j
 
 `dfdisk verify` recognises EWF segment families (`.E01`, `.Ex01`, `.E02`, …),
 RAW images and split RAW images (`.001`, `.002`, …). A requested digest that was
-not computed is a failure, never a pass. `dfdisk convert` takes the case fields
-from `<source>.info.json` when it exists and lists the source image (a report
-that does not list it, such as the rescue report next to a `--rescue-to-e01`
-E01, is ignored with a note; only a report given with `--report` must list the
-image) and requires them otherwise; it refuses
-RAW images whose size is not a multiple of 512 bytes (as an E01 of a source
-without whole 512-byte sectors is refused) and never overwrites an existing
-output. Its report is `<base>.conversion.info` / `.conversion.info.json`.
+not computed is a failure, never a pass.
+
+`dfdisk convert` takes the case fields from the source image's report
+(`<base>.info.json` or `<base>.conversion.info.json` next to it, when it lists
+the image; a report that does not, such as the rescue report next to a
+`--rescue-to-e01` E01, is ignored with a note, while a report given with
+`--report` must list the image) and from an E01's header, and requires them
+otherwise. It refuses RAW images whose size is not a multiple of 512 bytes (as
+an E01 of a source without whole 512-byte sectors is refused) and never
+overwrites an existing output (EWF segments beyond `.EZZ`, `.FAA` …, included).
+An E01 that ewfinfo reports as corrupted (segments missing, or never finalized)
+is converted as far as libewf reads it and reported INCOMPLETE (exit 6); sectors
+ewfexport could not read correctly (data missing from the image, written as
+zeros, or a chunk whose checksum does not match, written as stored) are listed
+as the conversion's own read errors. A source image whose report says HASH
+MISMATCH or VERIFICATION FAILED gives at best COMPLETE, NOT VERIFIED (exit 9),
+and an output that cannot be fsynced fails the verification (exit 4). Its
+report is `<base>.conversion.info` / `.conversion.info.json`.
 
 ### Signals
 
-SIGINT or SIGTERM stops an acquisition gracefully: the running tool is asked to
-stop (ewfacquire gets 15 s, ddrescue 30 s so it can save its map), the partial
-output is kept, the report is written with verdict ABORTED and dfdisk exits 8. A
-second SIGINT kills the tool at once; the report is still written. SIGHUP (a
-closed terminal or SSH session) lets the acquisition finish headless and write
-its report.
+SIGINT, SIGTERM or SIGQUIT stops an acquisition gracefully: the running tool is
+asked to stop (ewfacquire gets 15 s, ddrescue 30 s so it can save its map), the
+partial output is kept, the report is written with verdict ABORTED and dfdisk
+exits 8. A second SIGINT kills the tool at once; the report is still written.
+SIGHUP (a closed terminal or SSH session) lets the acquisition finish headless
+and write its report. If dfdisk itself is killed in a way it cannot handle
+(SIGKILL, the OOM killer, a crash), its running tool gets SIGTERM from the
+kernel and ends too; no report is written then. An unmount (`dfdisk unmount`,
+or U in the TUI) is not cut short by SIGINT, SIGTERM, SIGQUIT or SIGHUP: dfdisk
+finishes it, checks whether anything stayed mounted and writes its audit record
+before it exits.
 
 ## Exit codes
 
@@ -394,28 +437,36 @@ identify-class queries that the report records.
   one that changes or disappears during the run makes the verdict INCOMPLETE.
   External tools read through `/dev/disk/by-diskseq/<N>` when that link points
   at the pinned device.
-- **Refusals.** dfdisk refuses (exit 3) an empty device (size 0: no medium,
-  or the size is unknown), a device listed in the dfnix
-  protected-device registry (and fails closed when the registry exists but cannot
-  be read), a system disk, a device with mounted filesystems (in dfdisk's mount
-  namespace; a mount in another namespace makes the exclusive open below fail)
-  or active swap, and a device with holders (dm-crypt, LVM, md): a holder
-  claims the device, so it has to be closed first (there is no override).
-  Unmounting is a separate, explicit, audited
+- **Refusals.** dfdisk refuses (exit 3) an empty device (size 0: no medium, or
+  the size is unknown), a device listed in the dfnix protected-device registry
+  (and fails closed when the registry exists but cannot be read), a system disk,
+  a device with mounted filesystems (in dfdisk's mount namespace; a mount in
+  another namespace makes the exclusive open below fail) or active swap, and a
+  device with holders (dm-crypt, LVM, md, or a loop device whose backing file is
+  the source or one of its partitions; mounts of such a loop device count as
+  mounts of the source): a holder keeps the device open, so it has to be closed
+  first (there is no override). Unmounting is a separate, explicit, audited
   action (`dfdisk unmount`, `--auto-unmount`) that refuses system mounts and
   protected devices and never forces or lazily unmounts.
 - **Exclusive open.** The source is opened with `O_EXCL` and held for the whole
-  run, so nothing can mount or assemble it meanwhile; EBUSY means it is in use.
+  run, so the kernel refuses to mount it or to assemble device-mapper, LVM or md
+  devices on it meanwhile (setting up a loop device needs no exclusive claim and
+  is not stopped by it); EBUSY means it is in use.
 - **Destination checks** before anything is written: not on the source, not on a
   dfnix evidence mount, not tmpfs/ramfs, writable, enough free space, file size
   limits of FAT, no existing output of the same name (case-insensitive). A 1 MiB
   reservation guarantees room for the report.
 - **Write protection.** With `--write-protect auto` (default) dfdisk sets the
-  kernel read-only flag (BLKROSET) on the source node and on the disk it is
-  stored on together with every partition node of that disk (a disk that has
-  other mounted filesystems stays writable, with a note in the report). It
-  refuses if a flag cannot be set, leaves the flags set afterwards and records
-  every node. `--write-protect off` only records the state.
+  kernel read-only flag (BLKROSET) on the source node, its own partitions, every
+  node it sits on down to the disk (the partition and intermediate dm/md devices
+  under a LUKS, LVM or md source) and the disk(s) it is stored on together with
+  every partition node of those disks. A disk that has other mounted filesystems
+  stays writable together with its partitions outside the source's chain (as
+  does a node of the chain that another mounted device depends on); the report
+  names exactly the nodes left writable. It refuses if a flag cannot be set,
+  leaves the flags set afterwards and records every node; each node keeps its
+  own flag (`blockdev --setrw <node>` clears one node). `--write-protect off`
+  only records the state.
 - **Order.** Nothing is sent to the device (BLKROSET, hdparm, smartctl) before
   the audit "acquisition_started" record is written. On dfnix an audit log that
   cannot be written refuses the acquisition.
@@ -430,15 +481,15 @@ identify-class queries that the report records.
 - **Clock.** Reports state whether the host clock was NTP-synchronised and give
   the RTC offset; without confirmed synchronisation timestamps are labelled
   "host system time, NOT synchronized". Durations come from the monotonic clock.
-- **Audit log.** Acquisitions, refused acquisitions, unmounts, verifications and
-  conversions are recorded in the hash-chained dfnix audit log (dfcore); usage
-  errors and conversions refused before they started are not. The
-  "acquisition_finished" record is written on every path, including errors,
-  aborts and signals, and carries the SHA-256 of both reports; when the report
-  itself cannot be written, the record still carries the verdict, the digests,
-  the read errors and the files, and the error message printed by dfdisk names
-  the digests. Records of a MISMATCH, INCOMPLETE, ABORTED or VERIFICATION
-  FAILED run have the outcome `error`.
+- **Audit log.** Acquisitions, refused acquisitions, unmounts, verifications,
+  conversions and refused conversions are recorded in the hash-chained dfnix
+  audit log (dfcore); usage errors and runs that fail before they start (a
+  missing tool, for example) are not. The "acquisition_finished" record is
+  written on every path, including errors, aborts and signals, and carries the
+  SHA-256 of both reports; when the report itself cannot be written, the record
+  still carries the verdict, the digests, the read errors and the files, and the
+  error message printed by dfdisk names the digests. Records of a MISMATCH,
+  INCOMPLETE, ABORTED or VERIFICATION FAILED run have the outcome `error`.
 
 ## Screenshots
 
@@ -498,7 +549,7 @@ Source layout:
 ```
 src/
 ├── main.rs            exit codes, error printing
-├── signals.rs         SIGINT/SIGTERM/SIGHUP handling shared by CLI and TUI
+├── signals.rs         SIGINT/SIGTERM/SIGQUIT/SIGHUP handling shared by CLI and TUI
 ├── cli/               argument parsing and subcommands
 ├── tui/               ratatui interface
 ├── discovery/         device scan, identity probe, sysfs, write protection,

@@ -69,7 +69,8 @@ pub struct WriteProtection {
     pub nodes_set: Vec<String>,
     /// sysfs `ro` re-read after setting it
     pub ro_after: Vec<NodeReadOnly>,
-    /// Devices stacked on the source (dm, md), recursively
+    /// Devices stacked on the source (dm, md) and loop devices over it or
+    /// its partitions, recursively
     pub holders: Vec<String>,
     /// The source is held open O_EXCL for the whole run (R1)
     pub exclusive_open: bool,

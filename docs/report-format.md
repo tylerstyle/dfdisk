@@ -31,7 +31,7 @@ case-insensitively (exFAT, NTFS and FAT destinations).
 
 | File | Written by | Content |
 |------|------------|---------|
-| `<base>.E01`, `.E02`, … `.EAA` … | E01 engine (ewfacquire) | EWF image segments |
+| `<base>.E01`, `.E02`, … `.EAA` … `.EZZ`, `.FAA` … | E01 engine (ewfacquire) | EWF image segments |
 | `<base>.raw` | RAW engine, rescue engine | the image (one file; RAW is never split) |
 | `<base>.info` | every acquisition | text report |
 | `<base>.info.json` | every acquisition | JSON report, schema 2 |
@@ -66,8 +66,19 @@ listed in the report with their SHA-256.
 A conversion (`dfdisk convert`, `--rescue-to-e01`) writes its own reports,
 `<base>.conversion.info` and `<base>.conversion.info.json`, next to its output;
 they name the report of the source image (path and SHA-256) and inherit its
-read-error table. `--rescue-to-e01` writes the E01 next to the rescue image; a
-later `--resume` of that rescue is refused while the E01 is there.
+read-error table (section READ ERRORS OF THE SOURCE ACQUISITION, JSON key
+`read_errors`). Sectors of the source image the conversion itself could not read
+correctly (ewfexport's "Read errors during export": data missing from the image,
+zeros in the output, or a chunk whose checksum does not match, written as
+stored) are listed separately as `unread` ranges ("not read" in the text):
+section READ ERRORS OF THIS CONVERSION, JSON key `conversion_errors` (same shape
+as `read_errors`); they make the conversion INCOMPLETE. `read_errors_note`
+(JSON; "Unreadable Ranges" in the text) states what is known about unreadable
+ranges the table cannot list, for example an E01 whose header notes alone record
+zero-filled sectors. An output that cannot be fsynced fails the conversion's
+verification (exit 4), as for an acquisition. `--rescue-to-e01` writes the E01
+next to the rescue image; a later `--resume` of that rescue is refused while the
+E01 is there.
 
 ## Text report (`<base>.info`)
 
@@ -212,7 +223,7 @@ With `--json` every command prints one pretty-printed JSON document on stdout
 | `acquire --rescue-to-e01 --json` | `{schema_version: 1, acquisition, conversion, conversion_error, conversion_skipped, exit_code}`: `acquisition` is the rescue report; `conversion` the conversion report or null; `conversion_error` the `error` object below or null (a conversion that could not start); `conversion_skipped` the reason (string) or null; `exit_code` the combined exit code |
 | `convert --json` | the conversion report `<base>.conversion.info.json` (its own `schema_version`) |
 | `list --json` | `schema_version` 1: registry state, active swap, scan notes, `devices` with partitions and stacked devices nested in `children` |
-| `check --json` | `schema_version` 1, `ready` (bool), `device`, `engine`, `output_dir`, `base_name`, `identity` (as `source` in the report), `tool_source_path`, `effective_config`, `write_protection` (as found), `write_protection_plan` (string), `destination` (facts), `capacity`, `smart`, `problems` (`[{step, kind, message}]`; `step` is `request`, `identity`, `source safety`, `exclusive open`, `destination`, `tools` or `capacity`; `kind` is `usage`, `refused` or `failed`), `notes`. Fields that were not reached are null |
+| `check --json` | `schema_version` 1, `ready` (bool), `device`, `engine`, `output_dir`, `base_name`, `identity` (as `source` in the report), `tool_source_path`, `effective_config`, `write_protection` (as found), `write_protection_plan` (string), `destination` (facts), `capacity`, `smart`, `missing_tools` (the programs the engine runs that are not installed, `[]` when none is missing), `problems` (`[{step, kind, message}]`; `step` is `request`, `identity`, `source safety`, `exclusive open`, `destination`, `tools` or `capacity`; `kind` is `usage`, `refused` or `failed`), `notes`. Fields that were not reached are null |
 | `verify --json` | `{schema_version: 1, verification, exit_code}`; `verification`: `image`, `read_path`, `segments`, `format` (`ewf`, `raw`), `method`, `computed`, `stored` (digests an EWF image stores), `expected` (`md5`, `sha1`, `sha256`, `source`, `report_image_files`, `report_outcome`, `report_pieces`), `checks` (`[{algorithm, expected, computed, status, reference}]`, `status` `match`, `mismatch` or `not_computed`), `pieces` (or null), `result` (as `verification.result` above), `exit_code`, `started_at`, `ended_at`, `elapsed_seconds`, `clock`, `addendum`, `addendum_sha256`, `audit_record`, `warnings` |
 | `unmount --json` | `schema_version` 1, `device`, `mounts_before`, `unmounted`, `holders`, `audit_record` (hash of the `unmount` record or null), `audit_error`, `notes` |
 | any command that ends with an error | `{schema_version: 1, error: {kind, exit_code, message}}`, `kind` one of `usage`, `refused`, `failed`, `aborted` |
@@ -256,7 +267,8 @@ lines, `/run/dfnix/audit.jsonl` by default; `DFNIX_AUDIT_LOG` overrides the path
 | `acquisition_refused` | a refusal after the device was selected and before "started" (identity, source safety, destination); nothing was written to the destination |
 | `unmount` | `dfdisk unmount` and `--auto-unmount`: the mounts and what happened to them |
 | `image_verification` | `dfdisk verify` |
-| `conversion_started`, `conversion_finished` | `dfdisk convert` and `--rescue-to-e01`; a conversion refused before it started (usage, destination checks, existing outputs) writes no record |
+| `conversion_started`, `conversion_finished` | `dfdisk convert` and `--rescue-to-e01`; a usage error or a failure before the start writes no record |
+| `conversion_refused` | a conversion refused before it started (for example by the destination checks, an existing output, or an output that would be the source): source, intended output, target format, output directory, base name (when known), the error kind and message, exit code 3; nothing was written |
 
 The top-level `outcome` of a record that carries a verdict
 (`acquisition_finished`, `image_verification`, `conversion_finished`) is `ok`

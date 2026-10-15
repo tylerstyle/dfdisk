@@ -3,7 +3,9 @@
 //! directory, no reservation, no audit record, no read-only flag (the plan is
 //! described), no SMART JSON file. The exclusive open is tried and released.
 
-use super::{check_tools, destination_checks, identify, source_safety, validate, SessionHost};
+use super::{
+    destination_checks, identify, missing_tools, source_safety, tools_error, validate, SessionHost,
+};
 use crate::discovery::writeprotect::{self, WriteProtectDecision};
 use crate::engines::error::{AcquisitionError, ErrorKind};
 use crate::engines::preflight::DestinationFacts;
@@ -47,6 +49,9 @@ pub struct CheckReport {
     pub destination: Option<DestinationFacts>,
     pub capacity: Option<CapacityInfo>,
     pub smart: Option<SmartSnapshot>,
+    /// The external programs the engine runs that are not installed (empty:
+    /// none is missing); None when the check stopped before the tools step
+    pub missing_tools: Option<Vec<String>>,
     pub problems: Vec<CheckProblem>,
     pub notes: Vec<String>,
 }
@@ -177,6 +182,7 @@ pub(super) async fn run_check(
         destination: None,
         capacity: None,
         smart: None,
+        missing_tools: None,
         problems: Vec::new(),
         notes: Vec::new(),
     };
@@ -226,7 +232,9 @@ pub(super) async fn run_check(
         }
         Err(e) => report.problem("destination", e),
     }
-    if let Err(e) = check_tools(host, &request.config) {
+    let missing = missing_tools(host, &request.config);
+    report.missing_tools = Some(missing.iter().map(|t| t.to_string()).collect());
+    if let Err(e) = tools_error(&request.config, &missing) {
         report.problem("tools", e);
     }
 

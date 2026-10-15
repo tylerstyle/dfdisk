@@ -14,7 +14,7 @@ codes; the text and JSON reports carry the same code (`exit_code` in
 | 5 | Mismatch | A digest recomputed from the image, or from a second read of the source, differs from the digest computed during acquisition (for a rescue: the second read differs from the image). The report says which digests were compared. |
 | 6 | Incomplete | Not all of the source was acquired: the run stopped early, areas were never read, the source was lost or changed, or the destination filled up. |
 | 7 | Completed with read errors | The full length was written, but unreadable sectors were replaced by zeros. The digests describe the image including the substituted sectors, not the original medium. |
-| 8 | Aborted | Stopped by the examiner or by a signal (SIGINT, SIGTERM). |
+| 8 | Aborted | Stopped by the examiner or by a signal (SIGINT, SIGTERM, SIGQUIT). |
 | 9 | Complete, not verified | The whole source was acquired without read errors, but no independent comparison was possible (for example a rescue without `--verify-source`). |
 
 Codes 0 and 4 to 9 are verdicts of a run that wrote output; the report states the
@@ -53,9 +53,10 @@ source device, when for example:
   `--expect-wwn` or `--expect-size`;
 - the device is protected by the dfnix protected-device registry, or the registry
   exists but cannot be read (fail closed);
-- the device is a system disk, is mounted (in dfdisk's mount namespace), holds
-  active swap, or has holders (device-mapper, LVM, md, LUKS): a holder claims the
-  device, so it has to be closed first (there is no override);
+- the device is a system disk, is mounted (in dfdisk's mount namespace, also
+  through a loop device set up over it or its partitions), holds active swap, or
+  has holders (device-mapper, LVM, md, LUKS, or such a loop device): a holder
+  keeps the device open, so it has to be closed first (there is no override);
 - the device cannot be opened exclusively (`O_EXCL` returns EBUSY: it is in use,
   for example mounted in another mount namespace);
 - the destination is on the source, on a dfnix evidence mount, on tmpfs/ramfs
@@ -76,19 +77,28 @@ source device, when for example:
 | `acquire` | The report's verdict (0, 4–9) once anything was written; 2, 3 or 4 when the run ended before the first write; 8 when aborted before the first write. With `--rescue-to-e01` the more severe of the rescue's and the conversion's code, from most to least severe 1, 2, 8, 5, 4, 3, 6, 7, 9, 0 (a conversion that is skipped because the rescue is not complete adds nothing; a conversion that could not start after the rescue wrote its image, because of a usage error or a refusal, counts as 4, never 2 or 3; a source that is not a whole number of 512-byte sectors is a usage error, 2, before the rescue starts). |
 | `check` | 0 ready; otherwise the code of the first problem found: 2 usage, 3 refused, 4 a check could not run or a tool the engine runs is not installed; 8 interrupted. Writes nothing. |
 | `verify` | 0 every digest compared matches (expected digests, the digests an E01 stores, every piece of `--pieces`); 5 a digest or a piece differs; 4 the verification could not run or a requested digest was not computed (never reported as a pass); 9 nothing to compare against (no expected digest given, none in the report, none stored in the image, no `--pieces`); 2 the image or pieces file does not exist, an expected digest is not exactly 32 (MD5), 40 (SHA-1) or 64 (SHA-256) hex digits (also in a `--report`), or arguments are invalid; 8 aborted. |
-| `convert` | The conversion's verdict (0, 4–9; 7 when the source image holds zero-filled sectors of its acquisition); 2 for example a RAW size that is not a multiple of 512 bytes or missing case fields; 3 an output already exists or a destination check refused; 4 a tool could not run. |
+| `convert` | The conversion's verdict (0, 4–9; 7 when the source image holds zero-filled sectors of its acquisition); 2 for example a RAW size that is not a multiple of 512 bytes or missing case fields; 3 an output already exists or a destination check refused; 4 a tool could not run; 8 aborted before anything was written. |
 | `unmount` | 0 everything was unmounted and nothing remains mounted (or nothing was mounted); 2 usage (for example a regular file); 3 refused (system mount, protected device, active swap, unidentifiable device); 4 an unmount failed or a mount remained. |
 | `list` | 0, or 4 when the device scan failed. |
-| `tui` (default) | 0 on a normal exit; the result's exit code when the TUI ends before the examiner acknowledged a result on screen (a run that finished after SIGHUP, or a quit by signal); 1 on a terminal failure; 4 when the signal handlers cannot be installed. |
+| `tui` (default) | 0 on a normal exit; the result's exit code when the TUI ends before the examiner acknowledged a result on screen (a run that finished after SIGHUP, or a quit by signal); 1 on a terminal failure or an internal error of the UI itself; 4 when the signal handlers cannot be installed. A run that stops on an internal error of dfdisk (a panic inside the acquisition, conversion or verification) is shown as FAILED (INTERNAL ERROR), exit code 4. |
 
 Command-line parsing errors (unknown option, missing value, missing required
 `--case`/`--evidence`/`--examiner`) exit 2. `--help` and `--version` exit 0.
 
 ## Signals
 
-- SIGINT or SIGTERM: graceful abort. The running tool gets SIGINT (ewfacquire
-  15 s, ddrescue 30 s grace), then SIGTERM, then SIGKILL; dfdisk keeps the partial
-  output, writes the report with verdict ABORTED and exits **8**.
+- SIGINT, SIGTERM or SIGQUIT: graceful abort. The running tool gets SIGINT
+  (ewfacquire 15 s, ddrescue 30 s grace), then SIGTERM, then SIGKILL; dfdisk
+  keeps the partial output, writes the report with verdict ABORTED and exits
+  **8**.
 - A second SIGINT kills the running tool at once; the report is still written.
 - SIGHUP (for example a dropped SSH session): dfdisk stops writing to the terminal,
   finishes the acquisition and writes the report; the exit code is the verdict.
+- SIGKILL, the OOM killer or a crash of dfdisk: nothing can be written any more,
+  but the running tool is not left behind: it gets SIGTERM from the kernel
+  (`PR_SET_PDEATHSIG`) and ends.
+- During `dfdisk unmount` (and an unmount started in the TUI) SIGINT, SIGTERM,
+  SIGQUIT, SIGHUP or a quit do not interrupt the unmount: it is finished,
+  checked (whether anything of the source stayed mounted) and recorded in the
+  audit log, then dfdisk exits. Q or Ctrl+C in the TUI asks before quitting
+  while an unmount runs.

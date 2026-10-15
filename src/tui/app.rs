@@ -261,6 +261,74 @@ impl ConfirmState {
             ConfirmSubject::Conversion { facts, .. } => facts.as_ref().is_some_and(|f| f.exists),
         }
     }
+
+    /// What keeps the acquisition's dry run from starting (None for a
+    /// conversion, while the checks run and when every check passed).
+    pub fn not_ready(&self) -> Option<NotReady> {
+        let ConfirmSubject::Acquisition { check, .. } = &self.subject else {
+            return None;
+        };
+        if self.pending || self.ready() {
+            return None;
+        }
+        let Some(check) = check else {
+            return Some(NotReady::WouldNotStart);
+        };
+        let problems = &check.problems;
+        let missing = check.missing_tools.clone().unwrap_or_default();
+        Some(if problems.is_empty() {
+            NotReady::WouldNotStart
+        } else if !missing.is_empty() && problems.iter().all(|p| p.step == "tools") {
+            NotReady::MissingTools(missing)
+        } else if problems.iter().all(|p| p.kind == ErrorKind::Refused) {
+            NotReady::Refused
+        } else {
+            NotReady::WouldNotStart
+        })
+    }
+}
+
+/// Why the acquisition's dry run would not start, as the confirmation sheet
+/// states it: "refused" only when a safety or preflight rule refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotReady {
+    /// The only problem: programs the engine runs are not installed
+    /// (nothing refuses the source; the run would fail before it starts)
+    MissingTools(Vec<String>),
+    /// Every problem is a refusal
+    Refused,
+    /// Anything else (a usage problem, a check that could not run)
+    WouldNotStart,
+}
+
+impl NotReady {
+    fn missing(tools: &[String]) -> String {
+        format!(
+            "{} {} not installed",
+            tools.join(", "),
+            if tools.len() == 1 { "is" } else { "are" }
+        )
+    }
+
+    /// The sheet's first line.
+    pub fn headline(&self) -> String {
+        let what = match self {
+            NotReady::MissingTools(tools) => Self::missing(tools),
+            NotReady::Refused => "this would be refused".into(),
+            NotReady::WouldNotStart => "the acquisition would not start".into(),
+        };
+        format!("NOT READY: {what}. Nothing has been written or changed.")
+    }
+
+    /// The error under the sheet when Enter is pressed.
+    pub fn start_error(&self) -> String {
+        let what = match self {
+            NotReady::MissingTools(tools) => Self::missing(tools),
+            NotReady::Refused => "The acquisition would be refused".into(),
+            NotReady::WouldNotStart => "The acquisition would not start".into(),
+        };
+        format!("{what} (see the problems on this sheet); nothing was started.")
+    }
 }
 
 /// Colour class of a verdict.
@@ -1919,22 +1987,23 @@ impl App {
             }
         }
         let error = if !c.ready() {
-            Some(match c.subject {
-                ConfirmSubject::Acquisition { .. } => {
-                    "The acquisition would be refused (see the problems on this sheet); nothing was started."
+            Some(match (&c.subject, c.not_ready()) {
+                (ConfirmSubject::Acquisition { .. }, Some(why)) => why.start_error(),
+                (ConfirmSubject::Acquisition { .. }, None) => {
+                    "The acquisition would not start (see the problems on this sheet); nothing was started.".into()
                 }
-                ConfirmSubject::Conversion { .. } => {
-                    "The source image cannot be read (see this sheet); nothing was started."
+                (ConfirmSubject::Conversion { .. }, _) => {
+                    "The source image cannot be read (see this sheet); nothing was started.".into()
                 }
             })
         } else if !c.target.as_ref().is_some_and(|t| t.matches(&c.typed)) {
-            Some("That does not match: compare the serial number on this sheet with the drive label and type the requested characters.")
+            Some("That does not match: compare the serial number on this sheet with the drive label and type the requested characters.".to_string())
         } else {
             None
         };
         if let Some(e) = error {
             if let Some(cs) = &mut self.confirm {
-                cs.error = Some(e.to_string());
+                cs.error = Some(e);
             }
             return;
         }
@@ -2325,6 +2394,10 @@ impl App {
         }
         let source_path = expand_tilde(Path::new(&source));
         let dir = expand_tilde(Path::new(self.conv.destination.trim()));
+        // The TUI found this report next to the image (the form has no report
+        // field): the converter ignores it with a note when it describes
+        // another image, e.g. the rescue report next to a --rescue-to-e01 E01
+        // (C-5), instead of refusing the conversion as for a given --report
         let source_report = self
             .conv
             .facts
@@ -2340,6 +2413,7 @@ impl App {
             split_size: self.conv.split,
             notes: self.conv.notes.clone(),
             source_report,
+            source_report_auto: true,
             ..Default::default()
         };
         self.token += 1;

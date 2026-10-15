@@ -95,7 +95,11 @@ fn identity_of(dev: &BlockDevice) -> SourceIdentity {
     id
 }
 
-fn check_for(req: &AcquisitionRequest, problems: Vec<CheckProblem>) -> CheckReport {
+fn check_for(
+    req: &AcquisitionRequest,
+    problems: Vec<CheckProblem>,
+    missing_tools: Vec<String>,
+) -> CheckReport {
     let id = identity_of(&req.device);
     CheckReport {
         ready: problems.is_empty(),
@@ -114,6 +118,7 @@ fn check_for(req: &AcquisitionRequest, problems: Vec<CheckProblem>) -> CheckRepo
         destination: None,
         capacity: None,
         smart: None,
+        missing_tools: Some(missing_tools),
         problems,
         notes: Vec::new(),
     }
@@ -173,6 +178,8 @@ struct Script {
     scans: VecDeque<Vec<BlockDevice>>,
     last_scan: Vec<BlockDevice>,
     problems: VecDeque<Vec<CheckProblem>>,
+    /// The engine's programs the dry run reports as not installed
+    missing_tools: Vec<String>,
     check_requests: Vec<AcquisitionRequest>,
     acquire_requests: Vec<AcquisitionRequest>,
     acquire: Acquire,
@@ -197,6 +204,7 @@ impl Fake {
             scans: VecDeque::new(),
             last_scan: devices,
             problems: VecDeque::new(),
+            missing_tools: Vec::new(),
             check_requests: Vec::new(),
             acquire_requests: Vec::new(),
             acquire: Acquire::Verified,
@@ -260,8 +268,9 @@ impl TuiBackend for Fake {
         let me = self.clone();
         Box::pin(async move {
             let problems = me.s().problems.pop_front().unwrap_or_default();
+            let missing = me.s().missing_tools.clone();
             me.s().check_requests.push(request.clone());
-            check_for(&request, problems)
+            check_for(&request, problems, missing)
         })
     }
 
@@ -660,13 +669,83 @@ async fn a_refused_check_cannot_be_started() {
     to_case_setup(&mut app, "/mnt/case");
     to_confirm(&mut app).await;
     assert!(!app.confirm.as_ref().unwrap().ready());
+    assert_eq!(
+        sheet_text(&app)[0],
+        "NOT READY: this would be refused. Nothing has been written or changed."
+    );
     typ(&mut app, "KD7Y");
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.screen, Screen::Confirm);
+    assert_eq!(
+        app.confirm.as_ref().unwrap().error.as_deref(),
+        Some("The acquisition would be refused (see the problems on this sheet); nothing was started.")
+    );
     assert!(fake.s().acquire_requests.is_empty());
     // Esc goes back without starting
     app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.screen, Screen::CaseSetup);
+}
+
+/// A tool the engine runs that is not installed is not a refusal (nothing
+/// refuses the source; the run would fail before it starts, exit 4): the
+/// sheet names what is missing instead of saying "refused".
+#[tokio::test]
+async fn a_missing_tool_is_named_not_called_a_refusal() {
+    let fake = Fake::new(vec![evidence()]);
+    fake.s().missing_tools = vec!["ewfacquire".into()];
+    let tools = CheckProblem {
+        step: "tools".into(),
+        kind: ErrorKind::Failed,
+        message: "the E01 engine runs ewfacquire, ewfinfo, ewfverify, but ewfacquire is not installed (not found as an executable on PATH)".into(),
+    };
+    fake.s().problems.push_back(vec![tools.clone()]);
+    let mut app = app_with(&fake);
+    to_case_setup(&mut app, "/mnt/case");
+    to_confirm(&mut app).await;
+    let sheet = sheet_text(&app);
+    assert_eq!(
+        sheet[0],
+        "NOT READY: ewfacquire is not installed. Nothing has been written or changed."
+    );
+    assert!(
+        !sheet.iter().any(|l| l.to_lowercase().contains("refused")),
+        "{sheet:?}"
+    );
+    typ(&mut app, "KD7Y");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen, Screen::Confirm);
+    assert_eq!(
+        app.confirm.as_ref().unwrap().error.as_deref(),
+        Some("ewfacquire is not installed (see the problems on this sheet); nothing was started.")
+    );
+    assert!(fake.s().acquire_requests.is_empty());
+
+    // Several missing tools are all named
+    fake.s().missing_tools = vec!["ddrescue".into(), "ewfverify".into()];
+    fake.s().problems.push_back(vec![tools.clone()]);
+    app.handle_key(key(KeyCode::Esc));
+    to_confirm(&mut app).await;
+    assert_eq!(
+        sheet_text(&app)[0],
+        "NOT READY: ddrescue, ewfverify are not installed. Nothing has been written or changed."
+    );
+
+    // A missing tool next to a refusal: neither alone describes the run
+    fake.s().problems.push_back(vec![
+        CheckProblem {
+            step: "destination".into(),
+            kind: ErrorKind::Refused,
+            message: "tmpfs destination".into(),
+        },
+        tools,
+    ]);
+    app.handle_key(key(KeyCode::Esc));
+    to_confirm(&mut app).await;
+    assert_eq!(
+        sheet_text(&app)[0],
+        "NOT READY: the acquisition would not start. Nothing has been written or changed."
+    );
+    assert!(fake.s().acquire_requests.is_empty());
 }
 
 #[tokio::test]
@@ -1443,6 +1522,54 @@ async fn the_converter_never_keeps_the_previous_images_case_values() {
     assert_eq!(case.case_number, "MANUAL-1");
     assert_eq!(case.evidence_number, "EV-A");
     assert_eq!(case.seal_number, "", "not given: taken from the report");
+}
+
+/// C-5: the converter form has no report field, so a report the TUI passes
+/// is one it found next to the image. It goes to the converter as found
+/// (`source_report_auto`): one that describes another image, such as the
+/// rescue report `x.info.json` (listing `x.raw`) next to the E01 that
+/// --rescue-to-e01 made, is ignored with a note instead of refusing the
+/// conversion as a given --report would.
+#[tokio::test]
+async fn a_report_the_tui_found_is_passed_as_found_not_as_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = image_with_report(dir.path(), "x", "CASE-X", "EV-X", "");
+    let e01 = dir.path().join("x.E01");
+    std::fs::write(&e01, b"EVF\x09\x0d\x0a\xff\x00").unwrap();
+    let fake = Fake::new(vec![]);
+    let mut app = app_with(&fake);
+    app.handle_key(key(KeyCode::Char('c')));
+    typ(&mut app, &e01.display().to_string());
+    pump(&mut app, "report next to the E01", |app| {
+        app.conv.facts.as_ref().is_some_and(|f| f.path == e01)
+    })
+    .await;
+    let found = app.conv.facts.as_ref().unwrap().report.clone();
+    assert_eq!(
+        found.map(|r| r.path),
+        Some(dir.path().join("x.info.json")),
+        "the report of {} next to the E01",
+        raw.display()
+    );
+    app.conv.destination = dir.path().join("out").display().to_string();
+    app.handle_key(key(KeyCode::F(5)));
+    pump(&mut app, "sheet", |app| {
+        app.confirm.as_ref().is_some_and(|c| !c.pending)
+    })
+    .await;
+    typ(&mut app, "serx");
+    app.handle_key(key(KeyCode::Enter));
+    pump(&mut app, "conversion result", |app| {
+        app.screen == Screen::Result
+    })
+    .await;
+    let req = fake.s().conversions[0].clone();
+    assert_eq!(req.source, e01);
+    assert_eq!(
+        req.source_report.as_deref(),
+        Some(dir.path().join("x.info.json").as_path())
+    );
+    assert!(req.source_report_auto, "found by the TUI, not given");
 }
 
 #[tokio::test]

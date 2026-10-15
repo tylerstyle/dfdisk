@@ -761,6 +761,7 @@ async fn a_missing_tool_fails_before_anything_is_written_sent_or_started() {
     let check = check_with(&fake, fake.request(config)).await;
     assert!(!check.ready);
     assert_eq!(check.problems[0].step, "tools");
+    assert_eq!(check.missing_tools, Some(vec!["ewfacquire".to_string()]));
     assert_eq!(check.exit_code(), 4);
     assert!(check.render_text().contains("would not start"));
 
@@ -1870,6 +1871,7 @@ async fn check_writes_nothing_and_lists_every_problem() {
         .contains("would set read-only (BLKROSET): /dev/sdx, /dev/sdx1"));
     assert!(report.capacity.is_some());
     assert!(report.smart.as_ref().unwrap().json_file.is_none());
+    assert_eq!(report.missing_tools, Some(Vec::new()), "the tools step ran");
     assert!(report.render_text().contains("READY"));
     // Nothing written, nothing set, nothing recorded
     assert!(!fake.out().exists());
@@ -1899,6 +1901,7 @@ async fn check_writes_nothing_and_lists_every_problem() {
     let report = check_with(&fake, request).await;
     assert_eq!(report.exit_code(), 2);
     assert!(report.identity.is_none());
+    assert!(report.missing_tools.is_none(), "not reached");
 }
 
 // ---------------------------------------------------------------------------

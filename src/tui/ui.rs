@@ -923,13 +923,14 @@ pub fn sheet_lines(app: &App) -> Vec<Line<'static>> {
         (
             "Looking at the source image and the destination…",
             "READY TO START: the source image exists. The converter checks the image, the destination and existing outputs when it starts. Nothing has been written yet.",
-            "NOT READY: the source image was not found or is not a regular file. Nothing has been written or changed.",
+            "NOT READY: the source image was not found or is not a regular file. Nothing has been written or changed.".to_string(),
         )
     } else {
         (
             "Running the pre-flight checks (identity, safety, destination, hidden areas)…",
             "READY: every pre-flight check passed. Nothing has been written or changed yet.",
-            "NOT READY: this would be refused. Nothing has been written or changed.",
+            // "Refused" only when a rule refused: a missing tool is named
+            c.not_ready().map(|why| why.headline()).unwrap_or_default(),
         )
     };
     if c.pending {

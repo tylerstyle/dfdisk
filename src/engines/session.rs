@@ -407,19 +407,27 @@ pub fn required_tools(config: &AcquisitionConfig) -> Vec<&'static str> {
     }
 }
 
+/// The programs of [`required_tools`] that are not found on PATH.
+fn missing_tools(host: &dyn SessionHost, config: &AcquisitionConfig) -> Vec<&'static str> {
+    required_tools(config)
+        .into_iter()
+        .filter(|t| host.find_tool(t).is_none())
+        .collect()
+}
+
 /// Step 4 (I3): every external program of the engine can be run, so a
 /// missing tool fails the run before anything is written, sent to the
 /// source or recorded as started (FAILED, exit 4; `check` lists it too).
 fn check_tools(host: &dyn SessionHost, config: &AcquisitionConfig) -> Result<(), AcquisitionError> {
-    let required = required_tools(config);
-    let missing: Vec<&str> = required
-        .iter()
-        .copied()
-        .filter(|t| host.find_tool(t).is_none())
-        .collect();
+    tools_error(config, &missing_tools(host, config))
+}
+
+/// The error for the `missing` programs of `config`'s engine (none: Ok).
+fn tools_error(config: &AcquisitionConfig, missing: &[&str]) -> Result<(), AcquisitionError> {
     if missing.is_empty() {
         return Ok(());
     }
+    let required = required_tools(config);
     Err(AcquisitionError::failed(format!(
         "{} runs {}, but {} {} not installed (not found as an executable on PATH); install ewf-tools and gddrescue (Debian/Ubuntu) or libewf and ddrescue (Nix). Nothing was written and nothing was sent to the source",
         if config.engine() == EngineKind::Rescue && config.rescue_to_e01 {
@@ -587,11 +595,12 @@ fn source_safety(
             write_protection.mounts_before.join(", ")
         )));
     }
-    // A holder (dm, LVM, md, bcache, LUKS) claims the source exclusively,
-    // so the exclusive open would refuse it anyway; there is no override
+    // A holder keeps the source open and may write to it: dm, LVM, md,
+    // bcache and LUKS claim it exclusively (the exclusive open would refuse
+    // it anyway), a loop device over it does not (L3). There is no override
     if !write_protection.holders.is_empty() {
         errors.push(AcquisitionError::refused(format!(
-            "devices are stacked on the source ({}): device-mapper, LVM, md or LUKS keep it open and may write to it. Close them first (for example cryptsetup close, vgchange -an, mdadm --stop), then acquire again",
+            "devices are stacked on the source ({}): device-mapper, LVM, md, LUKS or loop devices keep it open and may write to it. Close them first (for example cryptsetup close, vgchange -an, mdadm --stop, losetup -d), then acquire again",
             write_protection.holders.join(", ")
         )));
     }

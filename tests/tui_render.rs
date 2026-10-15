@@ -309,6 +309,7 @@ fn all_states() -> Vec<(&'static str, App)> {
         destination: None,
         capacity: None,
         smart: None,
+        missing_tools: Some(Vec::new()),
         problems: vec![CheckProblem {
             step: "destination".into(),
             kind: ErrorKind::Refused,
