@@ -131,7 +131,11 @@ and when something was not done the report says so.
   `hdparm --dco-identify` and `nvme id-ns` (read-only, on the physical disk,
   with timeouts) are recorded; `--refuse-hidden-areas` refuses.
 - **M3** Verification read the page cache: images, auxiliary files and the
-  directory are fsynced and evicted from the page cache before verification.
+  directory are fsynced and evicted from the page cache before verification. An
+  image that cannot be fsynced fails the verification (exit 4); one that cannot
+  be evicted is noted in the verification method ("the re-read may have come
+  from memory"); the method states the fsync and eviction only when they
+  happened.
 - **M4** Metadata: control characters are sanitised (no shifted E01 header
   fields), placeholders are never recorded, file names are capped at 255 bytes
   (refused, never truncated), tokens are NFC-normalised, existing outputs are

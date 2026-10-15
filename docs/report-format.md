@@ -51,7 +51,14 @@ case-insensitively (exFAT, NTFS and FAT destinations).
 Image, auxiliary and SMART files are fsynced, together with the directory, and
 dropped from the page cache (POSIX_FADV_DONTNEED) before verification, so the
 verification reads them back from the destination rather than from memory (the
-RAW engine re-reads with `O_DIRECT` where the filesystem allows it).
+RAW engine re-reads with `O_DIRECT` where the filesystem allows it). An image
+file that cannot be opened or fsynced (or a directory fsync that fails) means
+the image may not be on the destination medium: the verification is FAILED
+("the image could not be flushed durably to the destination", exit 4). An image
+that cannot be dropped from the page cache keeps its verdict, but the
+verification method says the re-read may have come from memory. The method
+names the fsync and the eviction only when they succeeded. Problems with
+auxiliary files are listed in the notes.
 
 Auxiliary files (ewfacquire log, pieces file, ddrescue map, SMART JSON) are
 listed in the report with their SHA-256.

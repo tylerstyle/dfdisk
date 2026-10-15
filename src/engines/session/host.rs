@@ -154,6 +154,12 @@ pub trait SessionHost: Send + Sync {
         Box::pin(super::verify(ctx, out))
     }
 
+    /// Step 10 (default: [`flush_files`](super::flush_files): fsync, page-cache
+    /// eviction, directory fsync).
+    fn flush(&self, files: &[PathBuf], dir: &Path) -> super::FlushReport {
+        super::flush_files(files, dir)
+    }
+
     /// Step 11, `--verify-source` (default: positioned reads through the
     /// held descriptor, `raw::hash_source`).
     fn reread_source<'a>(

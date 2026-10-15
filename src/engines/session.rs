@@ -15,7 +15,8 @@
 //!   reservation (R11)
 //! - 7 audit "started" (refuses on dfnix if it cannot be written)
 //! - 5 write protection, 6 capacity probe (R6) and SMART before (§8)
-//! - 8 engine acquire, 9 identity re-check, 10 fsync + cache eviction
+//! - 8 engine acquire, 9 identity re-check, 10 fsync + cache eviction (an
+//!   image file that cannot be fsynced fails the verification)
 //! - 11 engine verify and optional second source read, 12 classify
 //! - 13 SMART after (rescue), 14 reports, 15 audit "finished" (on every path
 //!   after "started"), 16 per-boot audit export
@@ -884,36 +885,141 @@ fn recheck_identity(
     }
 }
 
+/// What step 10 did to one file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileFlush {
+    pub path: PathBuf,
+    /// The file could not be opened or fsynced: what it holds may not be on
+    /// the destination medium
+    pub not_durable: Option<String>,
+    /// The page-cache eviction failed: a re-read may be served from memory
+    pub not_evicted: Option<String>,
+}
+
+/// What step 10 did: per file, and the directory fsync.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlushReport {
+    pub files: Vec<FileFlush>,
+    /// The directory could not be fsynced: new entries may not be durable
+    pub directory: Option<String>,
+}
+
+impl FlushReport {
+    /// Every problem, one sentence each, in file order.
+    pub fn problems(&self) -> Vec<String> {
+        self.files
+            .iter()
+            .flat_map(|f| f.not_durable.iter().chain(f.not_evicted.iter()))
+            .chain(self.directory.iter())
+            .cloned()
+            .collect()
+    }
+}
+
 /// Step 10: fsync every file, evict it from the page cache (so verification
-/// reads the medium), fsync the directory. Returns the problems.
-pub fn flush_and_evict(files: &[PathBuf], dir: &Path) -> Vec<String> {
+/// reads the medium), fsync the directory; what happened to each file.
+pub fn flush_files(files: &[PathBuf], dir: &Path) -> FlushReport {
     use std::os::unix::io::AsRawFd;
-    let mut problems = Vec::new();
+    let mut report = FlushReport::default();
     for f in files {
+        let mut result = FileFlush {
+            path: f.clone(),
+            ..Default::default()
+        };
         match File::open(f) {
             Ok(file) => {
                 if let Err(e) = file.sync_all() {
-                    problems.push(format!("fsync of {} failed: {e}", f.display()));
+                    result.not_durable = Some(format!("fsync of {} failed: {e}", f.display()));
                 }
                 // SAFETY: advisory call on a descriptor we own
                 let rc = unsafe {
                     libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
                 };
                 if rc != 0 {
-                    problems.push(format!(
+                    result.not_evicted = Some(format!(
                         "{} could not be evicted from the page cache: {}",
                         f.display(),
                         io::Error::from_raw_os_error(rc)
                     ));
                 }
             }
-            Err(e) => problems.push(format!("{} cannot be opened to flush it: {e}", f.display())),
+            Err(e) => {
+                result.not_durable =
+                    Some(format!("{} cannot be opened to flush it: {e}", f.display()))
+            }
         }
+        report.files.push(result);
     }
     if let Err(e) = sync_dir(dir) {
-        problems.push(e.to_string());
+        report.directory = Some(e.to_string());
     }
-    problems
+    report
+}
+
+/// [`flush_files`] as a list of problems (for callers that only note them).
+pub fn flush_and_evict(files: &[PathBuf], dir: &Path) -> Vec<String> {
+    flush_files(files, dir).problems()
+}
+
+/// What step 10 means for the image files (T1): a file that could not be
+/// opened or fsynced, or a directory that could not be fsynced, makes the
+/// image not durable (verification fails); an eviction failure means the
+/// re-read may have come from memory. Problems of other files are notes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ImageFlush {
+    not_durable: Vec<String>,
+    not_evicted: Vec<String>,
+    notes: Vec<String>,
+}
+
+impl ImageFlush {
+    fn of(flush: &FlushReport, image_files: &[PathBuf]) -> Self {
+        let mut r = ImageFlush::default();
+        for f in &flush.files {
+            let image = image_files.contains(&f.path);
+            if let Some(p) = &f.not_durable {
+                if image {
+                    r.not_durable.push(p.clone());
+                } else {
+                    r.notes.push(p.clone());
+                }
+            }
+            if let Some(p) = &f.not_evicted {
+                if image {
+                    r.not_evicted.push(p.clone());
+                } else {
+                    r.notes.push(p.clone());
+                }
+            }
+        }
+        if let Some(p) = &flush.directory {
+            if image_files.is_empty() {
+                r.notes.push(p.clone());
+            } else {
+                r.not_durable
+                    .push(format!("{p} (the directory entries of the image)"));
+            }
+        }
+        r
+    }
+
+    /// The image verification once the flush is taken into account: an
+    /// image that is not durable fails verification (a mismatch stays a
+    /// mismatch, an aborted run stays not verified).
+    fn apply(&self, image: VerificationResult) -> VerificationResult {
+        if self.not_durable.is_empty() {
+            return image;
+        }
+        match image {
+            VerificationResult::Mismatched { .. } | VerificationResult::NotPossible { .. } => image,
+            _ => VerificationResult::Failed {
+                reason: format!(
+                    "the image could not be flushed durably to the destination: {}",
+                    self.not_durable.join("; ")
+                ),
+            },
+        }
+    }
 }
 
 /// The image verification combined with the second source read: a
@@ -947,7 +1053,18 @@ pub fn combine_verification(
     }
 }
 
-fn verification_method(engine: EngineKind, result: &VerificationResult) -> String {
+/// How the image was verified, stating only what happened: the reader, and
+/// whether the image was fsynced and evicted from the page cache first.
+fn verification_method(
+    engine: EngineKind,
+    result: &VerificationResult,
+    ran: bool,
+    has_image: bool,
+    flush: &ImageFlush,
+) -> String {
+    if !ran {
+        return "none: the acquisition was aborted before the verification".to_string();
+    }
     let base = match result {
         VerificationResult::Matched { method } | VerificationResult::Mismatched { method, .. } => {
             method.clone()
@@ -958,7 +1075,15 @@ fn verification_method(engine: EngineKind, result: &VerificationResult) -> Strin
             EngineKind::Rescue => "image digests computed by dfdisk".to_string(),
         },
     };
-    format!("{base}, after fsync and page-cache eviction of the image")
+    if !has_image {
+        base
+    } else if !flush.not_durable.is_empty() {
+        format!("{base}; the image could not be fsynced to the destination, so the re-read may not show what the destination holds")
+    } else if !flush.not_evicted.is_empty() {
+        format!("{base}, after fsync of the image; the image could not be evicted from the page cache, so the re-read may have come from memory")
+    } else {
+        format!("{base}, after fsync and page-cache eviction of the image")
+    }
 }
 
 /// `<base>.smart-<when>.json`, or `-2`, `-3`, ... when a resumed rescue
@@ -1129,12 +1254,17 @@ async fn acquire_phase(
     let mut written: Vec<PathBuf> = out.image_files.clone();
     written.extend(out.auxiliary_files.iter().cloned());
     written.extend(session_files.iter().cloned());
-    for problem in flush_and_evict(&written, &dir) {
+    let flush = ImageFlush::of(&host.flush(&written, &dir), &out.image_files);
+    for problem in flush.not_durable.iter().chain(&flush.not_evicted) {
         sink.warn(problem.clone());
-        notes.push(problem);
+    }
+    for problem in &flush.notes {
+        sink.warn(problem.clone());
+        notes.push(problem.clone());
     }
 
     // 11: verification and the optional second source read
+    let verify_ran = !out.aborted;
     let (image_result, image_hashes) = if out.aborted {
         (
             VerificationResult::NotPossible {
@@ -1146,6 +1276,7 @@ async fn acquire_phase(
         sink.phase(AcquisitionStatus::Verifying, "Verifying the written image");
         host.verify(&ctx, &out).await
     };
+    let image_result = flush.apply(image_result);
     if stop.is_aborted() {
         out.aborted = true;
     }
@@ -1191,7 +1322,13 @@ async fn acquire_phase(
             Err(e) => Some(VerificationResult::Failed { reason: e.message }),
         }
     };
-    let method = verification_method(v.engine, &image_result);
+    let method = verification_method(
+        v.engine,
+        &image_result,
+        verify_ran,
+        !out.image_files.is_empty(),
+        &flush,
+    );
     let verification = combine_verification(image_result, source_reread.as_ref());
 
     // 13: SMART after a rescue

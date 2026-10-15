@@ -117,6 +117,9 @@ struct Fake {
     engine: Option<EngineFn>,
     verify: Option<VerifyFn>,
     reread: Option<Result<HashResults, AcquisitionError>>,
+    /// Step 10 fails to fsync (or to evict) files whose name ends with this
+    fsync_fail: Option<&'static str>,
+    evict_fail: Option<&'static str>,
     calls: Mutex<Vec<&'static str>>,
 }
 
@@ -156,6 +159,8 @@ impl Fake {
             engine: None,
             verify: None,
             reread: None,
+            fsync_fail: None,
+            evict_fail: None,
             calls: Mutex::new(Vec::new()),
             data,
             tmp,
@@ -378,6 +383,28 @@ impl SessionHost for Fake {
             Some(f) => Box::pin(async move { f(ctx, out) }),
             None => Box::pin(super::verify(ctx, out)),
         }
+    }
+
+    fn flush(&self, files: &[PathBuf], dir: &Path) -> FlushReport {
+        let mut report = flush_files(files, dir);
+        let ends = |f: &FileFlush, suffix: Option<&str>| {
+            suffix.is_some_and(|s| f.path.to_string_lossy().ends_with(s))
+        };
+        for f in &mut report.files {
+            if ends(f, self.fsync_fail) {
+                f.not_durable = Some(format!(
+                    "fsync of {} failed: Input/output error (os error 5)",
+                    f.path.display()
+                ));
+            }
+            if ends(f, self.evict_fail) {
+                f.not_evicted = Some(format!(
+                    "{} could not be evicted from the page cache: Invalid argument (os error 22)",
+                    f.path.display()
+                ));
+            }
+        }
+        report
     }
 
     fn reread_source<'a>(
@@ -1025,6 +1052,97 @@ async fn short_source_is_incomplete_with_the_real_engine() {
 }
 
 #[tokio::test]
+async fn an_image_that_cannot_be_flushed_is_never_verified() {
+    // fsync of the image fails: VERIFICATION FAILED (exit 4), and the method
+    // does not claim an fsync or eviction that did not happen
+    let mut fake = Fake::new();
+    fake.fsync_fail = Some(".raw");
+    let report = run_fake(&fake, fake.raw()).await.0.unwrap();
+    assert_eq!(report.outcome, Outcome::VerificationFailed, "{report:?}");
+    assert_eq!(report.exit_code, 4);
+    assert!(
+        report
+            .outcome_reason
+            .contains("the image could not be flushed durably to the destination: fsync of"),
+        "{}",
+        report.outcome_reason
+    );
+    let method = &report.verification.method;
+    assert!(!method.contains("page-cache eviction"), "{method}");
+    assert!(method.contains("could not be fsynced"), "{method}");
+    let (text, _) = read_report(&fake);
+    assert!(!text.contains("ALL HASHES MATCH"), "{text}");
+    // The finished record carries the verdict
+    let finished = fake.records().pop().unwrap();
+    assert_eq!(finished["details"]["exit_code"], 4);
+
+    // Eviction fails: still verified (the data is durable), but the method
+    // says the re-read may have come from memory
+    let mut fake = Fake::new();
+    fake.evict_fail = Some(".raw");
+    let report = run_fake(&fake, fake.raw()).await.0.unwrap();
+    assert_eq!(
+        report.outcome,
+        Outcome::Verified,
+        "{}",
+        report.outcome_reason
+    );
+    let method = &report.verification.method;
+    assert!(method.contains("may have come from memory"), "{method}");
+    assert!(
+        !method.contains("page-cache eviction of the image"),
+        "{method}"
+    );
+
+    // An auxiliary file that cannot be fsynced is a note, not a verdict
+    let mut fake = Fake::new();
+    fake.fsync_fail = Some(".smart-before.json");
+    let report = run_fake(&fake, fake.raw()).await.0.unwrap();
+    assert_eq!(
+        report.outcome,
+        Outcome::Verified,
+        "{}",
+        report.outcome_reason
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("fsync of") && n.contains("smart-before.json")),
+        "{:?}",
+        report.notes
+    );
+    assert!(report
+        .verification
+        .method
+        .ends_with("after fsync and page-cache eviction of the image"));
+
+    // An aborted run never claims a verification method
+    let mut fake = Fake::new();
+    fake.fsync_fail = Some(".raw");
+    let stop = StopFlags::new();
+    let flags = stop.clone();
+    fake.engine = Some(Box::new(move |ctx| {
+        flags.abort.store(true, Ordering::SeqCst);
+        let p = ctx.output_path(".raw");
+        std::fs::write(&p, b"partial").unwrap();
+        Ok(EngineOutput {
+            bytes_acquired: 7,
+            aborted: true,
+            image_files: vec![p],
+            ..Default::default()
+        })
+    }));
+    let report = run_on(&fake, fake.raw(), stop).await.0.unwrap();
+    assert_eq!(report.outcome, Outcome::Aborted);
+    assert!(
+        report.verification.method.starts_with("none"),
+        "{}",
+        report.verification.method
+    );
+}
+
+#[tokio::test]
 async fn substituted_sectors_are_completed_with_read_errors() {
     let mut fake = Fake::new();
     let mut out = complete(&fake.data);
@@ -1451,6 +1569,27 @@ fn flush_reports_problems_and_smart_names_never_collide() {
     assert!(flush_and_evict(std::slice::from_ref(&f), tmp.path()).is_empty());
     let problems = flush_and_evict(&[tmp.path().join("missing")], tmp.path());
     assert_eq!(problems.len(), 1);
+    // Per file: an image that cannot be opened is not durable; a problem of
+    // another file is only a note
+    let report = flush_files(&[f.clone(), tmp.path().join("missing")], tmp.path());
+    assert_eq!(
+        report.files[0],
+        FileFlush {
+            path: f.clone(),
+            ..Default::default()
+        }
+    );
+    assert!(report.files[1].not_durable.is_some());
+    let as_image = ImageFlush::of(&report, &[tmp.path().join("missing")]);
+    assert_eq!(as_image.not_durable.len(), 1);
+    assert!(as_image.notes.is_empty());
+    assert!(matches!(
+        as_image.apply(VerificationResult::Matched { method: "m".into() }),
+        VerificationResult::Failed { .. }
+    ));
+    let as_aux = ImageFlush::of(&report, std::slice::from_ref(&f));
+    assert!(as_aux.not_durable.is_empty());
+    assert_eq!(as_aux.notes.len(), 1);
 
     let p = smart_json_path(tmp.path(), "b", "before");
     assert!(p.ends_with("b.smart-before.json"));
