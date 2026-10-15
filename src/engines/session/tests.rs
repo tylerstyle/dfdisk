@@ -1283,16 +1283,27 @@ async fn a_panic_after_started_still_writes_the_finished_record() {
 }
 
 #[tokio::test]
-async fn zero_fill_is_refused_by_this_raw_engine_before_writing() {
+async fn zero_fill_runs_with_the_real_raw_engine() {
+    // A readable source: zero-fill substitutes nothing, and the report says
+    // which policy was applied
     let fake = Fake::new();
     let config = AcquisitionConfig {
         on_read_error: OnReadError::ZeroFill,
         smart: SmartPolicy::Off,
         ..fake.raw()
     };
-    let e = run_fake(&fake, config).await.0.unwrap_err();
-    assert_eq!(e.kind, ErrorKind::Usage);
-    assert!(!fake.out().exists());
+    let report = run_fake(&fake, config).await.0.unwrap();
+    assert_eq!(
+        report.outcome,
+        Outcome::Verified,
+        "{}",
+        report.outcome_reason
+    );
+    assert!(report.read_errors.is_empty());
+    let EngineSettings::Raw(raw) = &report.effective_config.settings else {
+        panic!()
+    };
+    assert_eq!(raw.on_read_error, OnReadError::ZeroFill);
 }
 
 // ---------------------------------------------------------------------------

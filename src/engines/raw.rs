@@ -800,12 +800,6 @@ pub(crate) fn run_copy(
 
 /// Acquire the source into `<base>.raw` (step 8).
 pub async fn acquire(ctx: &EngineContext) -> Result<EngineOutput, AcquisitionError> {
-    if ctx.config().on_read_error == OnReadError::ZeroFill {
-        // Enabled together with the session test that expects it
-        return Err(AcquisitionError::usage(
-            "--on-read-error zero-fill is not available in this build of the RAW engine",
-        ));
-    }
     let src = ctx.dup_source().map_err(|e| {
         AcquisitionError::failed(format!("cannot read the source {}: {e}", ctx.identity.path))
     })?;
