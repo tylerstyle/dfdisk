@@ -1,6 +1,7 @@
 pub mod capacity;
 pub mod devices;
 pub mod identity;
+pub mod runner;
 pub mod safety;
 pub mod smart;
 pub mod sysfs;
