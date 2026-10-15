@@ -2325,6 +2325,10 @@ impl App {
         }
         let source_path = expand_tilde(Path::new(&source));
         let dir = expand_tilde(Path::new(self.conv.destination.trim()));
+        // The TUI found this report next to the image (the form has no report
+        // field): the converter ignores it with a note when it describes
+        // another image, e.g. the rescue report next to a --rescue-to-e01 E01
+        // (C-5), instead of refusing the conversion as for a given --report
         let source_report = self
             .conv
             .facts
@@ -2340,6 +2344,7 @@ impl App {
             split_size: self.conv.split,
             notes: self.conv.notes.clone(),
             source_report,
+            source_report_auto: true,
             ..Default::default()
         };
         self.token += 1;

@@ -1445,6 +1445,54 @@ async fn the_converter_never_keeps_the_previous_images_case_values() {
     assert_eq!(case.seal_number, "", "not given: taken from the report");
 }
 
+/// C-5: the converter form has no report field, so a report the TUI passes
+/// is one it found next to the image. It goes to the converter as found
+/// (`source_report_auto`): one that describes another image, such as the
+/// rescue report `x.info.json` (listing `x.raw`) next to the E01 that
+/// --rescue-to-e01 made, is ignored with a note instead of refusing the
+/// conversion as a given --report would.
+#[tokio::test]
+async fn a_report_the_tui_found_is_passed_as_found_not_as_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = image_with_report(dir.path(), "x", "CASE-X", "EV-X", "");
+    let e01 = dir.path().join("x.E01");
+    std::fs::write(&e01, b"EVF\x09\x0d\x0a\xff\x00").unwrap();
+    let fake = Fake::new(vec![]);
+    let mut app = app_with(&fake);
+    app.handle_key(key(KeyCode::Char('c')));
+    typ(&mut app, &e01.display().to_string());
+    pump(&mut app, "report next to the E01", |app| {
+        app.conv.facts.as_ref().is_some_and(|f| f.path == e01)
+    })
+    .await;
+    let found = app.conv.facts.as_ref().unwrap().report.clone();
+    assert_eq!(
+        found.map(|r| r.path),
+        Some(dir.path().join("x.info.json")),
+        "the report of {} next to the E01",
+        raw.display()
+    );
+    app.conv.destination = dir.path().join("out").display().to_string();
+    app.handle_key(key(KeyCode::F(5)));
+    pump(&mut app, "sheet", |app| {
+        app.confirm.as_ref().is_some_and(|c| !c.pending)
+    })
+    .await;
+    typ(&mut app, "serx");
+    app.handle_key(key(KeyCode::Enter));
+    pump(&mut app, "conversion result", |app| {
+        app.screen == Screen::Result
+    })
+    .await;
+    let req = fake.s().conversions[0].clone();
+    assert_eq!(req.source, e01);
+    assert_eq!(
+        req.source_report.as_deref(),
+        Some(dir.path().join("x.info.json").as_path())
+    );
+    assert!(req.source_report_auto, "found by the TUI, not given");
+}
+
 #[tokio::test]
 async fn converting_a_rescue_fills_only_the_fields_the_form_shows() {
     let fake = Fake::new(vec![evidence()]);
