@@ -51,10 +51,11 @@ source device, when for example:
   `--expect-wwn` or `--expect-size`;
 - the device is protected by the dfnix protected-device registry, or the registry
   exists but cannot be read (fail closed);
-- the device is a system disk, is mounted (in any mount namespace visible to
-  dfdisk), holds active swap, or has holders (device-mapper, LVM, md) and
-  `--allow-holders` was not given;
-- the device cannot be opened exclusively (`O_EXCL` returns EBUSY: it is in use);
+- the device is a system disk, is mounted (in dfdisk's mount namespace), holds
+  active swap, or has holders (device-mapper, LVM, md) and `--allow-holders` was
+  not given;
+- the device cannot be opened exclusively (`O_EXCL` returns EBUSY: it is in use,
+  for example mounted in another mount namespace);
 - the destination is on the source, on a dfnix evidence mount, on tmpfs/ramfs
   (without `--allow-tmpfs`), read-only, too small, on a FAT filesystem that
   cannot hold the image file, or already contains an output of the same name
@@ -70,13 +71,13 @@ source device, when for example:
 
 | Subcommand | Exit codes |
 |------------|------------|
-| `acquire` | The report's verdict (0, 4–9) once anything was written; 2, 3 or 4 when the run ended before the first write; 8 when aborted before the first write. |
-| `check` | 0 ready; otherwise the code of the first problem found: 2 usage, 3 refused, 4 a check could not run. Writes nothing. |
-| `verify` | 0 every expected digest matches; 5 a digest differs; 4 the verification could not run or a requested digest was not computed (never reported as a pass); 9 nothing to compare against (no expected digest given, none in the report, none stored in the image); 2 the image does not exist or arguments are invalid; 8 aborted. |
-| `convert` | The conversion's verdict (0, 4, 5, 6, 8, 9); 2 for example a RAW size that is not a multiple of 512 bytes or missing case fields; 3 an output already exists or a destination check refused. |
-| `unmount` | 0 everything was unmounted and nothing remains mounted; 3 refused (system mount, protected device, active swap); 4 an unmount failed. |
+| `acquire` | The report's verdict (0, 4–9) once anything was written; 2, 3 or 4 when the run ended before the first write; 8 when aborted before the first write. With `--rescue-to-e01` the more severe of the rescue's and the conversion's code, from most to least severe 1, 2, 8, 5, 4, 3, 6, 7, 9, 0 (a conversion that is skipped because the rescue is not complete adds nothing). |
+| `check` | 0 ready; otherwise the code of the first problem found: 2 usage, 3 refused, 4 a check could not run; 8 interrupted. Writes nothing. |
+| `verify` | 0 every digest compared matches (expected digests, the digests an E01 stores, every piece of `--pieces`); 5 a digest or a piece differs; 4 the verification could not run or a requested digest was not computed (never reported as a pass); 9 nothing to compare against (no expected digest given, none in the report, none stored in the image, no `--pieces`); 2 the image or pieces file does not exist or arguments are invalid; 8 aborted. |
+| `convert` | The conversion's verdict (0, 4–9; 7 when the source image holds zero-filled sectors of its acquisition); 2 for example a RAW size that is not a multiple of 512 bytes or missing case fields; 3 an output already exists or a destination check refused; 4 a tool could not run. |
+| `unmount` | 0 everything was unmounted and nothing remains mounted (or nothing was mounted); 2 usage (for example a regular file); 3 refused (system mount, protected device, active swap, unidentifiable device); 4 an unmount failed or a mount remained. |
 | `list` | 0, or 4 when the device scan failed. |
-| `tui` (default) | 0 on a normal exit, 1 on an internal error. |
+| `tui` (default) | 0 on a normal exit; the result's exit code when the TUI ends before the examiner acknowledged a result on screen (a run that finished after SIGHUP, or a quit by signal); 1 on a terminal failure; 4 when the signal handlers cannot be installed. |
 
 Command-line parsing errors (unknown option, missing value, missing required
 `--case`/`--evidence`/`--examiner`) exit 2. `--help` and `--version` exit 0.

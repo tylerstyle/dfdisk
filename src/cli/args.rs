@@ -63,12 +63,14 @@ Exit codes:
 const VERIFY_AFTER_HELP: &str = "\
 Expected digests come from --md5/--sha1/--sha256 or from a dfdisk report
 (--report <base>.info.json). EWF images (.E01, .Ex01, .E02 ...) are re-read by
-ewfverify; anything else is hashed by dfdisk. A digest that was expected but not
-computed fails the verification; it never passes. Every run writes an addendum
-<image>.verify-<UTC>.txt next to the image and an audit record.
+ewfverify and also compared with the digests they store; anything else (RAW,
+split RAW .001 ...) is hashed by dfdisk, and with --pieces checked piece by
+piece. A digest that was expected but not computed fails the verification; it
+never passes. Every run writes an addendum <base>.verify-<UTC>.txt next to the
+image (<base>: the image file name without its extension) and an audit record.
 
 Exit codes:
-  0  every expected digest (and every piece of --pieces) matches
+  0  every digest compared (expected, stored in the E01, every piece) matches
   2  usage error
   4  verification failed: the image could not be read completely, or an expected
      digest was not computed
@@ -80,7 +82,8 @@ const CONVERT_AFTER_HELP: &str = "\
 Without case flags the case fields are taken from the source's dfdisk report;
 without such a report --case, --evidence and --examiner are required. Existing
 outputs are never overwritten. The conversion is verified and writes its own
-report (.info + .info.json) and audit records. SIGINT/SIGTERM abort it (exit 8).
+report (<base>.conversion.info + <base>.conversion.info.json, <base>: the source
+name without its extensions) and audit records. SIGINT/SIGTERM abort it (exit 8).
 
 Exit codes: the verdict of the conversion report (0, 4, 5, 6, 7, 8, 9), or 2
 (usage), 3 (refused) or 4 (failed) when no conversion ran; see dfdisk --help.";

@@ -45,7 +45,14 @@ and when something was not done the report says so.
   than the source (unless `--allow-low-space`).
 - **Write protection on by default.** `--write-protect auto` sets the kernel
   read-only flag (BLKROSET) on the source and leaves it set; `off` only records.
-- **SMART** is no longer queried during device scans; `list --smart` asks for it.
+- **SMART** is no longer queried during device scans; `list --smart` asks for it
+  (with `-n standby`, so a sleeping disk is not woken).
+- **`list --json`** prints one object (`schema_version` 1: registry state,
+  active swap, scan notes, `devices` with partitions and stacked devices nested
+  in `children`) instead of 0.1's array of devices.
+- **TUI exit code.** The TUI exits with the exit code of a result the examiner
+  did not acknowledge on screen (for example a run that finished after SIGHUP),
+  0 otherwise, and 1 on a terminal failure.
 - **TUI keys.** Esc never aborts; aborting needs a y/N confirmation; Tab and
   Shift-Tab always move between fields and path completion has its own key.
 - **Packaging.** The .deb depends on `$auto, ewf-tools, gddrescue, smartmontools,
@@ -78,9 +85,10 @@ and when something was not done the report says so.
   every path.
 - **H3** The converter overwrote outputs and verified nothing: existing outputs
   are refused before any tool runs, destination checks apply, the output is
-  verified against the source digests, it writes `.info` / `.info.json` and
-  audit records, abort works, sizes that are not a multiple of 512 bytes are
-  refused, split RAW inputs are converted completely or refused.
+  verified against the source digests, it writes `<base>.conversion.info` /
+  `.conversion.info.json` and audit records, abort works, sizes that are not a
+  multiple of 512 bytes are refused, split RAW inputs are converted completely
+  or refused.
 - **H4** Rescue reports were not truthful: read-error ranges and counts come
   from the ddrescue mapfile, untried areas make the run INCOMPLETE, the map is
   hashed and listed, a resume requires the same device (identity sidecar) and
@@ -102,7 +110,8 @@ and when something was not done the report says so.
   only after every destination check. The registry is matched by device number
   (device-mapper paths), and an ambiguous bare device name is refused.
 - **H8** TUI start and abort hazards: required fields, typed confirmation
-  (last four characters of the serial), source identity on every screen, a
+  (last four characters of the serial, the whole serial when shorter, the
+  evidence number without a serial), source identity on every screen, a
   scrolling device table that keeps the serial visible, abort with confirmation.
 - **H9** Exit codes: see Breaking changes; errors are printed once.
 - **H10** Release and packaging: releases are built only after the test job
@@ -177,17 +186,25 @@ and when something was not done the report says so.
   and the audit record.
 - **F8** Persistent result screen; SIGHUP-resilient headless completion and a
   warning when the TUI runs over SSH outside tmux or screen.
-- **F10** `--rescue-to-e01`: a finished rescue is converted to E01 and the rescue's
-  read-error summary goes into the E01 notes and both reports. The ddrescue map is
-  not imported into the E01 as EWF error ranges.
+- **F10** `--rescue-to-e01`: a finished rescue is converted to E01 next to the
+  rescue image; the rescue's verdict, read-error summary and zero-filled sector
+  ranges go into the E01 notes and the conversion report, which names the rescue
+  report by path and SHA-256. The ddrescue map is not imported into the E01 as
+  EWF error ranges.
 - **F11** Chain-of-custody fields `--seal`, `--seized-at`, `--seized-location`;
   required examiner, case and evidence number; a TUI case profile
   (`$XDG_CONFIG_HOME/dfdisk/profile.toml`) with an evidence-number suggestion.
 - **F12** SMART policy `--smart off|basic|full`, before and (rescue) after the
   acquisition.
 - `--expect-serial`, `--expect-wwn`, `--expect-size`, `--allow-holders`,
-  `--allow-tmpfs`, `--allow-low-space`, `--write-protect auto|off`,
-  `--on-read-error stop|zero-fill`.
+  `--allow-tmpfs`, `--allow-low-space` (also for `convert`),
+  `--write-protect auto|off`, `--on-read-error stop|zero-fill`.
+- Sources are selected from the device scan by device number: partitions,
+  device-mapper (dm-linear, dm-crypt, LVM), md and loop devices carry their own
+  facts and the hardware identity of the one disk they are stored on; the
+  virtio-blk serial is read from sysfs, so a virtio disk matches its selection.
+- The flake check `libewf-legacy` builds and tests dfdisk against libewf
+  20140816, the release line of the Debian/Ubuntu `ewf-tools` package.
 
 ### Not in 0.2.0
 

@@ -39,23 +39,28 @@ case-insensitively (exFAT, NTFS and FAT destinations).
 | `<base>.pieces.tsv` | RAW engine | piecewise SHA-256 of the source stream (see below) |
 | `<base>.map` | rescue engine | GNU ddrescue mapfile |
 | `<base>.identity.json` | rescue engine | identity of the source at the first start; a resume requires the same device |
-| `<base>.info.session-N` | rescue engine | the report of an earlier session, kept when a rescue is resumed |
+| `<base>.info.session-N`, `<base>.info.session-N.json` | rescue engine | the reports of an earlier session, kept when a rescue is resumed |
 | `<base>.smart-before.json` | acquisitions with `--smart basic` or `full` | raw `smartctl -j` output before the acquisition |
 | `<base>.smart-after.json` | rescue | raw `smartctl -j` output after the rescue |
 | `<base>.smart-before-N.json`, `<base>.smart-after-N.json` | resumed rescue | later SMART snapshots never overwrite earlier ones |
 | `audit-<boot_id>.jsonl`, `audit-<boot_id>.head` | every acquisition whose audit log could be read and verified | copy of the audit log and its head hash (see [Audit records](#audit-records)) |
 | `<image>.verify-<YYYYMMDDTHHMMSSZ>.txt` | `dfdisk verify` | verification addendum next to the image (`<image>` is the image file name without its extension) |
+| `<base>.conversion.info`, `<base>.conversion.info.json`, `<base>.conversion.log` | `dfdisk convert`, `--rescue-to-e01` | conversion reports and the libewf tool log, next to the converted image (`<base>`: the source image name without its extensions) |
 | `<base>.info.reserve` | every acquisition, temporarily | 1 MiB reservation created before anything else is written and deleted right before the reports are written, so a full destination still gets its report |
 
 Image, auxiliary and SMART files are fsynced, together with the directory, and
-evicted from the page cache before verification, so verification reads the
-destination medium, not memory.
+dropped from the page cache (POSIX_FADV_DONTNEED) before verification, so the
+verification reads them back from the destination rather than from memory (the
+RAW engine re-reads with `O_DIRECT` where the filesystem allows it).
 
 Auxiliary files (ewfacquire log, pieces file, ddrescue map, SMART JSON) are
 listed in the report with their SHA-256.
 
-A conversion (`dfdisk convert`, `--rescue-to-e01`) writes its own `.info` and
-`.info.json` next to its output.
+A conversion (`dfdisk convert`, `--rescue-to-e01`) writes its own reports,
+`<base>.conversion.info` and `<base>.conversion.info.json`, next to its output;
+they name the report of the source image (path and SHA-256) and inherit its
+read-error table. `--rescue-to-e01` writes the E01 next to the rescue image; a
+later `--resume` of that rescue is refused while the E01 is there.
 
 ## Text report (`<base>.info`)
 
@@ -123,7 +128,7 @@ report prints "(not provided)").
 | `source` | object | identity probed at the start: `path`, `canonical_path`, `kernel_name`, `maj_min`, `diskseq`, `kind` (`{"type": "disk"}`, `"partition"`, `"device_mapper"` with `crypt_plaintext`, `"md"`, `"loop"` with `backing_file`, `"regular_file"`, `"other"`), `size_bytes`, `logical_sector_size`, `physical_sector_size`, `model`, `vendor`, `firmware_rev`, `serial`, `serial_candidates` (`[{value, source}]`), `wwn`, `transport`, `removable`, `hotplug`, `rotational`, `read_only`, `parent_disks`, `partition_number`, `partition_start_sector`, `dm_uuid`, `dm_name`, `hardware_of`, `file_id`, `probe_notes` |
 | `identity_at_end` | object or null | identity probed again after the acquisition |
 | `identity_check` | object | `start_ok`, `end_ok` (null: not checked), `details` |
-| `capacity` | object or null | `reported_bytes`, `probed_device`, `ata` (`native_max_sectors`, `current_max_sectors`, `hpa_present`, `dco_real_max_sectors`, `dco_present`), `nvme` (`nsze`, `ncap`, `nuse`, `lba_bytes`), `method`, `errors` |
+| `capacity` | object or null | `reported_bytes`, `probed_device`, `ata` (`native_max_sectors`, `current_max_sectors`, `hpa_present`, `dco_real_max_sectors`, `dco_present`, `sector_bytes`: the sector size of these counts), `nvme` (`nsze`, `ncap`, `nuse`, `lba_bytes`), `method`, `errors` |
 | `write_protection` | object or null | `policy`, `sysfs_ro_before`, `parent_disks_ro_before`, `partitions_ro_before`, `set_by_dfdisk`, `method`, `nodes_set`, `ro_after`, `holders`, `exclusive_open`, `dfnix_registry` (`{"state": "present"}`, `"absent"`, or `"unreadable"` with `reason`), `mounts_before`, `unmounted_by_dfdisk`, `notes` |
 | `smart_before`, `smart_after` | object or null | `policy`, `command`, `smartctl_version`, `exit_status`, `taken_at`, `summary` (parsed health and attributes), `json_file`, `json_sha256`, `note`, `device_serial` |
 | `effective_config` | object | `engine`, `image_format`, `digests`, `verify_source`, `smart`, `write_protect`, `settings` (one of `{"ewf": {…}}`, `{"raw": {…}}`, `{"rescue": {…}}` with what that engine applied), `notes` |
@@ -214,7 +219,7 @@ lines, `/run/dfnix/audit.jsonl` by default; `DFNIX_AUDIT_LOG` overrides the path
 | `acquisition_refused` | a refusal after the device was selected and before "started" (identity, source safety, destination); nothing was written to the destination |
 | `unmount` | `dfdisk unmount` and `--auto-unmount`: the mounts and what happened to them |
 | `image_verification` | `dfdisk verify` |
-| `conversion_started`, `conversion_finished` | `dfdisk convert` and `--rescue-to-e01` |
+| `conversion_started`, `conversion_finished` | `dfdisk convert` and `--rescue-to-e01`; a conversion refused before it started (usage, destination checks, existing outputs) writes no record |
 
 Usage errors are not recorded (nothing was sent to the device). On dfnix
 (protected-device registry present) an audit log that cannot be written refuses

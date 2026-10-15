@@ -32,6 +32,8 @@ The workflow refuses to run unless these agree:
 Start the Release workflow by hand (Actions → Release → Run workflow) on the
 commit to be tagged. It runs the version check (without a tag), the tests and
 every build, including the .deb installation test, and publishes nothing.
+Locally, `nix build .#default .#checks.x86_64-linux.libewf-legacy` builds and
+tests the package against both libewf release lines.
 
 ## 4. Tag
 

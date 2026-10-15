@@ -57,10 +57,11 @@ registry and writes to the hash-chained dfnix audit log.
 | RAW | `--format raw` | `<base>.raw`, one file | MD5, SHA-1, SHA-256 computed by dfdisk while reading, plus a piecewise SHA-256 per `--piece-size` (default 1 GiB); the image is re-read and hashed again | `--on-read-error stop` (default): stop at the first unreadable sector, report its exact offset, verdict INCOMPLETE; `--on-read-error zero-fill`: replace each unreadable sector by zeros, record every range, continue |
 | Rescue | `--rescue` | `<base>.raw` and the ddrescue mapfile `<base>.map` | computed from the image after the rescue; `--verify-source` reads the source a second time and compares | taken from the ddrescue map: bad sectors are zeros in the image, untried or unfinished areas make the run INCOMPLETE; a rescue can be resumed on the same device |
 
-`--rescue-to-e01` converts a finished rescue image into an E01 and puts the
-read-error summary of the rescue into the E01 notes and both reports.
-`dfdisk convert` converts RAW to E01 and E01 to RAW with the same checks and a
-report of its own.
+`--rescue-to-e01` converts a finished rescue image into an E01 next to it and
+puts the read-error summary of the rescue (and its zero-filled sector ranges)
+into the E01 notes and the conversion report, which references the rescue
+report by path and SHA-256. `dfdisk convert` converts RAW to E01 and E01 to RAW
+with the same checks and a report of its own.
 
 ### A verdict you can rely on
 
@@ -77,9 +78,10 @@ never choose it.
 | VERIFICATION FAILED | 4 | the verification could not run or complete |
 | ABORTED | 8 | stopped by the examiner or a signal; partial output and report are kept |
 
-"ALL HASHES MATCH" is printed only for VERIFIED. Images are fsynced and evicted
-from the page cache before they are verified, so verification reads the
-destination medium and not memory.
+"ALL HASHES MATCH" is printed only for VERIFIED. Images are fsynced and dropped
+from the page cache (POSIX_FADV_DONTNEED) before they are verified, so the
+verification reads them back from the destination rather than from memory; the
+RAW engine re-reads with `O_DIRECT` where the filesystem supports it.
 
 ### Evidence handling
 
@@ -123,7 +125,7 @@ own PATH; the .deb depends on them; with a tarball you install them yourself.
 
 | Tool | Debian / Ubuntu package | Nix package | Used for |
 |------|-------------------------|-------------|----------|
-| `ewfacquire`, `ewfverify`, `ewfinfo`, `ewfexport`, `ewfacquirestream` | `ewf-tools` | `libewf` | E01 acquisition, verification and conversion |
+| `ewfacquire`, `ewfverify`, `ewfinfo`, `ewfexport` | `ewf-tools` | `libewf` | E01 acquisition, verification and conversion |
 | `ddrescue` | `gddrescue` | `ddrescue` | rescue engine |
 | `smartctl` | `smartmontools` | `smartmontools` | SMART snapshots (`--smart`) |
 | `hdparm` | `hdparm` | `hdparm` | HPA/DCO detection (read-only queries) |
@@ -132,10 +134,10 @@ own PATH; the .deb depends on them; with a tarball you install them yourself.
 | `udevadm` | `udev` | `systemd` | device identity |
 | `timedatectl` (optional) | `systemd` | `systemd` | NTP state for the report's clock section |
 
-The Nix build runs the tool tests against libewf 20231119 and ddrescue 1.30.
-Debian and Ubuntu ship older libewf releases (`ewf-tools` 20140807 on Ubuntu
-22.04); CI runs the same tests against Ubuntu 22.04's `ewf-tools` and
-`gddrescue`.
+The Nix build runs the tool tests against libewf 20231119 and ddrescue 1.30, and
+the flake check `libewf-legacy` runs them again against libewf 20140816. Debian
+and Ubuntu ship that older release line (`ewf-tools` 20140807 on Ubuntu 22.04);
+CI also runs the tests against Ubuntu 22.04's `ewf-tools` and `gddrescue`.
 
 ### Nix and NixOS
 
@@ -223,12 +225,14 @@ sudo dfdisk        # or: sudo dfdisk tui
 ```
 
 The device explorer lists disks and partitions with badges (SYSTEM, PROTECTED,
-MOUNTED, RO, IN-USE, HPA). Selecting a device leads to the case setup, then to a
-confirmation sheet that shows the source identity, write protection, hidden
-areas, destination and settings; starting requires typing the last four
-characters of the serial number (or the evidence number when the device has no
-serial). The result screen shows the verdict first and stays until it is
-acknowledged. `?` or F1 shows the keys of the current screen. Esc goes back and
+MOUNTED, RO, IN-USE, and HPA or DCO once a disk's hidden areas were probed on
+request). Selecting a device leads to the case setup, then to a confirmation
+sheet that shows the source identity, write protection, hidden areas,
+destination and settings; starting requires typing the last four characters of
+the serial number (the whole serial when it is shorter, the evidence number when
+the device has no serial). The result screen shows the verdict first and stays
+until it is acknowledged; when the TUI ends before a result was acknowledged
+(for example after SIGHUP) it exits with that result's exit code. `?` or F1 shows the keys of the current screen. Esc goes back and
 never aborts an acquisition; aborting asks for confirmation. The TUI also
 converts images, re-verifies an image against its report, resumes a rescue, and
 remembers examiner, authority and the last destination in
@@ -285,7 +289,10 @@ Acquisition options:
 | `--expect-serial`, `--expect-wwn`, `--expect-size` | refuse unless the device has this serial, WWN or size in bytes |
 | `--allow-holders`, `--allow-tmpfs`, `--allow-low-space` | accept device-mapper/LVM/md holders, a tmpfs destination, or an E01 destination with less free space than the source size |
 | `--auto-unmount` | unmount the source's filesystems first (audited, same as `dfdisk unmount`) |
+| `--digests md5,sha1,sha256` | digests to compute and verify (default all three; E01 always adds MD5) |
+| `--error-granularity <SECTORS>` | E01: ewfacquire error granularity (default physical / logical sector size) |
 | `--json` | print the final `.info.json` on stdout; progress and messages go to stderr |
+| `-v, --verbose` | print every log line of the engines and tools |
 
 `dfdisk acquire --help` lists every option with its default.
 
@@ -300,12 +307,18 @@ dfdisk verify <base>.raw --pieces <base>.pieces.tsv
 dfdisk convert <image.raw|image.E01> --to e01|raw -o <dir> [case fields]
 ```
 
+`dfdisk list --json` prints one object (`schema_version` 1): the registry state,
+active swap areas, scan notes and every disk with its partitions and stacked
+devices nested in `children`, each with its identity, mounts, holders, system
+reasons and badges.
+
 `dfdisk verify` recognises EWF segment families (`.E01`, `.Ex01`, `.E02`, …),
 RAW images and split RAW images (`.001`, `.002`, …). A requested digest that was
 not computed is a failure, never a pass. `dfdisk convert` takes the case fields
 from `<source>.info.json` when it exists and requires them otherwise; it refuses
-RAW images whose size is not a multiple of 512 bytes and never overwrites an
-existing output.
+RAW images whose size is not a multiple of 512 bytes (as an E01 of a source
+without whole 512-byte sectors is refused) and never overwrites an existing
+output. Its report is `<base>.conversion.info` / `.conversion.info.json`.
 
 ### Signals
 
@@ -350,6 +363,10 @@ Next to the image, every acquisition writes:
   with its head hash, one file per boot of the host, never overwriting another
   boot's copy.
 
+A conversion writes `<base>.conversion.info`, `<base>.conversion.info.json` and
+the libewf log `<base>.conversion.log` next to its output; `dfdisk verify` writes
+an addendum `<base>.verify-<UTC>.txt` next to the image.
+
 Read-error ranges are byte ranges of the source, marked `substituted` (zeros in
 the image) or `unread` (not in the image). The text report lists the first 200;
 the JSON report lists all of them.
@@ -370,9 +387,10 @@ identify-class queries that the report records.
   at the pinned device.
 - **Refusals.** dfdisk refuses (exit 3) a device listed in the dfnix
   protected-device registry (and fails closed when the registry exists but cannot
-  be read), a system disk, a device with mounted filesystems (in any visible
-  mount namespace) or active swap, and a device with holders (dm-crypt, LVM, md)
-  unless `--allow-holders` is given. Unmounting is a separate, explicit, audited
+  be read), a system disk, a device with mounted filesystems (in dfdisk's mount
+  namespace; a mount in another namespace makes the exclusive open below fail)
+  or active swap, and a device with holders (dm-crypt, LVM, md) unless
+  `--allow-holders` is given. Unmounting is a separate, explicit, audited
   action (`dfdisk unmount`, `--auto-unmount`) that refuses system mounts and
   protected devices and never forces or lazily unmounts.
 - **Exclusive open.** The source is opened with `O_EXCL` and held for the whole
@@ -401,8 +419,9 @@ identify-class queries that the report records.
 - **Clock.** Reports state whether the host clock was NTP-synchronised and give
   the RTC offset; without confirmed synchronisation timestamps are labelled
   "host system time, NOT synchronized". Durations come from the monotonic clock.
-- **Audit log.** Acquisitions, refusals, unmounts, verifications and conversions
-  are recorded in the hash-chained dfnix audit log (dfcore). The
+- **Audit log.** Acquisitions, refused acquisitions, unmounts, verifications and
+  conversions are recorded in the hash-chained dfnix audit log (dfcore); usage
+  errors and conversions refused before they started are not. The
   "acquisition_finished" record is written on every path, including errors,
   aborts and signals, and carries the SHA-256 of both reports.
 
@@ -437,11 +456,13 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 
 # Tool tests skip when libewf, ddrescue or a C compiler is missing;
-# DFDISK_REQUIRE_TOOLS=1 makes them fail instead
-nix shell nixpkgs#libewf nixpkgs#ddrescue -c env DFDISK_REQUIRE_TOOLS=1 cargo test
+# DFDISK_REQUIRE_TOOLS=1 makes them fail instead. Run them with both libewf
+# release lines (nixpkgs#libewf-legacy is the Debian/Ubuntu ewf-tools line)
+DFDISK_REQUIRE_TOOLS=1 nix shell nixpkgs#libewf nixpkgs#ddrescue nixpkgs#gcc -c cargo test --locked
+DFDISK_REQUIRE_TOOLS=1 nix shell nixpkgs#libewf-legacy nixpkgs#ddrescue nixpkgs#gcc -c cargo test --locked
 
-# Package build; runs the whole test suite with the real tools
-nix build
+# Package builds; they run the whole test suite with the real tools
+nix build .#default .#checks.x86_64-linux.libewf-legacy
 ```
 
 Tests never touch host disks and never need root: device scans, sysfs, udev,
@@ -450,7 +471,8 @@ SMART and capacity probes are injectable, CLI tests put fake tools on PATH, and
 
 CI runs formatting, clippy with `-D warnings`, the tests (`--locked`, tool tests
 required) with a pinned toolchain, a build with the minimum supported Rust
-version declared as `rust-version` in Cargo.toml, and the Nix build. Releases are
+version declared as `rust-version` in Cargo.toml, and the Nix builds (default and
+libewf-legacy). Releases are
 described in [docs/RELEASING.md](docs/RELEASING.md).
 
 Source layout:
