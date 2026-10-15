@@ -1,14 +1,27 @@
+//! Renders TUI screens with example data into SVG files (and PNG files when
+//! ImageMagick's `magick` is available and `--png` is given), for the README.
+//!
+//! Usage: `cargo run --example render_screenshots -- [OUTPUT_DIR] [--png]`
+//! (default OUTPUT_DIR: `target/screenshots` in the crate). Every value shown
+//! is invented example data; nothing is read from the host.
+
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
-use std::fs::File;
-use std::io::Write;
+use std::path::{Path, PathBuf};
 
+use dfdisk::engines::session::{AcquisitionRequest, CheckReport};
 use dfdisk::models::case::CaseMetadata;
-use dfdisk::models::config::{AcquisitionConfig, CompressionLevel, ImageFormat, SplitSize};
-use dfdisk::models::device::{BlockDevice, DeviceSafety};
-use dfdisk::tui::app::{App, Screen};
+use dfdisk::models::config::{EffectiveConfig, EngineKind};
+use dfdisk::models::device::{BlockDevice, DeviceSafety, Partition};
+use dfdisk::models::identity::{SourceIdentity, SourceKind};
+use dfdisk::models::info_report::{ForensicInfoReport, HashResults};
+use dfdisk::models::outcome::{RangeKind, ReadErrorTable, VerificationResult};
+use dfdisk::models::telemetry::{AcquisitionStatus, ProgressTelemetry};
+use dfdisk::tui::app::{App, ConfirmState, ConfirmSubject, Job, JobKind, RunResult, Screen};
+use dfdisk::tui::confirm::ConfirmTarget;
+use dfdisk::tui::form::Field;
 use dfdisk::tui::ui;
 
 fn color_to_hex(color: Color) -> &'static str {
@@ -68,8 +81,8 @@ fn buffer_to_svg(buffer: &Buffer, width_cells: u16, height_cells: u16) -> String
     let pad_x = 6.0f64;
     let pad_y = 0.0f64;
 
-    let total_w = 1143;
-    let total_h = 672;
+    let total_w = (pad_x * 2.0 + width_cells as f64 * cell_w).ceil() as u32;
+    let total_h = (pad_y * 2.0 + height_cells as f64 * cell_h).ceil() as u32;
 
     let mut svg = String::new();
     let bg_base = "#1E1E2E";
@@ -299,117 +312,282 @@ fn buffer_to_svg(buffer: &Buffer, width_cells: u16, height_cells: u16) -> String
     svg
 }
 
-fn build_case_setup_app() -> App {
-    let mut app = App::with_devices(Vec::new());
-    app.current_screen = Screen::CaseSetup;
-    app.case_metadata = CaseMetadata {
-        case_number: "VG-2026/4192".to_string(),
-        location_ea: "01".to_string(),
-        evidence_number: "SSD01".to_string(),
-        authority: "Cybercrime & Digital Forensics Unit".to_string(),
-        examiner: "Det. J. Doe (#4192)".to_string(),
-        description: "Samsung 970 EVO NVMe M.2 1TB".to_string(),
-        notes: "/mnt/evidence/cases".to_string(),
-        ..Default::default()
-    };
-    app.active_field = 6; // FormField::Notes
-    app.cursor_pos = app.case_metadata.notes.len();
+fn sample_devices() -> Vec<BlockDevice> {
+    vec![
+        BlockDevice {
+            name: "nvme0n1".into(),
+            path: "/dev/nvme0n1".into(),
+            size_bytes: 512_110_190_592,
+            model: Some("Example NVMe SSD 512GB".into()),
+            serial: Some("EXN512A0001234".into()),
+            bus_type: "NVME".into(),
+            transport: Some("nvme".into()),
+            is_rotational: Some(false),
+            logical_sector_size: 512,
+            physical_sector_size: 512,
+            mountpoints: vec!["/".into(), "/boot".into()],
+            safety: DeviceSafety::SystemDisk(vec!["/".into(), "/boot".into()]),
+            maj_min: Some("259:0".into()),
+            diskseq: Some(1),
+            ..Default::default()
+        },
+        BlockDevice {
+            name: "sdb".into(),
+            path: "/dev/sdb".into(),
+            size_bytes: 1_000_204_886_016,
+            model: Some("Example SATA HDD 1TB".into()),
+            vendor: Some("ACME".into()),
+            serial: Some("WX41A8F2KD7Y".into()),
+            wwn: Some("0x50014ee2b5a1c3d4".into()),
+            bus_type: "USB".into(),
+            transport: Some("usb".into()),
+            hotplug: true,
+            is_rotational: Some(true),
+            is_read_only: true,
+            logical_sector_size: 512,
+            physical_sector_size: 4096,
+            maj_min: Some("8:16".into()),
+            diskseq: Some(17),
+            partitions: vec![
+                Partition {
+                    name: "sdb1".into(),
+                    path: "/dev/sdb1".into(),
+                    size_bytes: 104_857_600,
+                    kind: Some("part".into()),
+                    maj_min: Some("8:17".into()),
+                    start_sector: Some(2048),
+                    is_read_only: true,
+                    ..Default::default()
+                },
+                Partition {
+                    name: "sdb2".into(),
+                    path: "/dev/sdb2".into(),
+                    size_bytes: 1_000_098_000_896,
+                    kind: Some("part".into()),
+                    maj_min: Some("8:18".into()),
+                    start_sector: Some(206_848),
+                    is_read_only: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        BlockDevice {
+            name: "sdc".into(),
+            path: "/dev/sdc".into(),
+            size_bytes: 32_010_928_128,
+            model: Some("Example USB Stick".into()),
+            serial: Some("0401A55F8C21".into()),
+            bus_type: "USB".into(),
+            transport: Some("usb".into()),
+            hotplug: true,
+            is_removable: true,
+            logical_sector_size: 512,
+            physical_sector_size: 512,
+            maj_min: Some("8:32".into()),
+            diskseq: Some(18),
+            mountpoints: vec!["/media/stick".into()],
+            safety: DeviceSafety::Mounted(vec!["/media/stick".into()]),
+            ..Default::default()
+        },
+    ]
+}
 
-    app.target_dir_str = "/mnt/evidence/cases".to_string();
-    app.config = AcquisitionConfig {
-        output_dir: std::path::PathBuf::from("/mnt/evidence/cases"),
-        format: ImageFormat::E01,
-        split_size: SplitSize::TwoGb,
-        compression: CompressionLevel::Fast,
-        calc_md5: true,
-        calc_sha1: true,
-        calc_sha256: true,
-        error_retries: 3,
-        wipe_bad_sectors: false,
-        rescue_mode: false,
-        resume: false,
+fn sample_case() -> CaseMetadata {
+    CaseMetadata {
+        case_number: "2026-0042".into(),
+        evidence_number: "HDD01".into(),
+        examiner: "J. Doe".into(),
+        authority: "Example Forensic Unit".into(),
+        description: "External USB hard disk".into(),
+        seal_number: "S-1187".into(),
         ..Default::default()
-    };
+    }
+}
 
-    let dev = BlockDevice {
-        name: "nvme0n1".to_string(),
-        path: "/dev/nvme0n1".to_string(),
-        devlinks: vec![],
-        size_bytes: 1_000_204_886_016,
-        model: Some("Samsung 970 EVO NVMe M.2 1TB".to_string()),
-        vendor: None,
-        serial: Some("EXNVME0000004192F".to_string()),
-        wwn: None,
-        revision: None,
-        bus_type: "NVMe".to_string(),
-        is_rotational: Some(false),
-        is_removable: false,
-        is_read_only: true,
-        logical_sector_size: 512,
-        physical_sector_size: 512,
-        partition_table_type: None,
-        partitions: vec![],
-        mountpoints: vec![],
-        safety: DeviceSafety::Safe,
-        smart: None,
-        ..Default::default()
-    };
-    app.devices = vec![dev];
-    app.selected_device_idx = 0;
-
+fn explorer_app() -> App {
+    let mut app = App::with_devices(sample_devices());
+    app.is_root = true;
+    app.handle_key(key(crossterm::event::KeyCode::Down));
     app
 }
 
-fn build_image_converter_app() -> App {
-    let mut app = App::with_devices(Vec::new());
-    app.current_screen = Screen::Converter;
-    app.conv_source_path = "/mnt/evidence/cases/suspect_disk.raw".to_string();
-    app.conv_cursor_pos = app.conv_source_path.len();
-    app.conv_active_field = 0; // ConverterField::SourcePath
-    app.conv_to_e01 = true;
-    app.conv_target_dir = "/mnt/evidence/cases".to_string();
-    app.conv_status_msg = "Ready to convert images.".to_string();
+fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+    crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+}
 
+fn case_setup_app() -> App {
+    let mut app = explorer_app();
+    app.handle_key(key(crossterm::event::KeyCode::Enter));
+    app.case = sample_case();
+    app.form.destination = "/mnt/evidence/2026-0042".into();
+    app.field = Field::Notes;
+    app.cursor = 0;
     app
+}
+
+fn identity(dev: &BlockDevice) -> SourceIdentity {
+    let mut id = SourceIdentity::from_block_device(dev);
+    id.kind = SourceKind::Disk;
+    id.probe_notes.clear();
+    id
+}
+
+fn confirm_app() -> App {
+    let mut app = case_setup_app();
+    let dev = app.source.clone().unwrap().device;
+    let config = app.form.config();
+    let request = AcquisitionRequest::new(dev.clone(), app.case.clone(), config.clone());
+    let id = identity(&dev);
+    let check = CheckReport {
+        ready: true,
+        device: dev.path.clone(),
+        engine: EngineKind::Ewf,
+        output_dir: config.output_dir.clone(),
+        base_name: app.base_name_preview(),
+        identity: Some(id.clone()),
+        tool_source_path: Some("/dev/disk/by-diskseq/17".into()),
+        effective_config: Some(EffectiveConfig::build(&config, Some(&id))),
+        write_protection: None,
+        write_protection_plan: Some("nothing to set: every node is already read-only".into()),
+        destination: None,
+        capacity: None,
+        smart: None,
+        problems: Vec::new(),
+        notes: Vec::new(),
+    };
+    app.confirm = Some(ConfirmState {
+        subject: ConfirmSubject::Acquisition {
+            request: Box::new(request),
+            base_name: app.base_name_preview().unwrap_or_default(),
+            check: Some(Box::new(check)),
+            destination: None,
+        },
+        token: 1,
+        pending: false,
+        typed: "kd7".into(),
+        cursor: 3,
+        target: Some(ConfirmTarget::new(dev.serial.as_deref(), "HDD01")),
+        error: None,
+        scroll: 0,
+    });
+    app.screen = Screen::Confirm;
+    app
+}
+
+fn running_app() -> App {
+    let mut app = case_setup_app();
+    let t = ProgressTelemetry {
+        status: AcquisitionStatus::Acquiring,
+        total_bytes: 1_000_204_886_016,
+        bytes_processed: 412_316_860_416,
+        percentage: 41.2,
+        speed_bps: 148.0 * 1024.0 * 1024.0,
+        avg_speed_bps: 151.0 * 1024.0 * 1024.0,
+        eta_secs: Some(6510),
+        elapsed_secs: 2710,
+        compression_ratio: Some(1.31),
+        log_messages: vec![
+            "ewfacquire: acquiry started".into(),
+            "Status: at 41%.".into(),
+        ],
+        ..Default::default()
+    };
+    app.job = Some(Job::detached(
+        JobKind::Acquisition,
+        t,
+        vec![
+            ("Source".into(), "/dev/sdb (whole disk)".into()),
+            ("Serial".into(), "WX41A8F2KD7Y (lsblk)".into()),
+            (
+                "Destination".into(),
+                "/mnt/evidence/2026-0042/2026-0042_01_HDD01_WX41A8F2KD7Y.*".into(),
+            ),
+            ("Engine".into(), "E01 (ewfacquire)".into()),
+        ],
+        true,
+    ));
+    app.screen = Screen::Running;
+    app
+}
+
+fn result_app() -> App {
+    let mut app = case_setup_app();
+    let dev = app.source.clone().unwrap().device;
+    let config = app.form.config();
+    let id = identity(&dev);
+    let mut report = ForensicInfoReport::new(
+        EngineKind::Ewf,
+        &app.case,
+        id.clone(),
+        EffectiveConfig::build(&config, Some(&id)),
+    );
+    report.output_dir = "/mnt/evidence/2026-0042".into();
+    report.base_name = app.base_name_preview().unwrap_or_default();
+    report.image_files = vec![format!("/mnt/evidence/2026-0042/{}.E01", report.base_name)];
+    report.acquisition_hashes = HashResults {
+        md5: Some("0123456789abcdef0123456789abcdef".into()),
+        ..Default::default()
+    };
+    report.image_hashes = report.acquisition_hashes.clone();
+    let mut errors = ReadErrorTable::new(512, "ewfinfo -e");
+    errors.push_sectors(2048, 64, RangeKind::Substituted);
+    let mut facts = report.facts();
+    facts.bytes_acquired = facts.expected_bytes;
+    facts.read_errors = errors;
+    facts.verification = VerificationResult::Matched {
+        method: "ewfverify".into(),
+    };
+    report.apply_facts(&facts);
+    let text = report.render_text();
+    app.result = Some(RunResult::Acquisition {
+        report: Box::new(report),
+        text,
+    });
+    app.result_acknowledged = false;
+    app.screen = Screen::Result;
+    app
+}
+
+fn render(app: &mut App, w: u16, h: u16) -> Result<String, Box<dyn std::error::Error>> {
+    let mut terminal = Terminal::new(TestBackend::new(w, h))?;
+    terminal.draw(|f| ui::render(f, app))?;
+    Ok(buffer_to_svg(terminal.backend().buffer(), w, h))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Rendering Case Setup screen...");
-    let mut case_app = build_case_setup_app();
-    let backend = TestBackend::new(142, 42);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.draw(|f| {
-        ui::render(f, &mut case_app);
-    })?;
-    let case_svg = buffer_to_svg(terminal.backend().buffer(), 142, 42);
-    let mut f = File::create("/tmp/case_setup.svg")?;
-    f.write_all(case_svg.as_bytes())?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let png = args.iter().any(|a| a == "--png");
+    let out: PathBuf = args
+        .iter()
+        .find(|a| !a.starts_with("--"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/screenshots"));
+    std::fs::create_dir_all(&out)?;
 
-    println!("Rendering Image Converter screen...");
-    let mut conv_app = build_image_converter_app();
-    let backend = TestBackend::new(142, 42);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.draw(|f| {
-        ui::render(f, &mut conv_app);
-    })?;
-    let conv_svg = buffer_to_svg(terminal.backend().buffer(), 142, 42);
-    let mut f = File::create("/tmp/image_converter.svg")?;
-    f.write_all(conv_svg.as_bytes())?;
-
-    println!("Rasterizing to PNG via ImageMagick...");
-    let status = std::process::Command::new("magick")
-        .args(["/tmp/case_setup.svg", "assets/screenshots/case_setup.png"])
-        .status()?;
-    assert!(status.success());
-
-    let status = std::process::Command::new("magick")
-        .args([
-            "/tmp/image_converter.svg",
-            "assets/screenshots/image_converter.png",
-        ])
-        .status()?;
-    assert!(status.success());
-
-    println!("Screenshots successfully generated!");
+    let screens: Vec<(&str, App)> = vec![
+        ("device_explorer", explorer_app()),
+        ("case_setup", case_setup_app()),
+        ("confirmation", confirm_app()),
+        ("acquisition", running_app()),
+        ("result", result_app()),
+    ];
+    for (name, mut app) in screens {
+        let svg = render(&mut app, 120, 36)?;
+        let svg_path = out.join(format!("{name}.svg"));
+        std::fs::write(&svg_path, svg)?;
+        println!("wrote {}", svg_path.display());
+        if png {
+            let png_path = out.join(format!("{name}.png"));
+            let status = std::process::Command::new("magick")
+                .arg(&svg_path)
+                .arg(&png_path)
+                .status()?;
+            if !status.success() {
+                return Err(format!("magick failed for {}", svg_path.display()).into());
+            }
+            println!("wrote {}", png_path.display());
+        }
+    }
     Ok(())
 }
