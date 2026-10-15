@@ -651,6 +651,7 @@ pub fn conversion_request(args: &ConvertArgs) -> Result<ConversionRequest, Acqui
         split_size: split_of(args.split),
         notes: Vec::new(),
         source_report: args.report.clone().or_else(|| report_next_to(&args.source)),
+        ..Default::default()
     })
 }
 
@@ -751,8 +752,12 @@ mod tests {
                     length: 1 << 20,
                     expected_sha256: "a".into(),
                     computed_sha256: "b".into(),
+                    bytes_present: 1 << 20,
                 })
                 .collect(),
+            mismatch_count: mismatches as u64,
+            covered_bytes: checked << 20,
+            image_bytes: checked << 20,
         })
     }
 

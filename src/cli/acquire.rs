@@ -529,6 +529,7 @@ pub fn plan_conversion(
         split_size: e01.split_size,
         notes: rescue_notes(report, &report_json),
         source_report: Some(report_json),
+        ..Default::default()
     })
 }
 
