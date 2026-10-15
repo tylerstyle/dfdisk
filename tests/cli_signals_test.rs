@@ -241,17 +241,23 @@ fn a_second_sigint_kills_a_tool_that_ignores_the_first() {
     wait_for(&started, &mut run);
     signal(&run, libc::SIGINT);
     std::thread::sleep(Duration::from_millis(500));
-    // An engine that stops its tool at the first SIGINT may already be done
-    let second = run.child.try_wait().unwrap().is_none();
-    if second {
-        signal(&run, libc::SIGINT);
-    }
+    // The rescue engine gives ddrescue 30 s to save its map after SIGINT;
+    // this one ignores SIGINT, so the run is still waiting for it
+    assert!(
+        run.child.try_wait().unwrap().is_none(),
+        "the first SIGINT must not end the run at once"
+    );
+    let t0 = Instant::now();
+    signal(&run, libc::SIGINT);
     let f = finish(run);
+    assert!(
+        t0.elapsed() < Duration::from_secs(20),
+        "the second SIGINT kills at once, without the grace period"
+    );
     assert_eq!(f.code, 8, "{}\n{}", f.stdout, f.stderr);
-    if second && f.stderr.contains("SIGINT: killing") {
-        // The second SIGINT reached a running acquisition: forced, still reported
-        assert!(f.stdout.contains("ABORTED (exit code 8)"), "{}", f.stdout);
-    }
+    // The second SIGINT reached a running acquisition: forced, still reported
+    assert!(f.stderr.contains("SIGINT: killing"), "{}", f.stderr);
+    assert!(f.stdout.contains("ABORTED (exit code 8)"), "{}", f.stdout);
     assert_eq!(report(&f.out)["outcome"], "aborted");
 }
 
