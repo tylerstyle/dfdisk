@@ -479,6 +479,87 @@ async fn an_aborted_rescue_resumes_with_its_sessions_listed() {
     assert!(text.contains("Resumed"), "{text}");
 }
 
+/// R-2: a session killed after ddrescue wrote data but before it saved its
+/// map leaves source data in areas the map lists as not tried; when the
+/// resumed session finds them unreadable, ddrescue marks them bad and never
+/// writes them. The report says bad sectors are zeros in the image: dfdisk
+/// makes that true.
+#[tokio::test]
+async fn bad_areas_hold_zeros_after_a_killed_session_is_resumed() {
+    if !ddrescue_wrapper() {
+        return;
+    }
+    let tmp = scratch();
+    let (src, data) = source(tmp.path(), MIB, None);
+    let out = tmp.path().join("out");
+    let device = file_device(&src, MIB as u64, Some("KILLED01"));
+    let first = run(device.clone(), rescue_config(&out)).await.unwrap();
+    assert_eq!(first.outcome, Outcome::CompleteUnverified);
+    // The map as a killed session can leave it: the image holds the data of
+    // these areas, the map lists them as not tried
+    let map = out.join(format!("{}.map", first.base_name));
+    std::fs::write(
+        &map,
+        "# Mapfile. Created by GNU ddrescue version 1.30\n\
+         # current_pos  current_status  current_pass\n\
+         0x00010000     ?               1\n\
+         #      pos        size  status\n\
+         0x00000000  0x00010000  +\n\
+         0x00010000  0x00000400  ?\n\
+         0x00010400  0x0007FC00  +\n\
+         0x00090000  0x00000200  ?\n\
+         0x00090200  0x0006FE00  +\n",
+    )
+    .unwrap();
+    assert_eq!(image_of(&first), data, "the image holds the whole source");
+    // Now these areas cannot be read
+    std::fs::write(
+        tmp.path().join("src.bin.ddrescue-args"),
+        format!("-H {}", fixture(TESTMODE_BAD_MIDDLE).display()),
+    )
+    .unwrap();
+    let config = AcquisitionConfig {
+        resume: true,
+        ..rescue_config(&out)
+    };
+    let resumed = run(device, config).await.unwrap();
+    assert_eq!(
+        resumed.outcome,
+        Outcome::CompletedWithReadErrors,
+        "{}",
+        resumed.outcome_reason
+    );
+    let saved = std::fs::read_to_string(&map).unwrap();
+    assert!(
+        saved.contains("0x00010000  0x00000400  -"),
+        "ddrescue marked the area bad:\n{saved}"
+    );
+    let image = image_of(&resumed);
+    assert_eq!(image.len(), MIB);
+    assert!(image[0x10000..0x10400].iter().all(|b| *b == 0));
+    assert!(image[0x90000..0x90200].iter().all(|b| *b == 0));
+    assert_eq!(image[..0x10000], data[..0x10000]);
+    assert_eq!(image[0x10400..0x90000], data[0x10400..0x90000]);
+    assert_eq!(image[0x90200..], data[0x90200..]);
+    let notes = resumed.notes.join("\n");
+    assert!(
+        notes.contains("dfdisk wrote zeros over the 2 bad-sector areas of the map inside the image (1536 bytes)"),
+        "{notes}"
+    );
+    assert!(
+        notes.contains("3 sectors (512-byte) held other data before"),
+        "{notes}"
+    );
+    // The digests describe the zeros
+    let mut expected = data.clone();
+    expected[0x10000..0x10400].fill(0);
+    expected[0x90000..0x90200].fill(0);
+    assert_eq!(
+        resumed.image_hashes.md5.as_deref(),
+        Some(hex::encode(<md5::Md5 as md5::Digest>::digest(&expected)).as_str())
+    );
+}
+
 #[tokio::test]
 async fn a_resume_on_another_source_is_refused_before_anything_is_written() {
     if !ddrescue_wrapper() {

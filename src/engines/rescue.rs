@@ -3,8 +3,11 @@
 //!
 //! What the report says comes from the map only ([`ddrescue_map`]):
 //! - `+` finished: in the image as read;
-//! - `-` bad sector: zeros in the image (ddrescue never writes it), listed
-//!   as `Substituted`;
+//! - `-` bad sector: zeros in the image, listed as `Substituted`. ddrescue
+//!   never writes a bad sector, but a session killed before it saved its map
+//!   can leave data there that the map does not list as rescued; after every
+//!   ddrescue run dfdisk writes zeros over the bad-sector areas inside the
+//!   image (and fsyncs it), so the statement holds;
 //! - `?` non-tried, `*` non-trimmed, `/` non-scraped: `Unread`; the rescue is
 //!   incomplete until it is run again (resumed).
 //!
@@ -52,7 +55,7 @@ use crate::models::info_report::{
 use crate::models::outcome::{RangeKind, ReadErrorTable, VerificationResult};
 use crate::models::provenance::{DFDISK_GIT_REV, DFDISK_VERSION};
 use crate::models::telemetry::ProgressTelemetry;
-use crate::models::text::sanitize_line;
+use crate::models::text::{plural, sanitize_line};
 use chrono::{DateTime, Utc};
 use digest::Digest;
 use regex::Regex;
@@ -83,6 +86,8 @@ pub const DDRESCUE_GRACE: Duration = Duration::from_secs(30);
 const MAP_POLL: Duration = Duration::from_secs(2);
 /// Chunk size for hashing the image.
 const HASH_CHUNK: usize = 4 << 20;
+/// Chunk size for writing zeros over bad-sector areas.
+const ZERO_CHUNK: usize = 1 << 20;
 
 const NO_STREAM_DIGEST: &str = "ddrescue computes no digest while reading, so the image digests have nothing to be compared with; --verify-source compares them with a second read of the source";
 
@@ -412,6 +417,22 @@ fn finalize(map_path: &Path, image_path: &Path, expected: u64, sector_size: u32)
             image_path.display()
         ));
     }
+    // R-2: the report says bad sectors are zeros in the image; ddrescue only
+    // never writes them, so data an earlier session wrote there before its
+    // map recorded it would stay. dfdisk writes the zeros itself
+    let mut stop_reason = None;
+    let zeroed = match image_len {
+        Some(l) => match zero_bad_sectors(image_path, &map, l, sector_size) {
+            Ok(z) => z.map(|z| z.statement()),
+            Err(e) => {
+                stop_reason = Some(format!(
+                    "dfdisk could not write zeros over the bad-sector areas of the map in the image ({e}); the image may hold other data there than the zeros this report states"
+                ));
+                None
+            }
+        },
+        None => None,
+    };
     if image_len.is_some()
         && len < expected
         && map.covers(expected)
@@ -437,14 +458,111 @@ fn finalize(map_path: &Path, image_path: &Path, expected: u64, sector_size: u32)
     }
     let a = map.assess(expected, len, sector_size);
     notes.push(map_summary(&map, map_path, &a.counts));
+    notes.extend(zeroed);
     notes.extend(a.notes.iter().cloned());
     Finalized {
         bad_sectors: map.bad_sectors(sector_size),
         read_errors: a.read_errors,
         bytes_acquired: a.bytes_acquired,
-        stop_reason: None,
+        stop_reason,
         notes,
     }
+}
+
+/// What [`zero_bad_sectors`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Zeroed {
+    /// Bad-sector blocks of the map inside the image file
+    ranges: usize,
+    /// Bytes of them inside the image file (all now zeros)
+    bytes: u64,
+    /// Sectors among them that held something other than zeros before
+    sectors_with_data: u64,
+    sector_size: u32,
+}
+
+impl Zeroed {
+    fn statement(&self) -> String {
+        let what = format!(
+            "dfdisk wrote zeros over the {} of the map inside the image ({}) after ddrescue ended, so the image holds zeros there",
+            plural(self.ranges as u64, "bad-sector area", "bad-sector areas"),
+            plural(self.bytes, "byte", "bytes")
+        );
+        if self.sectors_with_data == 0 {
+            format!("{what}; none of their sectors held other data before")
+        } else {
+            format!(
+                "{what}; {} ({}-byte) held other data before, which the map does not record as rescued (an earlier session can write data before its map records it, e.g. when it is killed), and was overwritten",
+                plural(self.sectors_with_data, "sector", "sectors"),
+                self.sector_size
+            )
+        }
+    }
+}
+
+/// Write zeros over every bad-sector (`-`) block of `map` inside the image
+/// file (up to `image_len`; nothing is written beyond its end), then fsync
+/// it. ddrescue never writes a bad sector, so the image holds zeros there
+/// only if nothing else was written before: a session killed before it
+/// saved its map leaves data the map does not list as rescued, which a
+/// later session can mark bad. `None` when no bad-sector block lies inside
+/// the image.
+fn zero_bad_sectors(
+    image: &Path,
+    map: &Mapfile,
+    image_len: u64,
+    sector_size: u32,
+) -> Result<Option<Zeroed>, String> {
+    use std::os::unix::fs::FileExt;
+    let ranges: Vec<(u64, u64)> = map
+        .blocks
+        .iter()
+        .filter(|b| b.status == ddrescue_map::BlockStatus::BadSector)
+        .map(|b| (b.pos, b.end().min(image_len)))
+        .filter(|(start, end)| end > start)
+        .collect();
+    if ranges.is_empty() {
+        return Ok(None);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image)
+        .map_err(|e| format!("cannot open {}: {e}", image.display()))?;
+    let sector = u64::from(sector_size.max(1));
+    let zeros = vec![0u8; ZERO_CHUNK];
+    let mut buf = vec![0u8; ZERO_CHUNK];
+    let mut z = Zeroed {
+        ranges: ranges.len(),
+        bytes: 0,
+        sectors_with_data: 0,
+        sector_size: sector_size.max(1),
+    };
+    for (start, end) in ranges {
+        let mut offset = start;
+        while offset < end {
+            let n = (end - offset).min(ZERO_CHUNK as u64) as usize;
+            // What was there (counted per sector), then the zeros
+            if file.read_exact_at(&mut buf[..n], offset).is_ok() {
+                let mut s = offset - offset % sector;
+                while s < offset + n as u64 {
+                    let from = s.max(offset) - offset;
+                    let to = (s + sector).min(offset + n as u64) - offset;
+                    if buf[from as usize..to as usize].iter().any(|b| *b != 0) {
+                        z.sectors_with_data += 1;
+                    }
+                    s += sector;
+                }
+            }
+            file.write_all_at(&zeros[..n], offset)
+                .map_err(|e| format!("write at byte offset {offset}: {e}"))?;
+            offset += n as u64;
+            z.bytes += n as u64;
+        }
+    }
+    file.sync_all()
+        .map_err(|e| format!("fsync of {}: {e}", image.display()))?;
+    Ok(Some(z))
 }
 
 fn map_summary(map: &Mapfile, path: &Path, counts: &ddrescue_map::MapCounts) -> String {
@@ -1922,6 +2040,82 @@ mod tests {
     }
 
     #[test]
+    fn bad_sector_areas_are_zeros_in_the_image_whatever_was_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("b.map");
+        let image = dir.path().join("b.raw");
+        // BAD_MIDDLE: bad 0x10000+0x400 and 0x90000+0x200 in 1 MiB
+        std::fs::write(&map, BAD_MIDDLE).unwrap();
+        let mut data = vec![7u8; MIB as usize];
+        data[0x10000..0x10200].fill(0); // one sector of the first area already zeros
+        std::fs::write(&image, &data).unwrap();
+        let fin = finalize(&map, &image, MIB, 512);
+        let after = std::fs::read(&image).unwrap();
+        assert!(after[0x10000..0x10400].iter().all(|b| *b == 0));
+        assert!(after[0x90000..0x90200].iter().all(|b| *b == 0));
+        assert!(after[..0x10000].iter().all(|b| *b == 7));
+        assert!(after[0x10400..0x90000].iter().all(|b| *b == 7));
+        assert!(after[0x90200..].iter().all(|b| *b == 7));
+        assert_eq!(after.len(), MIB as usize);
+        assert_eq!(fin.stop_reason, None);
+        assert_eq!(fin.read_errors.substituted_bytes(), 0x600);
+        let notes = fin.notes.join("\n");
+        assert!(
+            notes.contains(
+                "dfdisk wrote zeros over the 2 bad-sector areas of the map inside the image (1536 bytes)"
+            ),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("2 sectors (512-byte) held other data before"),
+            "{notes}"
+        );
+        // Run again: nothing but zeros there now
+        let fin = finalize(&map, &image, MIB, 512);
+        assert!(
+            fin.notes
+                .join("\n")
+                .contains("none of their sectors held other data before"),
+            "{:?}",
+            fin.notes
+        );
+        // Bad areas beyond the end of an unfinished image are not written
+        std::fs::write(&image, vec![7u8; 0x10200]).unwrap();
+        let fin = finalize(&map, &image, MIB, 512);
+        let after = std::fs::read(&image).unwrap();
+        assert_eq!(after.len(), 0x10200);
+        assert!(after[0x10000..].iter().all(|b| *b == 0));
+        assert!(
+            fin.notes
+                .join("\n")
+                .contains("the 1 bad-sector area of the map inside the image (512 bytes)"),
+            "{:?}",
+            fin.notes
+        );
+    }
+
+    #[test]
+    fn an_image_that_cannot_be_zeroed_is_not_claimed_to_hold_zeros() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("b.map");
+        let image = dir.path().join("b.raw");
+        std::fs::write(&map, BAD_MIDDLE).unwrap();
+        std::fs::write(&image, vec![7u8; MIB as usize]).unwrap();
+        std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if OpenOptions::new().write(true).open(&image).is_ok() {
+            // root ignores the mode: nothing to test here
+            return;
+        }
+        let fin = finalize(&map, &image, MIB, 512);
+        let stop = fin.stop_reason.unwrap();
+        assert!(
+            stop.contains("could not write zeros over the bad-sector areas"),
+            "{stop}"
+        );
+    }
+
+    #[test]
     fn an_unfinished_or_inconsistent_image_is_never_padded() {
         let dir = tempfile::tempdir().unwrap();
         let map = dir.path().join("b.map");
@@ -2348,6 +2542,46 @@ mod tests {
         assert!(ctx.output_path(".info.json").exists());
         assert!(!ctx.output_path(".info.session-3").exists());
         assert!(!ctx.output_path(".info.session-3.json").exists());
+    }
+
+    #[tokio::test]
+    async fn data_a_killed_session_left_in_bad_areas_is_zeroed_on_resume() {
+        // R-2: the first session wrote the whole image but was killed before
+        // ddrescue saved a map listing it; the resumed session finds those
+        // areas unreadable and marks them bad without writing them
+        let tmp = tempfile::tempdir().unwrap();
+        let first = fake_ddrescue(
+            tmp.path(),
+            &format!(
+                "head -c {MIB} /dev/zero | tr '\\0' 'Z' > \"$IMG\"\nprintf '%s' '{INTERRUPTED}' > \"$MAP\"\nkill -KILL $$\n"
+            ),
+        );
+        let ctx = context(tmp.path(), MIB, false);
+        let out = acquire_with(&ctx, first.as_os_str()).await.unwrap();
+        assert!(out.stop_reason.is_some(), "{out:?}");
+        let resumed = script(
+            tmp.path(),
+            "resumed-ddrescue",
+            &format!(
+                "if [ \"$1\" = --version ]; then echo 'GNU ddrescue 1.30 (fake)'; exit 0; fi\n\
+                 for a; do MAP=\"$a\"; done\nprintf '%s' '{BAD_MIDDLE}' > \"$MAP\"\nexit 0\n"
+            ),
+        );
+        let out = acquire_with(&context_again(&ctx, true), resumed.as_os_str())
+            .await
+            .unwrap();
+        assert_eq!(out.stop_reason, None);
+        assert_eq!(out.read_errors.substituted_bytes(), 0x600);
+        let image = std::fs::read(ctx.output_path(".raw")).unwrap();
+        assert!(image[0x10000..0x10400].iter().all(|b| *b == 0));
+        assert!(image[0x90000..0x90200].iter().all(|b| *b == 0));
+        assert!(image[..0x10000].iter().all(|b| *b == b'Z'));
+        assert!(image[0x90200..].iter().all(|b| *b == b'Z'));
+        let notes = out.notes.join("\n");
+        assert!(
+            notes.contains("3 sectors (512-byte) held other data before"),
+            "{notes}"
+        );
     }
 
     #[tokio::test]
