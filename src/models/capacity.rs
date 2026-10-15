@@ -18,6 +18,10 @@ pub struct AtaCapacity {
     /// Real maximum from DCO IDENTIFY
     pub dco_real_max_sectors: Option<u64>,
     pub dco_present: Option<bool>,
+    /// Bytes per sector of these counts (the disk's logical sector size:
+    /// 512, or 4096 on a 4Kn drive); `None`: unknown, no byte figures given
+    #[serde(default)]
+    pub sector_bytes: Option<u32>,
 }
 
 /// NVMe namespace facts (`nvme id-ns -o json`), in logical blocks.
@@ -72,12 +76,20 @@ impl CapacityInfo {
     pub fn hidden_area_statements(&self) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(ata) = &self.ata {
+            // "N sectors (X KiB)" at the disk's sector size, sectors only when
+            // that is unknown
+            let sectors = |n: u64| match ata.sector_bytes {
+                Some(b) => format!(
+                    "{n} sectors ({})",
+                    format_iec(n.saturating_mul(u64::from(b)))
+                ),
+                None => format!("{n} sectors"),
+            };
             if ata.hpa_present == Some(true) {
                 match (ata.native_max_sectors, ata.current_max_sectors) {
                     (Some(native), Some(current)) if native > current => out.push(format!(
-                        "Host Protected Area: {} sectors ({}) beyond the visible end are hidden",
-                        native - current,
-                        format_iec((native - current).saturating_mul(512))
+                        "Host Protected Area: {} beyond the visible end are hidden",
+                        sectors(native - current)
                     )),
                     _ => out.push("Host Protected Area present".to_string()),
                 }
@@ -85,8 +97,8 @@ impl CapacityInfo {
             if ata.dco_present == Some(true) {
                 out.push(match (ata.dco_real_max_sectors, ata.native_max_sectors) {
                     (Some(real), Some(native)) if real > native => format!(
-                        "Device Configuration Overlay: {} sectors beyond the native maximum are hidden",
-                        real - native
+                        "Device Configuration Overlay: {} beyond the native maximum are hidden",
+                        sectors(real - native)
                     ),
                     _ => "Device Configuration Overlay present".to_string(),
                 });
@@ -123,6 +135,7 @@ mod tests {
                 hpa_present: Some(false),
                 dco_real_max_sectors: Some(100),
                 dco_present: Some(false),
+                sector_bytes: Some(512),
             }),
             ..Default::default()
         };
@@ -140,5 +153,21 @@ mod tests {
         };
         assert_eq!(hpa.hidden_area(), Some(true));
         assert!(hpa.summary().contains("2000 sectors"), "{}", hpa.summary());
+        assert!(!hpa.summary().contains("KiB"), "sector size unknown");
+
+        // Byte figures at the disk's sector size: 4Kn
+        let mut hpa4k = hpa.clone();
+        hpa4k.ata.as_mut().unwrap().sector_bytes = Some(4096);
+        hpa4k.ata.as_mut().unwrap().dco_present = Some(true);
+        hpa4k.ata.as_mut().unwrap().dco_real_max_sectors = Some(3256);
+        let s = hpa4k.hidden_area_statements().join("; ");
+        assert!(s.contains("2000 sectors (7.81 MiB)"), "{s}");
+        assert!(
+            s.contains("256 sectors (1 MiB) beyond the native maximum"),
+            "{s}"
+        );
+        let mut hpa512 = hpa;
+        hpa512.ata.as_mut().unwrap().sector_bytes = Some(512);
+        assert!(hpa512.summary().contains("2000 sectors (1000 KiB)"));
     }
 }

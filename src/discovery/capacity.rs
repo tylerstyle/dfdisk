@@ -289,7 +289,10 @@ async fn probe_ata(
         info.method
             .push_str("; sent through a USB bridge, which may not pass ATA commands on");
     }
-    let mut ata = AtaCapacity::default();
+    let mut ata = AtaCapacity {
+        sector_bytes: u32::try_from(logical).ok(),
+        ..Default::default()
+    };
 
     if is_stopped(control) {
         info.errors.push("aborted before the capacity probe".into());
