@@ -1,7 +1,10 @@
 //! The one way dfdisk runs external tools (D5).
 //!
 //! Every child runs with `LC_ALL=C` and `LANG=C` (parsable, untranslated
-//! output), in its own process group, with stdin from /dev/null. Standard
+//! output), in its own process group, with stdin from /dev/null, and gets
+//! SIGTERM when dfdisk dies however it dies (SIGKILL, OOM, a crash:
+//! `PR_SET_PDEATHSIG`), so no tool keeps reading the source after the process
+//! that holds its exclusive claim and writes its report is gone. Standard
 //! output and standard error are both read, split into bounded lines (on `\n`,
 //! `\r` and `\r\n`) and delivered to a callback with their stream. A timer
 //! (not the arrival of output) polls the abort flags and the timeout and
@@ -571,6 +574,30 @@ async fn pump<R>(
     }
 }
 
+/// Between fork and exec in the child: SIGTERM when the parent `parent`
+/// dies (`PR_SET_PDEATHSIG`), and no start at all when it died before that
+/// was set (the child was re-parented). Only async-signal-safe calls, no
+/// allocation.
+fn die_with_parent(parent: libc::pid_t) -> io::Result<()> {
+    // SAFETY: prctl(PR_SET_PDEATHSIG) and getppid are async-signal-safe
+    // system calls without pointers
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if libc::getppid() != parent {
+            return Err(io::Error::from_raw_os_error(libc::ESRCH));
+        }
+    }
+    Ok(())
+}
+
+/// This process' id as the child sees its parent.
+fn own_pid() -> libc::pid_t {
+    // SAFETY: getpid has no preconditions
+    unsafe { libc::getpid() }
+}
+
 /// Run `spec`, delivering every output line and timer tick to `on_event`.
 /// `Err` only when the program could not be started (the attempt is still
 /// recorded); a non-zero exit, a signal, an abort or a timeout are reported
@@ -596,6 +623,11 @@ where
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .process_group(0);
+    let parent = own_pid();
+    // SAFETY: the closure only makes async-signal-safe system calls
+    unsafe {
+        cmd.pre_exec(move || die_with_parent(parent));
+    }
     if let Some(dir) = &spec.current_dir {
         cmd.current_dir(dir);
     }
@@ -737,6 +769,11 @@ pub fn run_blocking(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    let parent = own_pid();
+    // SAFETY: the closure only makes async-signal-safe system calls
+    unsafe {
+        cmd.pre_exec(move || die_with_parent(parent));
+    }
     if let Some(dir) = &spec.current_dir {
         cmd.current_dir(dir);
     }
@@ -1200,5 +1237,106 @@ mod tests {
             ),
             None
         );
+    }
+
+    // ---- the tool dies with dfdisk (PR_SET_PDEATHSIG) ----
+
+    const PDEATH_PIDFILE: &str = "DFDISK_TEST_PDEATH_PIDFILE";
+    const PDEATH_ASYNC: &str = "DFDISK_TEST_PDEATH_ASYNC";
+
+    /// Run in a child process by `tools_die_with_dfdisk` (a stand-in for a
+    /// dfdisk process): starts a tool that would run for a minute and waits
+    /// for it. Does nothing in a normal test run.
+    #[test]
+    fn pdeath_helper() {
+        let Some(pidfile) = std::env::var_os(PDEATH_PIDFILE) else {
+            return;
+        };
+        let script = format!(
+            "echo $$ > '{}'; exec sleep 60",
+            std::path::Path::new(&pidfile).display()
+        );
+        let spec = sh(&script).timeout(Duration::from_secs(90));
+        if std::env::var_os(PDEATH_ASYNC).is_some() {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _ = rt.block_on(run_collect(&spec, &StopControl::none(), None));
+        } else {
+            let _ = run_blocking(&spec, None);
+        }
+    }
+
+    /// The process is alive (a zombie is not: it has ended).
+    fn alive(pid: i32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => false,
+            Ok(stat) => !matches!(
+                stat.rsplit_once(") ")
+                    .and_then(|(_, rest)| rest.chars().next()),
+                Some('Z') | Some('X') | None
+            ),
+        }
+    }
+
+    /// A "dfdisk" killed with SIGKILL (no handler runs) while its tool runs:
+    /// the tool gets SIGTERM and ends instead of running on unsupervised.
+    fn tool_dies_with_parent(async_runner: bool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("tool.pid");
+        let mut helper = std::process::Command::new(std::env::current_exe().unwrap());
+        helper
+            .args([
+                "engines::process::tests::pdeath_helper",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(PDEATH_PIDFILE, &pidfile)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if async_runner {
+            helper.env(PDEATH_ASYNC, "1");
+        }
+        let mut helper = helper.spawn().unwrap();
+        let mut pid = None;
+        for _ in 0..400 {
+            if let Some(p) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|t| t.trim().parse::<i32>().ok())
+            {
+                pid = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let Some(pid) = pid else {
+            let _ = helper.kill();
+            panic!("the helper never started its tool");
+        };
+        assert!(alive(pid));
+        helper.kill().unwrap();
+        helper.wait().unwrap();
+        let gone = (0..200).any(|_| {
+            let a = alive(pid);
+            if a {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            !a
+        });
+        if !gone {
+            // SAFETY: ending the stray test process
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(
+            gone,
+            "the tool (pid {pid}) kept running after its parent was killed"
+        );
+    }
+
+    #[test]
+    fn tools_die_with_dfdisk() {
+        tool_dies_with_parent(false);
+        tool_dies_with_parent(true);
     }
 }
