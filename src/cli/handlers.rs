@@ -1,17 +1,18 @@
 //! `dfdisk list`, `unmount`, `verify` and `convert` (§15). `acquire` and
 //! `check` live in [`crate::cli::acquire`].
 
-use crate::cli::acquire::{compression_of, error_json, more_severe, split_of};
+use crate::cli::acquire::{compression_of, split_of};
 use crate::cli::args::{CliImageFormat, ConvertArgs, ListArgs, UnmountArgs, VerifyArgs};
 use crate::cli::console::{progress_line, Console, ProgressPrinter};
-use crate::cli::drive::{drive, next_signal, report_signal, with_signals, Activity};
+use crate::cli::drive::{drive, with_signals, Activity};
 use crate::cli::resolve::{resolve_argument, ResolvedSource};
 use crate::discovery::{identity, safety, smart, DeviceScanner};
 use crate::engines::converter;
-use crate::engines::pieces::{self, PiecesReport};
 use crate::engines::process::StopControl;
-use crate::engines::verify::{self, CheckStatus, ExpectedHashes, VerifyEvent, VerifyOptions};
-use crate::engines::{AcquisitionError, ErrorKind};
+use crate::engines::verify::{
+    self, CheckStatus, ExpectedHashes, ImageVerification, VerifyEvent, VerifyOptions,
+};
+use crate::engines::AcquisitionError;
 use crate::models::case::CaseMetadata;
 use crate::models::config::SmartPolicy;
 use crate::models::conversion::{ConversionRequest, ConversionTarget};
@@ -24,8 +25,6 @@ use crate::models::text::{format_iec, sanitize_line};
 use crate::signals::{AbortController, SignalListener};
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -255,104 +254,6 @@ pub async fn handle_unmount(args: UnmountArgs, console: &Console) -> Result<i32,
 // verify
 // ---------------------------------------------------------------------------
 
-/// The files of a RAW image in order: the file itself, or for a numbered
-/// segment (`.001`, `.000`) it and every following segment that exists.
-/// Starting in the middle of a family is a usage error.
-pub fn raw_image_files(image: &Path) -> Result<Vec<PathBuf>, AcquisitionError> {
-    let ext = image
-        .extension()
-        .map(|e| e.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if ext.len() < 2 || !ext.bytes().all(|b| b.is_ascii_digit()) {
-        return Ok(vec![image.to_path_buf()]);
-    }
-    let width = ext.len();
-    let first: u64 = ext.parse().unwrap_or(0);
-    let segment = |n: u64| image.with_extension(format!("{n:0width$}"));
-    if first > 0 && segment(first - 1).exists() {
-        return Err(AcquisitionError::usage(format!(
-            "{} is not the first segment of its split image ({} exists); give the first one",
-            image.display(),
-            segment(first - 1).display()
-        )));
-    }
-    let mut files = Vec::new();
-    let mut n = first;
-    while segment(n).is_file() {
-        files.push(segment(n));
-        n += 1;
-    }
-    if files.is_empty() {
-        files.push(image.to_path_buf());
-    }
-    Ok(files)
-}
-
-/// The exit code of a verification and an optional piece check: a mismatch
-/// anywhere is 5, a failure 4, a successful comparison 0, and nothing
-/// compared at all 9 (decision 1), never 0.
-pub fn verify_exit_code(
-    hashes: &VerificationResult,
-    pieces: Option<&Result<PiecesReport, AcquisitionError>>,
-) -> i32 {
-    let hash_code = match hashes {
-        VerificationResult::Matched { .. } => exit_code::VERIFIED,
-        VerificationResult::Mismatched { .. } => exit_code::MISMATCH,
-        VerificationResult::Failed { .. } => exit_code::FAILED,
-        VerificationResult::NotPossible { .. } => exit_code::UNVERIFIED,
-    };
-    let Some(pieces) = pieces else {
-        return hash_code;
-    };
-    let piece_code = match pieces {
-        Err(e) => e.exit_code(),
-        Ok(r) if !r.mismatches.is_empty() => exit_code::MISMATCH,
-        Ok(r) if r.all_match() => exit_code::VERIFIED,
-        Ok(_) => exit_code::FAILED, // no piece was checked
-    };
-    if hash_code == exit_code::UNVERIFIED {
-        // The pieces were the only comparison
-        return piece_code;
-    }
-    more_severe(hash_code, piece_code)
-}
-
-/// The piece check, line by line.
-pub fn pieces_summary(r: &Result<PiecesReport, AcquisitionError>) -> Vec<String> {
-    match r {
-        Err(e) => vec![format!(
-            "Pieces: the piece check did not complete ({}): {}",
-            e.kind.label(),
-            e.message
-        )],
-        Ok(p) if p.pieces_checked == 0 => vec![format!(
-            "Pieces: no piece was checked against {}",
-            p.pieces_file.display()
-        )],
-        Ok(p) if p.mismatches.is_empty() => vec![format!(
-            "Pieces: all {} pieces ({} bytes) match {}",
-            p.pieces_checked,
-            p.bytes_checked,
-            p.pieces_file.display()
-        )],
-        Ok(p) => {
-            let mut l = vec![format!(
-                "Pieces: {} of {} pieces DIFFER from {}",
-                p.mismatches.len(),
-                p.pieces_checked,
-                p.pieces_file.display()
-            )];
-            for m in &p.mismatches {
-                l.push(format!(
-                    "  piece {} at offset {} ({} bytes): expected {}, computed {}",
-                    m.index, m.offset, m.length, m.expected_sha256, m.computed_sha256
-                ));
-            }
-            l
-        }
-    }
-}
-
 fn progress_interval(console: &Console) -> Duration {
     if console.progress_redraws() {
         Duration::from_millis(250)
@@ -378,7 +279,27 @@ fn verify_progress(done: u64, total: u64, speed: f64) -> ProgressTelemetry {
     }
 }
 
+/// The last line of `dfdisk verify`: PASSED only when something was
+/// compared and everything matched (exit 0); nothing compared is exit 9
+/// (decision 1), never a pass.
+pub fn verify_verdict(v: &ImageVerification) -> String {
+    match &v.result {
+        VerificationResult::Matched { .. } if v.exit_code == exit_code::VERIFIED => {
+            "VERIFICATION RESULT: PASSED (every expected value matches)".to_string()
+        }
+        VerificationResult::Mismatched { .. } => {
+            "VERIFICATION RESULT: FAILED (HASH MISMATCH)".to_string()
+        }
+        VerificationResult::Failed { reason } => format!("VERIFICATION RESULT: FAILED ({reason})"),
+        _ => "VERIFICATION RESULT: NOT VERIFIED (digests computed, nothing to compare against)"
+            .to_string(),
+    }
+}
+
 /// `dfdisk verify <image> [--md5 ..] [--report <info.json>] [--pieces <tsv>]`.
+/// One verification ([`verify::verify_image`]) covers the digests and the
+/// pieces file: both are in its verdict, its exit code, the addendum and the
+/// audit record.
 pub async fn handle_verify(
     args: VerifyArgs,
     controller: &AbortController,
@@ -390,21 +311,6 @@ pub async fn handle_verify(
         None => ExpectedHashes::given(args.md5.clone(), args.sha1.clone(), args.sha256.clone()),
     };
     let ewf = verify::is_ewf_image_file(&args.image);
-    let piece_files = match &args.pieces {
-        Some(_) if ewf => {
-            return Err(AcquisitionError::usage(
-                "--pieces applies to RAW images (the pieces describe the RAW byte stream); an EWF image is checked through its digests",
-            ))
-        }
-        Some(tsv) if !tsv.is_file() => {
-            return Err(AcquisitionError::usage(format!(
-                "pieces file not found: {}",
-                tsv.display()
-            )))
-        }
-        Some(_) => Some(raw_image_files(&args.image)?),
-        None => None,
-    };
     console.say(&format!(
         "[*] Verifying {} ({})",
         args.image.display(),
@@ -417,6 +323,11 @@ pub async fn handle_verify(
     if !expected.is_empty() {
         console.say(&format!("    expected digests from {}", expected.source));
     }
+    let mut options = VerifyOptions::recorded();
+    if let Some(tsv) = &args.pieces {
+        console.say(&format!("    pieces file {}", tsv.display()));
+        options = options.with_pieces(tsv.clone());
+    }
 
     let stop = controller.stop_flags();
     let interval = progress_interval(console);
@@ -425,7 +336,7 @@ pub async fn handle_verify(
         verify::verify_image(
             &args.image,
             &expected,
-            &VerifyOptions::recorded(),
+            &options,
             &stop,
             |event| match event {
                 VerifyEvent::Progress(p) => {
@@ -450,55 +361,13 @@ pub async fn handle_verify(
     .await;
     console.end_progress();
     let v = verification?;
-
-    let pieces_result = match (&args.pieces, piece_files) {
-        (Some(tsv), Some(files)) => {
-            Some(check_pieces(files, tsv.clone(), controller, listener, console).await)
-        }
-        _ => None,
-    };
-    if let Some(Err(e)) = &pieces_result {
-        if e.kind == ErrorKind::Aborted {
-            return Err(e.clone());
-        }
-    }
-
-    let code = more_severe(
-        v.exit_code,
-        verify_exit_code(&v.result, pieces_result.as_ref()),
-    );
-    let compared = matches!(v.result, VerificationResult::Matched { .. })
-        || matches!(&pieces_result, Some(Ok(p)) if p.all_match());
-    let verdict = match code {
-        exit_code::VERIFIED if compared => {
-            "VERIFICATION RESULT: PASSED (every expected value matches)".to_string()
-        }
-        exit_code::MISMATCH => "VERIFICATION RESULT: FAILED (HASH MISMATCH)".to_string(),
-        exit_code::FAILED => format!(
-            "VERIFICATION RESULT: FAILED ({})",
-            match &v.result {
-                VerificationResult::Failed { reason } => reason.clone(),
-                _ => "the piece check did not complete".into(),
-            }
-        ),
-        _ => "VERIFICATION RESULT: NOT VERIFIED (digests computed, nothing to compare against)"
-            .to_string(),
-    };
+    let code = v.exit_code;
+    let verdict = verify_verdict(&v);
 
     if console.json() {
-        let (pieces, pieces_error) = match &pieces_result {
-            Some(Ok(p)) => (
-                serde_json::to_value(p).unwrap_or_default(),
-                serde_json::Value::Null,
-            ),
-            Some(Err(e)) => (serde_json::Value::Null, error_json(e)["error"].clone()),
-            None => (serde_json::Value::Null, serde_json::Value::Null),
-        };
         console.data(
             &serde_json::to_string_pretty(&json!({
                 "verification": v,
-                "pieces": pieces,
-                "pieces_error": pieces_error,
                 "exit_code": code,
             }))
             .unwrap_or_default(),
@@ -523,11 +392,9 @@ pub async fn handle_verify(
         };
         console.data(&line);
     }
-    if let Some(p) = &pieces_result {
-        for line in pieces_summary(p) {
-            console.data(&line);
-        }
-        console.data("  (the piece check is not part of the addendum and audit record above)");
+    if let Some(p) = &v.pieces {
+        let mark = if p.all_match() { "+" } else { "!" };
+        console.data(&format!("  [{mark}] Pieces: {}", p.details(20)));
     }
     for w in &v.warnings {
         console.note(&format!("[!] WARNING: {w}"));
@@ -537,56 +404,6 @@ pub async fn handle_verify(
     }
     console.data(&format!("\n{verdict}\nExit code: {code}"));
     Ok(code)
-}
-
-/// The piece check on a blocking thread, printing progress and signals.
-async fn check_pieces(
-    files: Vec<PathBuf>,
-    tsv: PathBuf,
-    controller: &AbortController,
-    listener: &mut Option<SignalListener>,
-    console: &Console,
-) -> Result<PiecesReport, AcquisitionError> {
-    let total: u64 = files
-        .iter()
-        .filter_map(|f| std::fs::metadata(f).ok())
-        .map(|m| m.len())
-        .sum();
-    console.note(&format!(
-        "[*] Checking {} file(s) against {}",
-        files.len(),
-        tsv.display()
-    ));
-    let done = Arc::new(AtomicU64::new(0));
-    let abort = controller.abort_flag();
-    let progress = done.clone();
-    let task = tokio::task::spawn_blocking(move || {
-        pieces::verify_pieces(&files, &tsv, &abort, |n| {
-            progress.store(n, Ordering::Relaxed);
-        })
-    });
-    tokio::pin!(task);
-    let mut tick = tokio::time::interval(progress_interval(console));
-    tick.tick().await;
-    let t0 = Instant::now();
-    let result = loop {
-        tokio::select! {
-            r = &mut task => break r,
-            _ = tick.tick() => {
-                let n = done.load(Ordering::Relaxed);
-                let secs = t0.elapsed().as_secs_f64();
-                let speed = if secs > 0.0 { n as f64 / secs } else { 0.0 };
-                if let Some(line) = progress_line(&verify_progress(n, total, speed)) {
-                    console.progress(&line);
-                }
-            }
-            (kind, action) = next_signal(listener) => {
-                report_signal(console, kind, action, Activity::Verification);
-            }
-        }
-    };
-    console.end_progress();
-    result.map_err(|e| AcquisitionError::failed(format!("the piece check stopped: {e}")))?
 }
 
 // ---------------------------------------------------------------------------
@@ -719,84 +536,7 @@ pub async fn handle_convert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::pieces::PieceMismatch;
     use crate::models::device::{DeviceSafety, Partition};
-
-    #[test]
-    fn split_raw_families_are_collected_from_the_first_segment() {
-        let tmp = tempfile::tempdir().unwrap();
-        let single = tmp.path().join("img.raw");
-        assert_eq!(raw_image_files(&single).unwrap(), vec![single.clone()]);
-        for n in 1..=3 {
-            std::fs::write(tmp.path().join(format!("split.{n:03}")), b"x").unwrap();
-        }
-        let files = raw_image_files(&tmp.path().join("split.001")).unwrap();
-        assert_eq!(files.len(), 3);
-        assert!(files[2].ends_with("split.003"));
-        let e = raw_image_files(&tmp.path().join("split.002")).unwrap_err();
-        assert_eq!(e.exit_code(), 2);
-        // A missing first segment is passed on (the checker reports it)
-        let missing = tmp.path().join("other.001");
-        assert_eq!(raw_image_files(&missing).unwrap(), vec![missing]);
-    }
-
-    fn report(checked: u64, mismatches: usize) -> Result<PiecesReport, AcquisitionError> {
-        Ok(PiecesReport {
-            pieces_file: "x.pieces.tsv".into(),
-            pieces_checked: checked,
-            bytes_checked: checked << 20,
-            mismatches: (0..mismatches as u64)
-                .map(|i| PieceMismatch {
-                    index: i,
-                    offset: i << 20,
-                    length: 1 << 20,
-                    expected_sha256: "a".into(),
-                    computed_sha256: "b".into(),
-                    bytes_present: 1 << 20,
-                })
-                .collect(),
-            mismatch_count: mismatches as u64,
-            covered_bytes: checked << 20,
-            image_bytes: checked << 20,
-        })
-    }
-
-    #[test]
-    fn verify_exit_codes_never_pass_without_a_comparison() {
-        let matched = VerificationResult::Matched { method: "m".into() };
-        let nothing = VerificationResult::NotPossible { reason: "r".into() };
-        let mismatch = VerificationResult::Mismatched {
-            method: "m".into(),
-            details: "d".into(),
-        };
-        let failed = VerificationResult::Failed { reason: "r".into() };
-        assert_eq!(verify_exit_code(&matched, None), 0);
-        assert_eq!(verify_exit_code(&nothing, None), 9, "decision 1");
-        assert_eq!(verify_exit_code(&mismatch, None), 5);
-        assert_eq!(verify_exit_code(&failed, None), 4);
-        // Pieces as the only comparison
-        assert_eq!(verify_exit_code(&nothing, Some(&report(4, 0))), 0);
-        assert_eq!(verify_exit_code(&nothing, Some(&report(4, 1))), 5);
-        assert_eq!(verify_exit_code(&nothing, Some(&report(0, 0))), 4);
-        assert_eq!(
-            verify_exit_code(&nothing, Some(&Err(AcquisitionError::failed("x")))),
-            4
-        );
-        // Both
-        assert_eq!(verify_exit_code(&matched, Some(&report(4, 0))), 0);
-        assert_eq!(verify_exit_code(&matched, Some(&report(4, 2))), 5);
-        assert_eq!(verify_exit_code(&mismatch, Some(&report(4, 0))), 5);
-        assert_eq!(verify_exit_code(&failed, Some(&report(4, 1))), 5);
-        assert_eq!(
-            verify_exit_code(&matched, Some(&Err(AcquisitionError::aborted("x")))),
-            8
-        );
-        let lines = pieces_summary(&report(4, 2));
-        assert!(lines[0].contains("2 of 4 pieces DIFFER"), "{lines:?}");
-        assert_eq!(lines.len(), 3);
-        assert!(pieces_summary(&report(4, 0))[0].contains("all 4 pieces"));
-        assert!(pieces_summary(&report(0, 0))[0].contains("no piece was checked"));
-    }
 
     #[test]
     fn device_table_shows_full_serials_partitions_and_badges() {

@@ -665,7 +665,7 @@ fn verify_exit_codes() {
     let v: serde_json::Value = serde_json::from_str(&text(&json).0).unwrap();
     assert_eq!(v["exit_code"], 0);
     assert_eq!(v["verification"]["result"]["status"], "matched");
-    assert!(v["pieces"].is_null());
+    assert!(v["verification"]["pieces"].is_null());
 
     // Missing image: usage
     let missing = run(&["verify", "/nonexistent/image.raw", "--md5", &md5]);
@@ -837,25 +837,55 @@ fn verify_pieces_finds_the_changed_piece() {
         let v: serde_json::Value = serde_json::from_str(&text(&o).0).unwrap();
         (o.status.code(), v)
     };
+    // The pieces alone are a comparison: exit 0, never a stub's 4
     let (code, v) = verify(&[]);
-    if v["pieces_error"]["message"]
-        .as_str()
-        .is_some_and(|m| m.contains("not implemented"))
-    {
-        // This build has no piece checker yet: it must fail, never pass
-        assert_eq!(code, Some(4), "{v}");
-        return;
-    }
     assert_eq!(code, Some(0), "the pieces were the comparison: {v}");
-    assert_eq!(v["pieces"]["pieces_checked"], 3, "{v}");
+    let pieces = &v["verification"]["pieces"];
+    assert_eq!(pieces["pieces_checked"], 3, "{v}");
+    assert_eq!(pieces["mismatch_count"], 0, "{v}");
+    assert_eq!(pieces["covered_bytes"], 3 << 20, "{v}");
+    assert_eq!(v["verification"]["result"]["status"], "matched", "{v}");
+    assert!(
+        v["verification"]["method"]
+            .as_str()
+            .unwrap()
+            .contains("piecewise SHA-256 (3 pieces"),
+        "{v}"
+    );
+    // The addendum names the piece check
+    let addendum = v["verification"]["addendum"].as_str().unwrap();
+    let text = std::fs::read_to_string(addendum).unwrap();
+    assert!(text.contains("Pieces File"), "{text}");
     let (code, _) = verify(&["--sha256", &sha256]);
     assert_eq!(code, Some(0));
 
-    // One changed byte in the second piece
+    // One changed byte in the second piece: a mismatch even when the
+    // whole-image digest is not given
     let mut bad = data.clone();
     bad[(1 << 20) + 5] ^= 0x55;
     std::fs::write(&image, &bad).unwrap();
     let (code, v) = verify(&[]);
     assert_eq!(code, Some(5), "{v}");
-    assert_eq!(v["pieces"]["mismatches"][0]["index"], 1, "{v}");
+    let pieces = &v["verification"]["pieces"];
+    assert_eq!(pieces["mismatch_count"], 1, "{v}");
+    assert_eq!(pieces["mismatches"][0]["index"], 1, "{v}");
+    assert!(
+        v["verification"]["result"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("piece 1 (bytes 1048576-2097151)"),
+        "{v}"
+    );
+
+    // A pieces file that does not cover the whole image is a mismatch
+    std::fs::write(&image, [data.as_slice(), b"tail"].concat()).unwrap();
+    let (code, v) = verify(&[]);
+    assert_eq!(code, Some(5), "{v}");
+    assert!(
+        v["verification"]["result"]["details"]
+            .as_str()
+            .unwrap()
+            .contains("4 bytes after the last piece"),
+        "{v}"
+    );
 }

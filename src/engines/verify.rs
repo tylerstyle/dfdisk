@@ -461,25 +461,24 @@ impl ImageVerification {
             row(
                 "Pieces Checked",
                 &format!(
-                    "{} ({}), {} mismatching",
+                    "{} ({} of the image's {}), {} differing",
                     plural(p.pieces_checked, "piece", "pieces"),
-                    format_iec(p.bytes_checked),
-                    p.mismatches.len()
+                    format_iec(p.covered_bytes),
+                    format_iec(p.image_bytes),
+                    p.mismatch_count
                 ),
             );
+            row("Pieces Result", &p.summary());
             for m in p.mismatches.iter().take(50) {
-                row(
-                    &format!("Piece {}", m.index),
-                    &format!(
-                        "MISMATCH at offset {} length {}: expected {}, computed {}",
-                        m.offset, m.length, m.expected_sha256, m.computed_sha256
-                    ),
-                );
+                row(&format!("Piece {}", m.index), &m.describe());
             }
-            if p.mismatches.len() > 50 {
+            if p.mismatch_count > 50 {
                 row(
                     "Pieces",
-                    &format!("... {} more mismatching pieces", p.mismatches.len() - 50),
+                    &format!(
+                        "... {} more differing pieces not listed here",
+                        p.mismatch_count - p.mismatches.len().min(50) as u64
+                    ),
                 );
             }
         }
@@ -533,7 +532,9 @@ impl ImageVerification {
                     "file": p.pieces_file.to_string_lossy(),
                     "checked": p.pieces_checked,
                     "bytes_checked": p.bytes_checked,
-                    "mismatches": p.mismatches.len(),
+                    "covered_bytes": p.covered_bytes,
+                    "image_bytes": p.image_bytes,
+                    "mismatches": p.mismatch_count,
                 }),
             );
         }
