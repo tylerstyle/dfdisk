@@ -47,6 +47,17 @@ impl CompressionLevel {
     }
 }
 
+/// The largest E01 segment size (`-S`, bytes) libewf's ewfacquire accepts
+/// for the EnCase 6 format, measured with libewf 20231119 and 20140816
+/// (`-S 9223372036854775806B` is applied; `9223372036854775807B`, i.e.
+/// INT64_MAX, is refused with "Unsupported maximum segment size defaulting
+/// to: 1572864000"). `SplitSize::None` passes it: one segment for any
+/// source smaller than 8 EiB.
+pub const EWF_MAX_SEGMENT_BYTES: u64 = 9_223_372_036_854_775_806;
+/// The smallest E01 segment size libewf accepts (1 MiB; smaller values are
+/// replaced by 1.4 GiB, measured).
+pub const EWF_MIN_SEGMENT_BYTES: u64 = 1 << 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SplitSize {
     None,
@@ -68,7 +79,8 @@ impl SplitSize {
 
     pub fn as_ewf_arg(&self) -> String {
         match self {
-            SplitSize::None => "7900G".to_string(), // Unlimited (EnCase 6 max)
+            // One segment: the EnCase 6 maximum both libewf lines accept
+            SplitSize::None => format!("{EWF_MAX_SEGMENT_BYTES}B"),
             SplitSize::TwoGb => "2048M".to_string(),
             SplitSize::FourGb => "4096M".to_string(),
             SplitSize::Custom(b) => format!("{}B", b),
@@ -439,6 +451,13 @@ impl AcquisitionConfig {
                     .to_string(),
             );
         }
+        if let SplitSize::Custom(b) = self.split_size {
+            if engine == EngineKind::Ewf {
+                if let Err(e) = check_segment_bytes(b) {
+                    errors.push(e);
+                }
+            }
+        }
         if let Some(p) = self.piece_size {
             if p < MIN_PIECE_SIZE || p % 512 != 0 {
                 errors.push(format!(
@@ -471,6 +490,19 @@ impl AcquisitionConfig {
         } else {
             Err(format!("Inconsistent options: {}", errors.join("; ")))
         }
+    }
+}
+
+/// An E01 segment size libewf applies as given: between
+/// [`EWF_MIN_SEGMENT_BYTES`] and [`EWF_MAX_SEGMENT_BYTES`] (ewfacquire
+/// silently replaces any other value with 1.4 GiB).
+pub fn check_segment_bytes(bytes: u64) -> Result<(), String> {
+    if (EWF_MIN_SEGMENT_BYTES..=EWF_MAX_SEGMENT_BYTES).contains(&bytes) {
+        Ok(())
+    } else {
+        Err(format!(
+            "the E01 segment size must be between {EWF_MIN_SEGMENT_BYTES} bytes (1 MiB) and {EWF_MAX_SEGMENT_BYTES} bytes (got {bytes}); libewf replaces any other value with 1.4 GiB"
+        ))
     }
 }
 
@@ -709,6 +741,25 @@ impl EffectiveConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_split_passes_the_largest_segment_size_libewf_accepts() {
+        assert_eq!(SplitSize::None.as_ewf_arg(), "9223372036854775806B");
+        assert_eq!(SplitSize::TwoGb.as_ewf_arg(), "2048M");
+        assert_eq!(SplitSize::Custom(1 << 20).as_ewf_arg(), "1048576B");
+        assert!(check_segment_bytes(EWF_MAX_SEGMENT_BYTES).is_ok());
+        assert!(check_segment_bytes(EWF_MIN_SEGMENT_BYTES).is_ok());
+        assert!(check_segment_bytes(EWF_MAX_SEGMENT_BYTES + 1).is_err());
+        assert!(check_segment_bytes((1 << 20) - 1).is_err());
+        let mut c = AcquisitionConfig::ewf("/out");
+        c.split_size = SplitSize::Custom(4096);
+        let e = c.validate().unwrap_err();
+        assert!(e.contains("between 1048576 bytes"), "{e}");
+        c.split_size = SplitSize::Custom(u64::MAX);
+        assert!(c.validate().is_err());
+        c.split_size = SplitSize::Custom(650 << 20);
+        assert!(c.validate().is_ok());
+    }
 
     fn raw() -> AcquisitionConfig {
         AcquisitionConfig {

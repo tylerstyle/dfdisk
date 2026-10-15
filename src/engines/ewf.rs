@@ -298,6 +298,9 @@ pub struct EwfacquireReport {
     pub retries_applied: Option<u32>,
     /// "Unsupported sector error granularity defaulting to: N."
     pub granularity_applied: Option<u32>,
+    /// "Unsupported maximum segment size defaulting to: N." (bytes): the
+    /// segment size ewfacquire applied instead of `-S`
+    pub segment_bytes_applied: Option<u64>,
     /// Other standard-error lines (errors, warnings)
     pub diagnostics: Vec<String>,
 }
@@ -324,6 +327,10 @@ impl EwfacquireParser {
                 number_after(t, "Unsupported sector error granularity defaulting to:")
             {
                 r.granularity_applied = u32::try_from(n).ok();
+            } else if let Some(n) =
+                number_after(t, "Unsupported maximum segment size defaulting to:")
+            {
+                r.segment_bytes_applied = Some(n);
             } else if !t.is_empty() && r.diagnostics.len() < MAX_DIAGNOSTICS {
                 r.diagnostics.push(t.to_string());
             }
@@ -1146,6 +1153,17 @@ pub fn assemble(f: &EwfFacts) -> Result<EngineOutput, AcquisitionError> {
     // Applied settings
     let mut applied = f.requested.clone();
     if let Some(s) = applied.as_mut() {
+        if let Some(b) = a.segment_bytes_applied {
+            if Some(b) != s.segment_bytes {
+                notes.push(format!(
+                    "ewfacquire did not accept the segment size {} and applied segments of {} ({b} bytes)",
+                    s.segment_size,
+                    format_iec(b)
+                ));
+                s.segment_bytes = Some(b);
+                s.segment_size = format!("{} ({b} bytes, applied by ewfacquire)", format_iec(b));
+            }
+        }
         if let Some(r) = a.retries_applied {
             if r != s.retries {
                 notes.push(format!(
@@ -2797,6 +2815,40 @@ mod tests {
             .map(|p| p.extension().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["E01", "E02", "E99", "EAA", "EAB", "EZZ", "FAA"]);
+    }
+
+    #[test]
+    fn a_segment_size_ewfacquire_refused_is_recorded_as_applied() {
+        // libewf 20231119 and 20140816 on -S 9223372036854775807B (measured)
+        let r = parse_ewfacquire(
+            "ewfacquire: SUCCESS\n",
+            "Unsupported maximum segment size defaulting to: 1572864000.\n",
+        );
+        assert_eq!(r.segment_bytes_applied, Some(1_572_864_000));
+        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+        let mut f = facts("", "clean", None, None, 0);
+        f.acquire.segment_bytes_applied = Some(1_572_864_000);
+        let out = assemble(&f).unwrap();
+        let Some(EngineSettings::Ewf(s)) = &out.settings else {
+            panic!("{:?}", out.settings)
+        };
+        assert_eq!(s.segment_bytes, Some(1_572_864_000));
+        assert!(
+            s.segment_size.contains("applied by ewfacquire"),
+            "{}",
+            s.segment_size
+        );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("did not accept the segment size 2.0 GiB")),
+            "{:?}",
+            out.notes
+        );
+        // The same size as requested: nothing to say
+        f.acquire.segment_bytes_applied = Some(2048 * MIB);
+        let out = assemble(&f).unwrap();
+        assert!(!out.notes.iter().any(|n| n.contains("segment size")));
     }
 
     #[test]

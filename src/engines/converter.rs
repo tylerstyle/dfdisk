@@ -46,7 +46,7 @@ use crate::engines::process::{self, ProcessEvent, ProcessOutcome, ProcessSpec, S
 use crate::engines::progress::ProgressSink;
 use crate::models::case::{check_filename_length, sanitize_header, CaseMetadata};
 use crate::models::config::{
-    CompressionLevel, EngineKind, HashAlgorithm, HashSelection, SplitSize,
+    check_segment_bytes, CompressionLevel, EngineKind, HashAlgorithm, HashSelection, SplitSize,
 };
 use crate::models::conversion::{
     ConversionReport, ConversionRequest, ConversionSettings, ConversionTarget, DigestComparison,
@@ -81,8 +81,6 @@ const INFO_TIMEOUT: Duration = Duration::from_secs(600);
 const HASH_BUFFER: usize = 4 << 20;
 /// Lines of tool output kept for parsing.
 const MAX_KEPT_LINES: usize = 20_000;
-/// libewf's smallest segment size.
-const MIN_SEGMENT_BYTES: u64 = 1 << 20;
 /// ewfexport's list of the sectors it could not read (libewf 20140816 and
 /// 20231119), followed by "total number:" and "at sector(s):" lines.
 const EXPORT_ERRORS_TITLE: &str = "Read errors during export";
@@ -1449,10 +1447,8 @@ async fn plan(
     })?;
     check_filename_length(&base_name, LONGEST_CONVERSION_SUFFIX.len()).map_err(usage)?;
     if let SplitSize::Custom(b) = req.split_size {
-        if req.target == ConversionTarget::E01 && b < MIN_SEGMENT_BYTES {
-            return Err(usage(format!(
-                "segment size {b} bytes is below libewf's minimum of 1 MiB"
-            )));
+        if req.target == ConversionTarget::E01 {
+            check_segment_bytes(b).map_err(usage)?;
         }
     }
 
