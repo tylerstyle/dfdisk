@@ -249,7 +249,8 @@ until it is acknowledged; when the TUI ends before a result was acknowledged
 shows the keys of the current screen. Esc goes back and never aborts an
 acquisition; aborting asks for confirmation. The TUI also converts images,
 re-verifies an image against its report, resumes a rescue, and remembers
-examiner, authority and the last destination in
+examiner, authority, the last destination and the last case and evidence
+numbers (offered as suggestions for the next case) in
 `$XDG_CONFIG_HOME/dfdisk/profile.toml`. The converter fills its empty case
 number, evidence number, examiner and description fields from the image's
 `.info.json` and names the fields it took; when the source changes, the values

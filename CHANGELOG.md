@@ -252,7 +252,7 @@ and when something was not done the report says so.
 - **M12** `dfdisk verify`: a requested digest that was not computed is a failure,
   never a pass; `.Ex01` and `.E02` segment families are recognised as EWF; an
   expected digest that is not 32/40/64 hex digits is a usage error (exit 2)
-  instead of a HASH MISMATCH with an addendum.
+  instead of a mismatch.
 - Low: `--split none` passes the largest segment size both libewf lines accept
   (9223372036854775806 bytes; 0.1.10 passed 7900 GiB, so a larger source got
   several segments); `-r` above 255 is a usage error instead of silently
