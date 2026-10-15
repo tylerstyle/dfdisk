@@ -1,0 +1,6 @@
+Unsupported number of error retries defaulting to: 2.
+Unable to acquire input.
+libcfile_file_read_buffer_with_error_code: unable to read from file with error: Input/output error
+libsmdev_handle_read_buffer: unable to read from device file.
+device_handle_read_buffer: unable to read buffer from device input handle.
+ewfacquire_read_input: error reading data from input.

@@ -1,0 +1,17 @@
+ewfverify 20140816
+
+Verify started at: Oct 15, 2026 02:32:26
+This could take a while.
+
+Verify completed at: Oct 15, 2026 02:32:26
+
+Read: 4.0 MiB (4194304 bytes) in 0 second(s).
+
+Sector validation errors:
+	total number: 1
+	at sector(s): 0 - 8191 (number: 8192) in segment file(s):
+
+MD5 hash stored in file:		N/A
+MD5 hash calculated over data:		b5cfa9d6c8febd618f91ac2843d50a1c
+
+ewfverify: FAILURE

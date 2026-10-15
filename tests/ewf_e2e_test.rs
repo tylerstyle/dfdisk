@@ -148,6 +148,12 @@ async fn one_bad_sector_is_completed_with_read_errors_exit_7() {
         .collect();
     assert_eq!(ranges, vec![(MIB, 512, RangeKind::Substituted)]);
     assert_eq!(report.read_errors.source, "ewfacquire output + ewfinfo -e");
+    // ewfacquire's list and the image's list agree (both parsed, any libewf)
+    assert!(
+        !report.notes.iter().any(|n| n.contains("differ")),
+        "{:?}",
+        report.notes
+    );
 
     // The digests describe the stream with the zero-filled sector, and the
     // image re-read reproduces them

@@ -1,0 +1,19 @@
+ewfinfo 20140816
+
+EWF information
+	File format:		EnCase 6
+	Sectors per chunk:	64
+	Error granularity:	1
+	Compression method:	deflate
+	Compression level:	no compression
+
+Media information
+	Media type:		fixed disk
+	Is physical:		yes
+	Bytes per sector:	4096
+	Number of sectors:	1024
+	Media size:		4.0 MiB (4194304 bytes)
+
+Digest hash information
+	MD5:			cbf648de3ec9ba4600bc4216005c8487
+

@@ -1395,37 +1395,41 @@ mod tests {
 
     #[test]
     fn stored_ewf_digests_count_as_compared() {
-        // ewfverify of a clean image (real output)
-        let report = parse_ewfverify(
+        // Real ewfverify output of libewf 20231119 and 20140816 (legacy)
+        let clean = [
             include_str!("../../tests/fixtures/ewf/clean/ewfverify.stdout"),
-            "",
-        );
-        let stored = ExpectedHashes::stored_in_image(&report.stored);
-        // EnCase 6 stores MD5 and SHA-1, never SHA-256 ("N/A")
-        assert_eq!(
-            stored.selection().algorithms(),
-            [HashAlgorithm::MD5, HashAlgorithm::SHA1]
-        );
-        let (checks, r) = decide_against(&report.calculated, &[&stored], None, "ewfverify");
-        assert!(r.is_matched(), "{r:?}");
-        assert_eq!(checks[0].reference, STORED_IN_IMAGE);
-        assert_eq!(verification_exit_code(&r), 0);
-
-        // Tampered image (real output): stored and recomputed differ
-        let report = parse_ewfverify(
+            include_str!("../../tests/fixtures/ewf/legacy/clean/ewfverify.stdout"),
+        ];
+        let tampered = [
             include_str!("../../tests/fixtures/ewf/tampered/ewfverify.stdout"),
-            "",
-        );
-        let stored = ExpectedHashes::stored_in_image(&report.stored);
-        let (checks, r) = decide_against(
-            &report.calculated,
-            &[&stored],
-            Some("ewfverify FAILURE"),
-            "ewfverify",
-        );
-        assert!(matches!(r, VerificationResult::Mismatched { .. }), "{r:?}");
-        assert_eq!(verification_exit_code(&r), 5);
-        assert!(checks.iter().all(|c| c.status == CheckStatus::Mismatch));
+            include_str!("../../tests/fixtures/ewf/legacy/tampered/ewfverify.stdout"),
+        ];
+        for (clean, tampered) in clean.into_iter().zip(tampered) {
+            let report = parse_ewfverify(clean, "");
+            let stored = ExpectedHashes::stored_in_image(&report.stored);
+            // EnCase 6 stores MD5 and SHA-1, never SHA-256 ("N/A")
+            assert_eq!(
+                stored.selection().algorithms(),
+                [HashAlgorithm::MD5, HashAlgorithm::SHA1]
+            );
+            let (checks, r) = decide_against(&report.calculated, &[&stored], None, "ewfverify");
+            assert!(r.is_matched(), "{r:?}");
+            assert_eq!(checks[0].reference, STORED_IN_IMAGE);
+            assert_eq!(verification_exit_code(&r), 0);
+
+            // Tampered image: stored and recomputed differ
+            let report = parse_ewfverify(tampered, "");
+            let stored = ExpectedHashes::stored_in_image(&report.stored);
+            let (checks, r) = decide_against(
+                &report.calculated,
+                &[&stored],
+                Some("ewfverify FAILURE"),
+                "ewfverify",
+            );
+            assert!(matches!(r, VerificationResult::Mismatched { .. }), "{r:?}");
+            assert_eq!(verification_exit_code(&r), 5);
+            assert!(checks.iter().all(|c| c.status == CheckStatus::Mismatch));
+        }
     }
 
     #[test]

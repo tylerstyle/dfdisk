@@ -153,6 +153,18 @@ fn number_after(line: &str, prefix: &str) -> Option<u64> {
         .ok()
 }
 
+/// A section heading of ewfinfo/ewfverify output: an unindented line that
+/// is only a title, with (libewf 20231119) or without (20140816) a trailing
+/// colon, e.g. "Media information:" -> "Media information".
+fn heading(raw: &str) -> Option<&str> {
+    if raw.starts_with([' ', '\t']) {
+        return None;
+    }
+    let t = raw.trim();
+    let title = t.strip_suffix(':').unwrap_or(t);
+    (!title.is_empty() && !title.contains(':') && !title.contains('\t')).then_some(title)
+}
+
 /// Parse a libewf "<ALGO> hash calculated over data: <hex>" line.
 pub fn parse_calculated_hash(line: &str) -> Option<(&'static str, String)> {
     parse_hash_line(line, "calculated over data")
@@ -312,7 +324,7 @@ impl EwfacquireParser {
             r.media_size = bytes_in_parens(t);
         } else if let Some(n) = number_after(t, "Bytes per sector:") {
             r.bytes_per_sector = u32::try_from(n).ok();
-        } else if t == "Errors reading device:" {
+        } else if heading(raw) == Some("Errors reading device") {
             self.in_errors = true;
             r.errors.get_or_insert_with(RunBlock::default);
         } else if let Some(done) = progress_bytes(raw) {
@@ -321,6 +333,13 @@ impl EwfacquireParser {
             r.status = Some(status);
         } else if let Some((algo, v)) = parse_calculated_hash(t) {
             set_hash(&mut r.hashes, algo, v);
+        } else if t.to_ascii_lowercase().contains("error") {
+            // A read-error report in a form this parser does not know: kept
+            // as not understood, which fails closed
+            let block = r.errors.get_or_insert_with(RunBlock::default);
+            if block.unparsed.len() < MAX_UNPARSED {
+                block.unparsed.push(t.to_string());
+            }
         }
     }
 
@@ -346,6 +365,9 @@ pub fn parse_ewfacquire(stdout: &str, stderr: &str) -> EwfacquireReport {
 }
 
 /// `ewfinfo -e`: the read errors the image records.
+/// Lines other than the version line and the error block are kept as not
+/// understood, so an output format this parser does not know fails closed
+/// (never counts as "no errors").
 pub fn parse_ewfinfo_errors(stdout: &str) -> RunBlock {
     let mut block = RunBlock::default();
     let mut inside = false;
@@ -356,8 +378,16 @@ pub fn parse_ewfinfo_errors(stdout: &str) -> RunBlock {
             }
             inside = false;
         }
-        if raw.trim() == "Read errors during acquiry:" {
+        let t = raw.trim();
+        if t.is_empty() || (t.starts_with("ewfinfo ") && !t.contains(':')) {
+            continue;
+        }
+        // "Read errors during acquiry:" (20231119) or without the colon
+        // (20140816, the Debian/Ubuntu ewf-tools line)
+        if heading(raw) == Some("Read errors during acquiry") {
             inside = true;
+        } else if block.unparsed.len() < MAX_UNPARSED {
+            block.unparsed.push(t.to_string());
         }
     }
     block
@@ -389,8 +419,8 @@ pub fn parse_ewfinfo_media(stdout: &str) -> EwfMediaInfo {
             in_digests = false;
             continue;
         }
-        if t == "Digest hash information:" {
-            in_digests = true;
+        if let Some(h) = heading(raw) {
+            in_digests = h == "Digest hash information";
             continue;
         }
         let Some((label, value)) = t.split_once(':') else {
@@ -511,10 +541,10 @@ impl EwfverifyParser {
         }
         if r.version.is_none() && t.starts_with("ewfverify ") && !t.contains(':') {
             r.version = Some(t.to_string());
-        } else if t == "Sector validation errors:" {
+        } else if heading(raw) == Some("Sector validation errors") {
             self.section = VerifySection::Validation;
             r.validation_errors.get_or_insert_with(RunBlock::default);
-        } else if t == "Additional hash values:" {
+        } else if heading(raw) == Some("Additional hash values") {
             self.section = VerifySection::Additional;
         } else if t.starts_with("Read:") {
             r.bytes_read = bytes_in_parens(t);
@@ -586,6 +616,26 @@ pub fn ewf_digest_list(selection: HashSelection, include_md5: bool) -> Option<St
     } else {
         Some(list.join(","))
     }
+}
+
+/// Bytes per sector an E01 stores: EWF images hold whole sectors.
+pub const EWF_SECTOR_BYTES: u64 = 512;
+
+/// An E01 can hold the whole source only when its size is a multiple of 512
+/// bytes. Measured with libewf 20231119 and 20140816: for a 3,000,000-byte
+/// regular file ewfacquire hashes all bytes but stores 5,859 whole sectors
+/// (2,999,808 bytes), so the image silently lacks the last 192 bytes and
+/// does not verify. Block devices always have whole sectors; this refuses
+/// such sources (regular files) as a usage error before anything is written.
+pub fn check_source_size(size_bytes: u64) -> Result<(), String> {
+    let rest = size_bytes % EWF_SECTOR_BYTES;
+    if rest == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "the source is {size_bytes} bytes, {rest} bytes more than {} whole 512-byte sectors; an E01 image stores whole sectors only, and ewfacquire would leave the last {rest} bytes out of the image while including them in its digests. Acquire this source with the RAW engine instead",
+        size_bytes / EWF_SECTOR_BYTES
+    ))
 }
 
 /// The ewfacquire settings the session's effective config asks for.
@@ -881,16 +931,19 @@ fn media_type_name(info: &str) -> String {
 }
 
 fn block_problem(what: &str, b: &RunBlock) -> String {
-    format!(
-        "{what} {} but only {} could be parsed{}",
-        plural(b.total.unwrap_or(0), "read error", "read errors"),
-        plural(b.runs.len() as u64, "position", "positions"),
-        if b.unparsed.is_empty() {
-            String::new()
-        } else {
-            format!(" (not understood: {})", b.unparsed.join(" | "))
-        }
-    )
+    let understood = match b.total {
+        Some(n) => format!(
+            "{what} {} but only {} could be parsed",
+            plural(n, "read error", "read errors"),
+            plural(b.runs.len() as u64, "position", "positions")
+        ),
+        None => format!("{what} read-error information that could not be parsed"),
+    };
+    if b.unparsed.is_empty() {
+        understood
+    } else {
+        format!("{understood} (not understood: {})", b.unparsed.join(" | "))
+    }
 }
 
 /// Derive the engine output from what was measured (pure).
@@ -935,10 +988,11 @@ pub fn assemble(f: &EwfFacts) -> Result<EngineOutput, AcquisitionError> {
     // Read errors: ewfacquire's list and the image's list, united
     let printed = a.errors.clone().unwrap_or_default();
     let mut table = table_from(&printed.runs, sector_size, "ewfacquire output");
-    let mut unlocated: u64 = 0;
+    // Fail closed: read errors whose positions are not known
+    let mut unlocated: Option<&str> = None;
     if printed.incomplete() {
         notes.push(block_problem("ewfacquire reported", &printed));
-        unlocated = printed.total.unwrap_or(0).max(1);
+        unlocated = Some("ewfacquire reported read errors");
     }
     match &f.info_errors {
         Some(Ok(stored)) => {
@@ -953,15 +1007,17 @@ pub fn assemble(f: &EwfFacts) -> Result<EngineOutput, AcquisitionError> {
                     describe_ranges(&from_image)
                 ));
             }
-            // The image's list is complete: positions are known after all
-            if printed.incomplete()
-                && !stored.incomplete()
-                && stored.runs.len() as u64 >= printed.total.unwrap_or(0)
-            {
-                unlocated = 0;
+            // ewfacquire stated how many errors it had and the image's
+            // complete list has at least that many: the positions are known.
+            // Without a count (output in an unknown form) it stays unresolved
+            let count_only = printed
+                .total
+                .is_some_and(|n| n > 0 && stored.runs.len() as u64 >= n);
+            if unlocated.is_some() && count_only && !stored.incomplete() {
+                unlocated = None;
             }
             if stored.incomplete() {
-                unlocated = unlocated.max(stored.total.unwrap_or(0).max(1));
+                unlocated = Some("the image records read errors (ewfinfo -e)");
             }
             table.merge(&from_image);
         }
@@ -972,10 +1028,9 @@ pub fn assemble(f: &EwfFacts) -> Result<EngineOutput, AcquisitionError> {
         }
         _ => {}
     }
-    if unlocated > 0 {
+    if let Some(who) = unlocated {
         stop_reason = Some(format!(
-            "ewfacquire reported {} whose positions could not be determined from its output or from the image",
-            plural(unlocated, "read error", "read errors")
+            "{who} whose positions could not be determined from ewfacquire's output or from the image; the read-error table may be incomplete"
         ));
     }
 
@@ -1323,6 +1378,7 @@ pub async fn acquire(ctx: &EngineContext) -> Result<EngineOutput, AcquisitionErr
             requested.error_granularity_sectors
         )));
     }
+    check_source_size(ctx.expected_bytes()).map_err(AcquisitionError::usage)?;
     let log = ctx.output_path(LOG_SUFFIX);
     let spec = ewfacquire_spec(ctx, &requested, &log);
     let expected = ctx.expected_bytes();
@@ -1569,51 +1625,153 @@ mod tests {
     use crate::models::identity::SourceKind;
     use crate::models::outcome::{classify, AcquisitionFacts, Outcome};
 
-    /// Captured with libewf 20231119 (see tests/fixtures/ewf/README.txt).
-    macro_rules! fixture {
-        ($dir:literal, $file:literal) => {
-            include_str!(concat!("../../tests/fixtures/ewf/", $dir, "/", $file))
+    /// Real output of libewf 20231119 (top level) and 20140816 (`legacy/`,
+    /// the Debian/Ubuntu ewf-tools line); see tests/fixtures/ewf/README.txt.
+    macro_rules! fixtures {
+        ($($path:literal),* $(,)?) => {
+            &[$(($path, include_str!(concat!("../../tests/fixtures/ewf/", $path)))),*]
         };
+    }
+    const FIXTURES: &[(&str, &str)] = fixtures![
+        "aborted/ewfacquire.stdout",
+        "aborted/ewfinfo-e.stdout",
+        "aborted/ewfinfo-m.stdout",
+        "aborted/ewfverify.stderr",
+        "aborted/ewfverify.stdout",
+        "clean/ewfacquire.stderr",
+        "clean/ewfacquire.stdout",
+        "clean/ewfinfo-e.stdout",
+        "clean/ewfinfo-m.stdout",
+        "clean/ewfverify-sha256.stdout",
+        "clean/ewfverify.stdout",
+        "dying_to_end/ewfacquire.stderr",
+        "dying_to_end/ewfacquire.stdout",
+        "dying_to_end/ewfinfo-e.stdout",
+        "dying_to_end/ewfinfo-m.stdout",
+        "dying_to_end/ewfverify.stdout",
+        "granularity_fallback/ewfacquire.stderr",
+        "granularity_fallback/ewfacquire.stdout",
+        "granularity_fallback/ewfinfo-e.stdout",
+        "granularity_fallback/ewfinfo-m.stdout",
+        "granularity_fallback/ewfverify.stdout",
+        "legacy/aborted/ewfacquire.stdout",
+        "legacy/aborted/ewfinfo-e.stdout",
+        "legacy/aborted/ewfinfo-m.stdout",
+        "legacy/aborted/ewfverify.stderr",
+        "legacy/aborted/ewfverify.stdout",
+        "legacy/clean/ewfacquire.stderr",
+        "legacy/clean/ewfacquire.stdout",
+        "legacy/clean/ewfinfo-e.stdout",
+        "legacy/clean/ewfinfo-m.stdout",
+        "legacy/clean/ewfverify-sha1-sha256.stdout",
+        "legacy/clean/ewfverify-sha256.stdout",
+        "legacy/clean/ewfverify.stdout",
+        "legacy/dying_to_end/ewfacquire.stderr",
+        "legacy/dying_to_end/ewfacquire.stdout",
+        "legacy/dying_to_end/ewfinfo-e.stdout",
+        "legacy/dying_to_end/ewfinfo-m.stdout",
+        "legacy/dying_to_end/ewfverify.stdout",
+        "legacy/granularity_fallback/ewfacquire.stderr",
+        "legacy/granularity_fallback/ewfacquire.stdout",
+        "legacy/granularity_fallback/ewfinfo-e.stdout",
+        "legacy/granularity_fallback/ewfinfo-m.stdout",
+        "legacy/granularity_fallback/ewfverify.stdout",
+        "legacy/one_bad_sector/ewfacquire.stderr",
+        "legacy/one_bad_sector/ewfacquire.stdout",
+        "legacy/one_bad_sector/ewfinfo-e.stdout",
+        "legacy/one_bad_sector/ewfinfo-m.stdout",
+        "legacy/one_bad_sector/ewfverify.stdout",
+        "legacy/retries256/ewfacquire.stderr",
+        "legacy/retries256/ewfacquire.stdout",
+        "legacy/retries256/ewfinfo-e.stdout",
+        "legacy/retries256/ewfinfo-m.stdout",
+        "legacy/retries256/ewfverify.stdout",
+        "legacy/sector4096/ewfacquire.stderr",
+        "legacy/sector4096/ewfacquire.stdout",
+        "legacy/sector4096/ewfinfo-e.stdout",
+        "legacy/sector4096/ewfinfo-m.stdout",
+        "legacy/sector4096/ewfverify.stdout",
+        "legacy/slow/ewfacquire.stdout",
+        "legacy/source_vanished/ewfacquire.stderr",
+        "legacy/source_vanished/ewfacquire.stdout",
+        "legacy/source_vanished/ewfinfo-e.stdout",
+        "legacy/source_vanished/ewfinfo-m.stdout",
+        "legacy/source_vanished/ewfverify.stderr",
+        "legacy/source_vanished/ewfverify.stdout",
+        "legacy/tampered/ewfverify-noMD5.stderr",
+        "legacy/tampered/ewfverify-noMD5.stdout",
+        "legacy/tampered/ewfverify.stderr",
+        "legacy/tampered/ewfverify.stdout",
+        "legacy/three_ranges_g8/ewfacquire.stderr",
+        "legacy/three_ranges_g8/ewfacquire.stdout",
+        "legacy/three_ranges_g8/ewfinfo-e.stdout",
+        "legacy/three_ranges_g8/ewfinfo-m.stdout",
+        "legacy/three_ranges_g8/ewfverify.stdout",
+        "one_bad_sector/ewfacquire.stderr",
+        "one_bad_sector/ewfacquire.stdout",
+        "one_bad_sector/ewfinfo-e.stdout",
+        "one_bad_sector/ewfinfo-m.stdout",
+        "one_bad_sector/ewfverify.stdout",
+        "sector4096/ewfacquire.stderr",
+        "sector4096/ewfacquire.stdout",
+        "sector4096/ewfinfo-e.stdout",
+        "sector4096/ewfinfo-m.stdout",
+        "sector4096/ewfverify.stdout",
+        "slow/ewfacquire.stdout",
+        "slow/ewfverify.stdout",
+        "source_vanished/ewfacquire.stderr",
+        "source_vanished/ewfacquire.stdout",
+        "source_vanished/ewfinfo-e.stdout",
+        "source_vanished/ewfinfo-m.stdout",
+        "source_vanished/ewfverify.stderr",
+        "source_vanished/ewfverify.stdout",
+        "tampered/ewfverify-sha256.stdout",
+        "tampered/ewfverify.stdout",
+        "three_ranges_g8/ewfacquire.stderr",
+        "three_ranges_g8/ewfacquire.stdout",
+        "three_ranges_g8/ewfinfo-e.stdout",
+        "three_ranges_g8/ewfinfo-m.stdout",
+        "three_ranges_g8/ewfverify.stdout",
+    ];
+
+    /// Fixture roots: the current libewf and the legacy line.
+    const ROOTS: [&str; 2] = ["", "legacy/"];
+
+    fn version_of(root: &str) -> &'static str {
+        if root.is_empty() {
+            "20231119"
+        } else {
+            "20140816"
+        }
+    }
+
+    fn fx(root: &str, dir: &str, file: &str) -> &'static str {
+        let path = format!("{root}{dir}/{file}");
+        FIXTURES
+            .iter()
+            .find(|(p, _)| *p == path)
+            .map(|(_, t)| *t)
+            .unwrap_or_else(|| panic!("no fixture {path}"))
+    }
+
+    /// A stream that was empty (not saved) is "".
+    fn fx_opt(root: &str, dir: &str, file: &str) -> &'static str {
+        let path = format!("{root}{dir}/{file}");
+        FIXTURES
+            .iter()
+            .find(|(p, _)| *p == path)
+            .map(|(_, t)| *t)
+            .unwrap_or("")
     }
 
     const MIB: u64 = 1024 * 1024;
     const SIZE: u64 = 4 * MIB;
 
-    fn acquire_report(dir: &str) -> EwfacquireReport {
-        let (out, err) = match dir {
-            "one_bad_sector" => (
-                fixture!("one_bad_sector", "ewfacquire.stdout"),
-                fixture!("one_bad_sector", "ewfacquire.stderr"),
-            ),
-            "three_ranges_g8" => (
-                fixture!("three_ranges_g8", "ewfacquire.stdout"),
-                fixture!("three_ranges_g8", "ewfacquire.stderr"),
-            ),
-            "clean" => (
-                fixture!("clean", "ewfacquire.stdout"),
-                fixture!("clean", "ewfacquire.stderr"),
-            ),
-            "source_vanished" => (
-                fixture!("source_vanished", "ewfacquire.stdout"),
-                fixture!("source_vanished", "ewfacquire.stderr"),
-            ),
-            "dying_to_end" => (
-                fixture!("dying_to_end", "ewfacquire.stdout"),
-                fixture!("dying_to_end", "ewfacquire.stderr"),
-            ),
-            "sector4096" => (
-                fixture!("sector4096", "ewfacquire.stdout"),
-                fixture!("sector4096", "ewfacquire.stderr"),
-            ),
-            "granularity_fallback" => (
-                fixture!("granularity_fallback", "ewfacquire.stdout"),
-                fixture!("granularity_fallback", "ewfacquire.stderr"),
-            ),
-            "aborted" => (fixture!("aborted", "ewfacquire.stdout"), ""),
-            "slow" => (fixture!("slow", "ewfacquire.stdout"), ""),
-            other => panic!("no fixture {other}"),
-        };
-        parse_ewfacquire(out, err)
+    fn acquire_report(root: &str, dir: &str) -> EwfacquireReport {
+        parse_ewfacquire(
+            fx(root, dir, "ewfacquire.stdout"),
+            fx_opt(root, dir, "ewfacquire.stderr"),
+        )
     }
 
     fn requested(granularity: u32, retries: u32) -> EwfSettings {
@@ -1630,7 +1788,13 @@ mod tests {
         }
     }
 
-    fn facts(dir: &str, info_e: Option<&str>, info_m: Option<&str>, exit_code: i32) -> EwfFacts {
+    fn facts(
+        root: &str,
+        dir: &str,
+        info_e: Option<&str>,
+        info_m: Option<&str>,
+        exit_code: i32,
+    ) -> EwfFacts {
         EwfFacts {
             expected_bytes: SIZE,
             sector_size: 512,
@@ -1641,7 +1805,7 @@ mod tests {
                 force_killed: false,
                 status_text: format!("exit {exit_code}"),
             },
-            acquire: acquire_report(dir),
+            acquire: acquire_report(root, dir),
             segments: vec![PathBuf::from("/o/b.E01")],
             log_file: Some(PathBuf::from("/o/b.ewfacquire.log")),
             info_errors: info_e.map(|t| Ok(parse_ewfinfo_errors(t))),
@@ -1677,194 +1841,224 @@ mod tests {
 
     #[test]
     fn ewfacquire_read_error_block_is_parsed_from_stdout() {
-        let r = acquire_report("one_bad_sector");
-        assert_eq!(r.version.as_deref(), Some("ewfacquire 20231119"));
-        assert_eq!(r.media_size, Some(SIZE));
-        assert_eq!(r.bytes_per_sector, Some(512));
-        assert_eq!(r.status, Some(ToolStatus::Success));
-        assert_eq!(r.retries_applied, Some(2));
-        assert_eq!(r.granularity_applied, None);
-        let errors = r.errors.unwrap();
-        assert_eq!(errors.total, Some(1));
-        // "at sector(s): 2048 - 2049 number: 1": the end is exclusive here
-        assert_eq!(
-            errors.runs,
-            vec![SectorRun {
-                first: 2048,
-                count: 1
-            }]
-        );
-        assert!(!errors.incomplete());
-        assert_eq!(
-            r.hashes.md5.as_deref(),
-            Some("610a9d68f92851d74b85f33bde1fe3b9")
-        );
-        assert_eq!(
-            r.hashes.sha256.as_deref(),
-            Some("c60332c5c91251bc6a9f57c7b3fa6acbc555299e9cf702963ac3e3de70206f44")
-        );
-        assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
-
-        let r = acquire_report("three_ranges_g8");
-        let errors = r.errors.unwrap();
-        assert_eq!(errors.total, Some(3));
-        assert_eq!(
-            errors.runs,
-            vec![
-                SectorRun {
+        for root in ROOTS {
+            let r = acquire_report(root, "one_bad_sector");
+            assert_eq!(r.version, Some(format!("ewfacquire {}", version_of(root))));
+            assert_eq!(r.media_size, Some(SIZE));
+            assert_eq!(r.bytes_per_sector, Some(512));
+            assert_eq!(r.status, Some(ToolStatus::Success));
+            assert_eq!(r.retries_applied, Some(2));
+            assert_eq!(r.granularity_applied, None);
+            let errors = r.errors.unwrap();
+            assert_eq!(errors.total, Some(1));
+            // "at sector(s): 2048 - 2049 number: 1": the end is exclusive here
+            assert_eq!(
+                errors.runs,
+                vec![SectorRun {
                     first: 2048,
-                    count: 8
-                },
-                SectorRun {
-                    first: 4096,
-                    count: 8
-                },
-                SectorRun {
-                    first: 6400,
-                    count: 144
-                }
-            ]
-        );
-        assert_eq!(r.retries_applied, Some(1));
-        assert!(r.hashes.sha256.is_none());
+                    count: 1
+                }]
+            );
+            assert!(!errors.incomplete());
+            assert_eq!(
+                r.hashes.md5.as_deref(),
+                Some("610a9d68f92851d74b85f33bde1fe3b9")
+            );
+            assert_eq!(
+                r.hashes.sha256.as_deref(),
+                Some("c60332c5c91251bc6a9f57c7b3fa6acbc555299e9cf702963ac3e3de70206f44")
+            );
+            assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+
+            let r = acquire_report(root, "three_ranges_g8");
+            let errors = r.errors.unwrap();
+            assert_eq!(errors.total, Some(3));
+            assert_eq!(
+                errors.runs,
+                vec![
+                    SectorRun {
+                        first: 2048,
+                        count: 8
+                    },
+                    SectorRun {
+                        first: 4096,
+                        count: 8
+                    },
+                    SectorRun {
+                        first: 6400,
+                        count: 144
+                    }
+                ]
+            );
+            assert_eq!(r.retries_applied, Some(1));
+            assert!(r.hashes.sha256.is_none());
+        }
     }
 
     #[test]
     fn ewfacquire_statuses_progress_and_notices() {
-        let clean = acquire_report("clean");
-        assert!(clean.errors.is_none());
-        assert_eq!(clean.status, Some(ToolStatus::Success));
-        assert_eq!(
-            clean.hashes.sha1.as_deref(),
-            Some("1dbbb00f9daaaab78905d7f61ef1f1865f601117")
-        );
+        for root in ROOTS {
+            let clean = acquire_report(root, "clean");
+            assert!(clean.errors.is_none());
+            assert_eq!(clean.status, Some(ToolStatus::Success));
+            assert_eq!(
+                clean.hashes.sha1.as_deref(),
+                Some("1dbbb00f9daaaab78905d7f61ef1f1865f601117")
+            );
 
-        let gone = acquire_report("source_vanished");
-        assert_eq!(gone.status, Some(ToolStatus::Failure));
-        assert!(gone.hashes.is_empty());
-        assert!(gone
-            .diagnostics
-            .iter()
-            .any(|d| d.contains("unable to read from device file")));
+            let gone = acquire_report(root, "source_vanished");
+            assert_eq!(gone.status, Some(ToolStatus::Failure));
+            assert!(gone.hashes.is_empty());
+            assert!(gone
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("unable to read from device file")));
 
-        let aborted = acquire_report("aborted");
-        assert_eq!(aborted.status, Some(ToolStatus::Aborted));
-        assert_eq!(aborted.acquired_bytes, None);
+            let aborted = acquire_report(root, "aborted");
+            assert_eq!(aborted.status, Some(ToolStatus::Aborted));
+            assert_eq!(aborted.acquired_bytes, None);
 
-        let slow = acquire_report("slow");
-        // "acquired 3.8 MiB (3964928 bytes) of total 4.0 MiB (4194304 bytes)"
-        assert_eq!(slow.acquired_bytes, Some(3_964_928));
-        assert_eq!(slow.media_size, Some(SIZE));
+            let slow = acquire_report(root, "slow");
+            // "acquired 3.8 MiB (3964928 bytes) of total 4.0 MiB (4194304
+            // bytes)"; the legacy line ends with a period
+            let last = if root.is_empty() {
+                3_964_928
+            } else {
+                2_097_152
+            };
+            assert_eq!(slow.acquired_bytes, Some(last));
+            assert_eq!(slow.media_size, Some(SIZE));
 
-        let fallback = acquire_report("granularity_fallback");
-        assert_eq!(fallback.granularity_applied, Some(64));
+            let fallback = acquire_report(root, "granularity_fallback");
+            assert_eq!(fallback.granularity_applied, Some(64));
 
-        let big = acquire_report("sector4096");
-        assert_eq!(big.bytes_per_sector, Some(4096));
-        assert_eq!(
-            big.errors.unwrap().runs,
-            vec![SectorRun {
-                first: 256,
-                count: 1
-            }]
-        );
+            let big = acquire_report(root, "sector4096");
+            assert_eq!(big.bytes_per_sector, Some(4096));
+            assert_eq!(
+                big.errors.unwrap().runs,
+                vec![SectorRun {
+                    first: 256,
+                    count: 1
+                }]
+            );
+        }
     }
 
     #[test]
     fn ewfinfo_error_list_and_media_information() {
-        // "at sector(s): 2048 - 2048 (number: 1)": the end is inclusive here
-        let e = parse_ewfinfo_errors(fixture!("one_bad_sector", "ewfinfo-e.stdout"));
-        assert_eq!(e.total, Some(1));
-        assert_eq!(
-            e.runs,
-            vec![SectorRun {
-                first: 2048,
-                count: 1
-            }]
-        );
-        let e = parse_ewfinfo_errors(fixture!("three_ranges_g8", "ewfinfo-e.stdout"));
-        assert_eq!(e.runs.len(), 3);
-        assert_eq!(e.runs[2].count, 144);
-        assert_eq!(
-            parse_ewfinfo_errors(fixture!("clean", "ewfinfo-e.stdout")),
-            RunBlock::default()
-        );
+        for root in ROOTS {
+            // "at sector(s): 2048 - 2048 (number: 1)": the end is inclusive here
+            let e = parse_ewfinfo_errors(fx(root, "one_bad_sector", "ewfinfo-e.stdout"));
+            assert_eq!(e.total, Some(1));
+            assert_eq!(
+                e.runs,
+                vec![SectorRun {
+                    first: 2048,
+                    count: 1
+                }]
+            );
+            let e = parse_ewfinfo_errors(fx(root, "three_ranges_g8", "ewfinfo-e.stdout"));
+            assert_eq!(e.runs.len(), 3);
+            assert_eq!(e.runs[2].count, 144);
+            assert_eq!(
+                parse_ewfinfo_errors(fx(root, "clean", "ewfinfo-e.stdout")),
+                RunBlock::default()
+            );
 
-        let m = parse_ewfinfo_media(fixture!("one_bad_sector", "ewfinfo-m.stdout"));
-        assert_eq!(m.error_granularity, Some(1));
-        assert_eq!(m.sectors_per_chunk, Some(64));
-        assert_eq!(m.media_type.as_deref(), Some("fixed disk"));
-        assert_eq!(m.is_physical, Some(true));
-        assert_eq!(m.bytes_per_sector, Some(512));
-        assert_eq!(m.number_of_sectors, Some(8192));
-        assert_eq!(m.media_size, Some(SIZE));
-        assert!(!m.corrupted);
-        assert_eq!(
-            m.stored.md5.as_deref(),
-            Some("610a9d68f92851d74b85f33bde1fe3b9")
-        );
-        assert_eq!(
-            m.stored.sha1.as_deref(),
-            Some("9749d3e2959c32a6838bb8f3699a358ca4bd1efd")
-        );
-        assert_eq!(m.stored.sha256, None);
+            let m = parse_ewfinfo_media(fx(root, "one_bad_sector", "ewfinfo-m.stdout"));
+            assert_eq!(m.error_granularity, Some(1));
+            assert_eq!(m.sectors_per_chunk, Some(64));
+            assert_eq!(m.media_type.as_deref(), Some("fixed disk"));
+            assert_eq!(m.is_physical, Some(true));
+            assert_eq!(m.bytes_per_sector, Some(512));
+            assert_eq!(m.number_of_sectors, Some(8192));
+            assert_eq!(m.media_size, Some(SIZE));
+            assert!(!m.corrupted);
+            assert_eq!(
+                m.stored.md5.as_deref(),
+                Some("610a9d68f92851d74b85f33bde1fe3b9")
+            );
+            assert_eq!(
+                m.stored.sha1.as_deref(),
+                Some("9749d3e2959c32a6838bb8f3699a358ca4bd1efd")
+            );
+            assert_eq!(m.stored.sha256, None);
 
-        let removable = parse_ewfinfo_media(fixture!("clean", "ewfinfo-m.stdout"));
-        assert_eq!(removable.media_type.as_deref(), Some("removable disk"));
-        assert_eq!(removable.is_physical, Some(false));
-        let interrupted = parse_ewfinfo_media(fixture!("aborted", "ewfinfo-m.stdout"));
-        assert!(interrupted.corrupted);
-        let fallback = parse_ewfinfo_media(fixture!("granularity_fallback", "ewfinfo-m.stdout"));
-        assert_eq!(fallback.error_granularity, Some(64));
+            let removable = parse_ewfinfo_media(fx(root, "clean", "ewfinfo-m.stdout"));
+            assert_eq!(removable.media_type.as_deref(), Some("removable disk"));
+            assert_eq!(removable.is_physical, Some(false));
+            let interrupted = parse_ewfinfo_media(fx(root, "aborted", "ewfinfo-m.stdout"));
+            assert!(interrupted.corrupted);
+            let fallback =
+                parse_ewfinfo_media(fx(root, "granularity_fallback", "ewfinfo-m.stdout"));
+            assert_eq!(fallback.error_granularity, Some(64));
+        }
     }
 
     #[test]
     fn ewfverify_counts_only_calculated_digests() {
-        let v = parse_ewfverify(fixture!("clean", "ewfverify.stdout"), "");
-        assert_eq!(v.status, Some(ToolStatus::Success));
-        assert_eq!(v.bytes_read, Some(SIZE));
-        assert_eq!(
-            v.calculated.md5.as_deref(),
-            Some("c0ed3b46644cbdf9322e6028c84f82fc")
-        );
-        assert_eq!(
-            v.calculated.sha256.as_deref(),
-            Some("a588bfb14c390d5c3a67c2004e68c2175ba8bfae9f5f5a6c953ae9d65c3464cf")
-        );
-        assert_eq!(v.stored.md5, v.calculated.md5);
-        assert_eq!(v.stored.sha256, None, "N/A is not a digest");
+        for root in ROOTS {
+            let v = parse_ewfverify(fx(root, "clean", "ewfverify.stdout"), "");
+            assert_eq!(v.status, Some(ToolStatus::Success));
+            assert_eq!(v.bytes_read, Some(SIZE));
+            assert_eq!(
+                v.calculated.md5.as_deref(),
+                Some("c0ed3b46644cbdf9322e6028c84f82fc")
+            );
+            assert_eq!(
+                v.calculated.sha256.as_deref(),
+                Some("a588bfb14c390d5c3a67c2004e68c2175ba8bfae9f5f5a6c953ae9d65c3464cf")
+            );
+            assert_eq!(v.stored.md5, v.calculated.md5);
+            assert_eq!(v.stored.sha256, None, "N/A is not a digest");
 
-        // -d sha256 only: MD5/SHA-1 under "Additional hash values" are
-        // stored values, never recalculations
-        let v = parse_ewfverify(fixture!("clean", "ewfverify-sha256.stdout"), "");
-        assert_eq!(v.calculated.md5, None);
-        assert_eq!(v.calculated.sha1, None);
-        assert_eq!(
-            v.stored.sha1.as_deref(),
-            Some("1dbbb00f9daaaab78905d7f61ef1f1865f601117")
-        );
+            // -d sha256 only: values under "Additional hash values" are stored
+            // values, never recalculations. 20231119 then computes no MD5;
+            // 20140816 always computes MD5 ("additional types besides md5")
+            let v = parse_ewfverify(fx(root, "clean", "ewfverify-sha256.stdout"), "");
+            if root.is_empty() {
+                assert_eq!(v.calculated.md5, None);
+            } else {
+                assert_eq!(v.calculated.md5, v.stored.md5);
+            }
+            assert_eq!(v.calculated.sha1, None);
+            assert_eq!(
+                v.stored.sha1.as_deref(),
+                Some("1dbbb00f9daaaab78905d7f61ef1f1865f601117")
+            );
 
-        let t = parse_ewfverify(fixture!("tampered", "ewfverify.stdout"), "");
-        assert_eq!(t.status, Some(ToolStatus::Failure));
-        let block = t.validation_errors.clone().unwrap();
-        assert_eq!(block.total, Some(1));
-        assert_eq!(
-            block.runs,
-            vec![SectorRun {
-                first: 3840,
-                count: 64
-            }]
-        );
-        assert_ne!(t.calculated.md5, t.stored.md5);
-        assert!(t.validation_summary().unwrap().contains("64 sectors"));
+            let t = parse_ewfverify(fx(root, "tampered", "ewfverify.stdout"), "");
+            assert_eq!(t.status, Some(ToolStatus::Failure));
+            let block = t.validation_errors.clone().unwrap();
+            assert_eq!(block.total, Some(1));
+            assert_eq!(
+                block.runs,
+                vec![SectorRun {
+                    first: 3840,
+                    count: 64
+                }]
+            );
+            assert_ne!(t.calculated.md5, t.stored.md5);
+            assert!(t.validation_summary().unwrap().contains("64 sectors"));
 
-        let broken = parse_ewfverify(
-            fixture!("aborted", "ewfverify.stdout"),
-            fixture!("aborted", "ewfverify.stderr"),
-        );
-        assert_eq!(broken.status, Some(ToolStatus::Failure));
-        assert!(broken.calculated.is_empty());
-        assert!(!broken.diagnostics.is_empty());
+            let broken = parse_ewfverify(
+                fx(root, "aborted", "ewfverify.stdout"),
+                fx(root, "aborted", "ewfverify.stderr"),
+            );
+            assert_eq!(broken.status, Some(ToolStatus::Failure));
+            assert!(!broken.diagnostics.is_empty());
+            if root.is_empty() {
+                // 20231119 cannot read the unfinalized image at all
+                assert!(broken.calculated.is_empty());
+            } else {
+                // 20140816 reads it and reports every chunk as invalid
+                assert!(broken
+                    .validation_summary()
+                    .unwrap()
+                    .contains("8192 sectors"));
+                assert_eq!(broken.stored.md5, None);
+            }
+        }
     }
 
     #[test]
@@ -1903,361 +2097,402 @@ mod tests {
 
     #[test]
     fn one_bad_sector_is_an_exact_substituted_range() {
-        let f = facts(
-            "one_bad_sector",
-            Some(fixture!("one_bad_sector", "ewfinfo-e.stdout")),
-            Some(fixture!("one_bad_sector", "ewfinfo-m.stdout")),
-            0,
-        );
-        let out = assemble(&f).unwrap();
-        assert_eq!(ranges(&out), vec![(MIB, 512, RangeKind::Substituted)]);
-        assert_eq!(out.read_errors.sector_size, 512);
-        assert_eq!(out.read_errors.source, "ewfacquire output + ewfinfo -e");
-        assert_eq!(out.bytes_acquired, SIZE);
-        assert_eq!(out.stop_reason, None);
-        assert!(!out.aborted);
-        assert_eq!(out.image_files, vec![PathBuf::from("/o/b.E01")]);
-        assert_eq!(
-            out.auxiliary_files,
-            vec![PathBuf::from("/o/b.ewfacquire.log")]
-        );
-        assert_eq!(verdict(&out), Outcome::CompletedWithReadErrors);
-        let Some(EngineSettings::Ewf(s)) = &out.settings else {
-            panic!("{:?}", out.settings)
-        };
-        assert_eq!((s.retries, s.error_granularity_sectors), (2, 1));
-        assert!(
-            out.notes.iter().any(|n| n.contains("replaced 1 sector")),
-            "{:?}",
-            out.notes
-        );
-        // No disagreement between the two lists
-        assert!(!out.notes.iter().any(|n| n.contains("differ")));
+        for root in ROOTS {
+            let f = facts(
+                root,
+                "one_bad_sector",
+                Some(fx(root, "one_bad_sector", "ewfinfo-e.stdout")),
+                Some(fx(root, "one_bad_sector", "ewfinfo-m.stdout")),
+                0,
+            );
+            let out = assemble(&f).unwrap();
+            assert_eq!(ranges(&out), vec![(MIB, 512, RangeKind::Substituted)]);
+            assert_eq!(out.read_errors.sector_size, 512);
+            assert_eq!(out.read_errors.source, "ewfacquire output + ewfinfo -e");
+            assert_eq!(out.bytes_acquired, SIZE);
+            assert_eq!(out.stop_reason, None);
+            assert!(!out.aborted);
+            assert_eq!(out.image_files, vec![PathBuf::from("/o/b.E01")]);
+            assert_eq!(
+                out.auxiliary_files,
+                vec![PathBuf::from("/o/b.ewfacquire.log")]
+            );
+            assert_eq!(verdict(&out), Outcome::CompletedWithReadErrors);
+            let Some(EngineSettings::Ewf(s)) = &out.settings else {
+                panic!("{:?}", out.settings)
+            };
+            assert_eq!((s.retries, s.error_granularity_sectors), (2, 1));
+            assert!(
+                out.notes.iter().any(|n| n.contains("replaced 1 sector")),
+                "{:?}",
+                out.notes
+            );
+            // No disagreement between the two lists
+            assert!(!out.notes.iter().any(|n| n.contains("differ")));
+        }
     }
 
     #[test]
     fn clean_acquisition_and_removable_logical_media() {
-        let mut f = facts(
-            "clean",
-            Some(fixture!("clean", "ewfinfo-e.stdout")),
-            Some(fixture!("clean", "ewfinfo-m.stdout")),
-            0,
-        );
-        f.requested = Some(EwfSettings {
-            media_type: "removable".into(),
-            media_flags: "logical".into(),
-            ..requested(1, 2)
-        });
-        let out = assemble(&f).unwrap();
-        assert!(out.read_errors.is_empty());
-        assert_eq!(out.bytes_acquired, SIZE);
-        assert_eq!(verdict(&out), Outcome::Verified);
-        assert!(out.notes.is_empty(), "{:?}", out.notes);
-        // Requested media as recorded: no note; a different request is noted
-        f.requested = Some(requested(1, 2));
-        let out = assemble(&f).unwrap();
-        let Some(EngineSettings::Ewf(s)) = &out.settings else {
-            panic!()
-        };
-        assert_eq!(
-            (s.media_type.as_str(), s.media_flags.as_str()),
-            ("removable", "logical")
-        );
-        assert!(out.notes.iter().any(|n| n.contains("media type removable")));
+        for root in ROOTS {
+            let mut f = facts(
+                root,
+                "clean",
+                Some(fx(root, "clean", "ewfinfo-e.stdout")),
+                Some(fx(root, "clean", "ewfinfo-m.stdout")),
+                0,
+            );
+            f.requested = Some(EwfSettings {
+                media_type: "removable".into(),
+                media_flags: "logical".into(),
+                ..requested(1, 2)
+            });
+            let out = assemble(&f).unwrap();
+            assert!(out.read_errors.is_empty());
+            assert_eq!(out.bytes_acquired, SIZE);
+            assert_eq!(verdict(&out), Outcome::Verified);
+            assert!(out.notes.is_empty(), "{:?}", out.notes);
+            // Requested media as recorded: no note; a different request is noted
+            f.requested = Some(requested(1, 2));
+            let out = assemble(&f).unwrap();
+            let Some(EngineSettings::Ewf(s)) = &out.settings else {
+                panic!()
+            };
+            assert_eq!(
+                (s.media_type.as_str(), s.media_flags.as_str()),
+                ("removable", "logical")
+            );
+            assert!(out.notes.iter().any(|n| n.contains("media type removable")));
+        }
     }
 
     #[test]
     fn granularity_ewfacquire_did_not_accept_is_reported_as_applied() {
-        let mut f = facts(
-            "granularity_fallback",
-            Some(fixture!("granularity_fallback", "ewfinfo-e.stdout")),
-            Some(fixture!("granularity_fallback", "ewfinfo-m.stdout")),
-            0,
-        );
-        f.requested = Some(requested(128, 2));
-        let out = assemble(&f).unwrap();
-        let Some(EngineSettings::Ewf(s)) = &out.settings else {
-            panic!()
-        };
-        assert_eq!(s.error_granularity_sectors, 64);
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains("did not accept an error granularity of 128 sectors")),
-            "{:?}",
-            out.notes
-        );
-        // Without ewfinfo the notice on standard error decides
-        f.info_media = None;
-        let out = assemble(&f).unwrap();
-        let Some(EngineSettings::Ewf(s)) = &out.settings else {
-            panic!()
-        };
-        assert_eq!(s.error_granularity_sectors, 64);
-        // A retry count ewfacquire replaced
-        f.requested = Some(requested(1, 7));
-        let out = assemble(&f).unwrap();
-        let Some(EngineSettings::Ewf(s)) = &out.settings else {
-            panic!()
-        };
-        assert_eq!(s.retries, 2);
-        assert!(out.notes.iter().any(|n| n.contains("did not accept -r 7")));
+        for root in ROOTS {
+            let mut f = facts(
+                root,
+                "granularity_fallback",
+                Some(fx(root, "granularity_fallback", "ewfinfo-e.stdout")),
+                Some(fx(root, "granularity_fallback", "ewfinfo-m.stdout")),
+                0,
+            );
+            f.requested = Some(requested(128, 2));
+            let out = assemble(&f).unwrap();
+            let Some(EngineSettings::Ewf(s)) = &out.settings else {
+                panic!()
+            };
+            assert_eq!(s.error_granularity_sectors, 64);
+            assert!(
+                out.notes
+                    .iter()
+                    .any(|n| n.contains("did not accept an error granularity of 128 sectors")),
+                "{:?}",
+                out.notes
+            );
+            // Without ewfinfo the notice on standard error decides
+            f.info_media = None;
+            let out = assemble(&f).unwrap();
+            let Some(EngineSettings::Ewf(s)) = &out.settings else {
+                panic!()
+            };
+            assert_eq!(s.error_granularity_sectors, 64);
+            // A retry count ewfacquire replaced
+            f.requested = Some(requested(1, 7));
+            let out = assemble(&f).unwrap();
+            let Some(EngineSettings::Ewf(s)) = &out.settings else {
+                panic!()
+            };
+            assert_eq!(s.retries, 2);
+            assert!(out.notes.iter().any(|n| n.contains("did not accept -r 7")));
+        }
     }
 
     #[test]
     fn errors_in_4096_byte_sectors_are_converted_with_the_tool_sector_size() {
-        let f = facts(
-            "sector4096",
-            Some(fixture!("sector4096", "ewfinfo-e.stdout")),
-            Some(fixture!("sector4096", "ewfinfo-m.stdout")),
-            0,
-        );
-        let out = assemble(&f).unwrap();
-        assert_eq!(out.read_errors.sector_size, 4096);
-        assert_eq!(ranges(&out), vec![(MIB, 4096, RangeKind::Substituted)]);
-        assert_eq!(out.read_errors.sectors(), 1);
+        for root in ROOTS {
+            let f = facts(
+                root,
+                "sector4096",
+                Some(fx(root, "sector4096", "ewfinfo-e.stdout")),
+                Some(fx(root, "sector4096", "ewfinfo-m.stdout")),
+                0,
+            );
+            let out = assemble(&f).unwrap();
+            assert_eq!(out.read_errors.sector_size, 4096);
+            assert_eq!(ranges(&out), vec![(MIB, 4096, RangeKind::Substituted)]);
+            assert_eq!(out.read_errors.sectors(), 1);
+        }
     }
 
     #[test]
     fn three_ranges_and_disagreeing_lists_are_united() {
-        let f = facts(
-            "three_ranges_g8",
-            Some(fixture!("three_ranges_g8", "ewfinfo-e.stdout")),
-            Some(fixture!("three_ranges_g8", "ewfinfo-m.stdout")),
-            0,
-        );
-        let out = assemble(&f).unwrap();
-        assert_eq!(
-            ranges(&out),
-            vec![
-                (MIB, 4096, RangeKind::Substituted),
-                (2 * MIB, 4096, RangeKind::Substituted),
-                (6400 * 512, 144 * 512, RangeKind::Substituted)
-            ]
-        );
-        assert_eq!(verdict(&out), Outcome::CompletedWithReadErrors);
+        for root in ROOTS {
+            let f = facts(
+                root,
+                "three_ranges_g8",
+                Some(fx(root, "three_ranges_g8", "ewfinfo-e.stdout")),
+                Some(fx(root, "three_ranges_g8", "ewfinfo-m.stdout")),
+                0,
+            );
+            let out = assemble(&f).unwrap();
+            assert_eq!(
+                ranges(&out),
+                vec![
+                    (MIB, 4096, RangeKind::Substituted),
+                    (2 * MIB, 4096, RangeKind::Substituted),
+                    (6400 * 512, 144 * 512, RangeKind::Substituted)
+                ]
+            );
+            assert_eq!(verdict(&out), Outcome::CompletedWithReadErrors);
 
-        // The image lists a range ewfacquire did not print: union + note
-        let f = facts(
-            "one_bad_sector",
-            Some(fixture!("three_ranges_g8", "ewfinfo-e.stdout")),
-            Some(fixture!("one_bad_sector", "ewfinfo-m.stdout")),
-            0,
-        );
-        let out = assemble(&f).unwrap();
-        assert_eq!(out.read_errors.ranges.len(), 3);
-        assert_eq!(out.read_errors.ranges[0].offset, MIB);
-        assert_eq!(out.read_errors.ranges[0].length, 4096);
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains("differ from those the image records")),
-            "{:?}",
-            out.notes
-        );
+            // The image lists a range ewfacquire did not print: union + note
+            let f = facts(
+                root,
+                "one_bad_sector",
+                Some(fx(root, "three_ranges_g8", "ewfinfo-e.stdout")),
+                Some(fx(root, "one_bad_sector", "ewfinfo-m.stdout")),
+                0,
+            );
+            let out = assemble(&f).unwrap();
+            assert_eq!(out.read_errors.ranges.len(), 3);
+            assert_eq!(out.read_errors.ranges[0].offset, MIB);
+            assert_eq!(out.read_errors.ranges[0].length, 4096);
+            assert!(
+                out.notes
+                    .iter()
+                    .any(|n| n.contains("differ from those the image records")),
+                "{:?}",
+                out.notes
+            );
+        }
     }
 
     #[test]
     fn errors_without_positions_fail_closed() {
-        let mut f = facts(
-            "clean",
-            None,
-            Some(fixture!("clean", "ewfinfo-m.stdout")),
-            0,
-        );
-        f.acquire.errors = Some(RunBlock {
-            total: Some(2),
-            runs: vec![],
-            unparsed: vec!["at sectors 1..2 (a future format)".into()],
-        });
-        f.info_errors = Some(Err("exit 1".into()));
-        let out = assemble(&f).unwrap();
-        assert!(out.read_errors.is_empty());
-        assert!(out
-            .stop_reason
-            .as_deref()
-            .unwrap()
-            .contains("2 read errors whose positions could not be determined"));
-        assert_eq!(verdict(&out), Outcome::Incomplete);
+        for root in ROOTS {
+            let mut f = facts(
+                root,
+                "clean",
+                None,
+                Some(fx(root, "clean", "ewfinfo-m.stdout")),
+                0,
+            );
+            f.acquire.errors = Some(RunBlock {
+                total: Some(2),
+                runs: vec![],
+                unparsed: vec!["at sectors 1..2 (a future format)".into()],
+            });
+            f.info_errors = Some(Err("exit 1".into()));
+            let out = assemble(&f).unwrap();
+            assert!(out.read_errors.is_empty());
+            assert!(out
+                .stop_reason
+                .as_deref()
+                .unwrap()
+                .contains("whose positions could not be determined"));
+            assert_eq!(verdict(&out), Outcome::Incomplete);
 
-        // The image's own list supplies the positions
-        f.info_errors = Some(Ok(parse_ewfinfo_errors(fixture!(
-            "three_ranges_g8",
-            "ewfinfo-e.stdout"
-        ))));
-        f.acquire.errors.as_mut().unwrap().total = Some(3);
-        let out = assemble(&f).unwrap();
-        assert_eq!(out.stop_reason, None, "{:?}", out.notes);
-        assert_eq!(out.read_errors.ranges.len(), 3);
-        assert_eq!(verdict(&out), Outcome::CompletedWithReadErrors);
+            // The image's own list supplies the positions
+            f.info_errors = Some(Ok(parse_ewfinfo_errors(fx(
+                root,
+                "three_ranges_g8",
+                "ewfinfo-e.stdout",
+            ))));
+            f.acquire.errors.as_mut().unwrap().total = Some(3);
+            let out = assemble(&f).unwrap();
+            assert_eq!(out.stop_reason, None, "{:?}", out.notes);
+            assert_eq!(out.read_errors.ranges.len(), 3);
+            assert_eq!(verdict(&out), Outcome::CompletedWithReadErrors);
+        }
     }
 
     #[test]
     fn media_shortfall_is_incomplete() {
-        let mut f = facts(
-            "clean",
-            Some(fixture!("clean", "ewfinfo-e.stdout")),
-            Some(fixture!("clean", "ewfinfo-m.stdout")),
-            0,
-        );
-        f.expected_bytes = SIZE + 512;
-        let out = assemble(&f).unwrap();
-        assert_eq!(out.bytes_acquired, SIZE);
-        assert_eq!(verdict(&out), Outcome::Incomplete);
-        assert!(out
-            .notes
-            .iter()
-            .any(|n| n.contains("the source had 4194816 bytes")));
-        // Size unknown: never assumed
-        f.info_media = Some(Err("exit 1".into()));
-        f.acquire.media_size = None;
-        let out = assemble(&f).unwrap();
-        assert!(out
-            .stop_reason
-            .as_deref()
-            .unwrap()
-            .contains("could not be determined"));
+        for root in ROOTS {
+            let mut f = facts(
+                root,
+                "clean",
+                Some(fx(root, "clean", "ewfinfo-e.stdout")),
+                Some(fx(root, "clean", "ewfinfo-m.stdout")),
+                0,
+            );
+            f.expected_bytes = SIZE + 512;
+            let out = assemble(&f).unwrap();
+            assert_eq!(out.bytes_acquired, SIZE);
+            assert_eq!(verdict(&out), Outcome::Incomplete);
+            assert!(out
+                .notes
+                .iter()
+                .any(|n| n.contains("the source had 4194816 bytes")));
+            // Size unknown: never assumed
+            f.info_media = Some(Err("exit 1".into()));
+            f.acquire.media_size = None;
+            let out = assemble(&f).unwrap();
+            assert!(out
+                .stop_reason
+                .as_deref()
+                .unwrap()
+                .contains("could not be determined"));
+        }
     }
 
     #[test]
     fn source_lost_after_zero_filling_to_the_end() {
-        let mut f = facts(
-            "dying_to_end",
-            Some(fixture!("dying_to_end", "ewfinfo-e.stdout")),
-            Some(fixture!("dying_to_end", "ewfinfo-m.stdout")),
-            0,
-        );
-        // Still attached: a medium that stopped answering is a read error
-        let out = assemble(&f).unwrap();
-        assert_eq!(ranges(&out), vec![(MIB, 3 * MIB, RangeKind::Substituted)]);
-        assert_eq!(verdict(&out), Outcome::CompletedWithReadErrors);
-        assert!(out
-            .notes
-            .iter()
-            .any(|n| n.contains("still present afterwards")));
+        for root in ROOTS {
+            let mut f = facts(
+                root,
+                "dying_to_end",
+                Some(fx(root, "dying_to_end", "ewfinfo-e.stdout")),
+                Some(fx(root, "dying_to_end", "ewfinfo-m.stdout")),
+                0,
+            );
+            // Still attached: a medium that stopped answering is a read error
+            let out = assemble(&f).unwrap();
+            assert_eq!(ranges(&out), vec![(MIB, 3 * MIB, RangeKind::Substituted)]);
+            assert_eq!(verdict(&out), Outcome::CompletedWithReadErrors);
+            assert!(out
+                .notes
+                .iter()
+                .any(|n| n.contains("still present afterwards")));
 
-        f.source_presence = Err("/dev/sdx no longer exists".into());
-        let out = assemble(&f).unwrap();
-        assert_eq!(ranges(&out), vec![(MIB, 3 * MIB, RangeKind::Unread)]);
-        assert_eq!(out.bytes_acquired, MIB);
-        assert_eq!(
-            out.stop_reason.as_deref(),
-            Some("source lost at offset 1048576 (1 MiB): /dev/sdx no longer exists")
-        );
-        assert_eq!(verdict(&out), Outcome::Incomplete);
+            f.source_presence = Err("/dev/sdx no longer exists".into());
+            let out = assemble(&f).unwrap();
+            assert_eq!(ranges(&out), vec![(MIB, 3 * MIB, RangeKind::Unread)]);
+            assert_eq!(out.bytes_acquired, MIB);
+            assert_eq!(
+                out.stop_reason.as_deref(),
+                Some("source lost at offset 1048576 (1 MiB): /dev/sdx no longer exists")
+            );
+            assert_eq!(verdict(&out), Outcome::Incomplete);
+        }
     }
 
     #[test]
     fn source_vanished_during_the_run_is_incomplete() {
-        let mut f = facts(
-            "source_vanished",
-            Some(fixture!("source_vanished", "ewfinfo-e.stdout")),
-            Some(fixture!("source_vanished", "ewfinfo-m.stdout")),
-            1,
-        );
-        f.source_presence = Err("src.img no longer exists".into());
-        let out = assemble(&f).unwrap();
-        let reason = out.stop_reason.clone().unwrap();
-        assert!(
-            reason.starts_with("source lost during the acquisition (src.img no longer exists); ewfacquire stopped with FAILURE"),
-            "{reason}"
-        );
-        assert_eq!(out.bytes_acquired, 0);
-        assert!(out.notes.iter().any(|n| n.contains("ewfinfo: corrupted")));
-        assert_eq!(verdict(&out), Outcome::Incomplete);
+        for root in ROOTS {
+            let mut f = facts(
+                root,
+                "source_vanished",
+                Some(fx(root, "source_vanished", "ewfinfo-e.stdout")),
+                Some(fx(root, "source_vanished", "ewfinfo-m.stdout")),
+                1,
+            );
+            f.source_presence = Err("src.img no longer exists".into());
+            let out = assemble(&f).unwrap();
+            let reason = out.stop_reason.clone().unwrap();
+            assert!(
+                reason.starts_with("source lost during the acquisition (src.img no longer exists); ewfacquire stopped with FAILURE"),
+                "{reason}"
+            );
+            assert_eq!(out.bytes_acquired, 0);
+            assert!(out.notes.iter().any(|n| n.contains("ewfinfo: corrupted")));
+            assert_eq!(verdict(&out), Outcome::Incomplete);
 
-        // The same failure with the source present: a tool failure
-        f.source_presence = Ok(());
-        let out = assemble(&f).unwrap();
-        let reason = out.stop_reason.unwrap();
-        assert!(reason.starts_with("ewfacquire failed (exit 1)"), "{reason}");
-        assert!(
-            reason.contains("unable to read from device file"),
-            "{reason}"
-        );
+            // The same failure with the source present: a tool failure
+            f.source_presence = Ok(());
+            let out = assemble(&f).unwrap();
+            let reason = out.stop_reason.unwrap();
+            assert!(reason.starts_with("ewfacquire failed (exit 1)"), "{reason}");
+            assert!(
+                reason.contains("unable to read from device file"),
+                "{reason}"
+            );
 
-        // Destination full
-        f.acquire.diagnostics = vec!["libcfile_file_write_buffer: unable to write to file with error: No space left on device".into()];
-        let out = assemble(&f).unwrap();
-        assert!(out.stop_reason.unwrap().starts_with("destination full"));
+            // Destination full
+            f.acquire.diagnostics = vec!["libcfile_file_write_buffer: unable to write to file with error: No space left on device".into()];
+            let out = assemble(&f).unwrap();
+            assert!(out.stop_reason.unwrap().starts_with("destination full"));
 
-        // Nothing written: the error stands
-        f.segments.clear();
-        f.log_file = None;
-        let err = assemble(&f).unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Failed);
+            // Nothing written: the error stands
+            f.segments.clear();
+            f.log_file = None;
+            let err = assemble(&f).unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Failed);
+        }
     }
 
     #[test]
     fn abort_keeps_segments_and_records_the_last_progress() {
-        let mut f = facts(
-            "aborted",
-            Some(fixture!("aborted", "ewfinfo-e.stdout")),
-            Some(fixture!("aborted", "ewfinfo-m.stdout")),
-            1,
-        );
-        f.run.stopped = true;
-        f.run.status_text = "exit 1 (aborted: SIGINT)".into();
-        let out = assemble(&f).unwrap();
-        assert!(out.aborted);
-        assert_eq!(out.image_files.len(), 1);
-        assert_eq!(out.bytes_acquired, 0);
-        assert_eq!(out.stop_reason, None);
-        assert!(out
-            .notes
-            .iter()
-            .any(|n| n.contains("not finalized (ewfinfo: corrupted)")));
-        assert_eq!(verdict(&out), Outcome::Aborted);
+        for root in ROOTS {
+            let mut f = facts(
+                root,
+                "aborted",
+                Some(fx(root, "aborted", "ewfinfo-e.stdout")),
+                Some(fx(root, "aborted", "ewfinfo-m.stdout")),
+                1,
+            );
+            f.run.stopped = true;
+            f.run.status_text = "exit 1 (aborted: SIGINT)".into();
+            let out = assemble(&f).unwrap();
+            assert!(out.aborted);
+            assert_eq!(out.image_files.len(), 1);
+            assert_eq!(out.bytes_acquired, 0);
+            assert_eq!(out.stop_reason, None);
+            assert!(out
+                .notes
+                .iter()
+                .any(|n| n.contains("not finalized (ewfinfo: corrupted)")));
+            assert_eq!(verdict(&out), Outcome::Aborted);
 
-        f.acquire.acquired_bytes = Some(1_736_704);
-        let out = assemble(&f).unwrap();
-        assert_eq!(out.bytes_acquired, 1_736_704);
+            f.acquire.acquired_bytes = Some(1_736_704);
+            let out = assemble(&f).unwrap();
+            assert_eq!(out.bytes_acquired, 1_736_704);
 
-        f.segments.clear();
-        assert_eq!(assemble(&f).unwrap_err().kind, ErrorKind::Aborted);
+            f.segments.clear();
+            assert_eq!(assemble(&f).unwrap_err().kind, ErrorKind::Aborted);
+        }
     }
 
     #[test]
     fn ewfverify_verdicts() {
-        let sel = HashSelection {
-            md5: true,
-            sha1: true,
-            sha256: true,
-        };
-        let clean = parse_ewfverify(fixture!("clean", "ewfverify.stdout"), "");
-        let acquisition = acquire_report("clean").hashes;
-        let r = evaluate_ewfverify(sel, &acquisition, &clean, true, "exit 0", "ewfverify");
-        assert!(r.is_matched(), "{r:?}");
+        for root in ROOTS {
+            let sel = HashSelection {
+                md5: true,
+                sha1: true,
+                sha256: true,
+            };
+            let clean = parse_ewfverify(fx(root, "clean", "ewfverify.stdout"), "");
+            let acquisition = acquire_report(root, "clean").hashes;
+            let r = evaluate_ewfverify(sel, &acquisition, &clean, true, "exit 0", "ewfverify");
+            assert!(r.is_matched(), "{r:?}");
 
-        // Tampered image: the recomputed digests differ -> mismatch, with the
-        // checksum errors ewfverify found
-        let tampered = parse_ewfverify(fixture!("tampered", "ewfverify.stdout"), "");
-        let r = evaluate_ewfverify(sel, &acquisition, &tampered, false, "exit 1", "ewfverify");
-        let VerificationResult::Mismatched { details, .. } = r else {
-            panic!("{r:?}")
-        };
-        assert!(details.contains("MD5"), "{details}");
-        assert!(details.contains("checksum errors"), "{details}");
+            // Tampered image: the recomputed digests differ -> mismatch, with the
+            // checksum errors ewfverify found
+            let tampered = parse_ewfverify(fx(root, "tampered", "ewfverify.stdout"), "");
+            let r = evaluate_ewfverify(sel, &acquisition, &tampered, false, "exit 1", "ewfverify");
+            let VerificationResult::Mismatched { details, .. } = r else {
+                panic!("{r:?}")
+            };
+            assert!(details.contains("MD5"), "{details}");
+            assert!(details.contains("checksum errors"), "{details}");
 
-        // Matching digests but ewfverify failed: a failure, never a pass
-        let r = evaluate_ewfverify(sel, &acquisition, &clean, false, "exit 1", "ewfverify");
-        assert!(matches!(r, VerificationResult::Failed { .. }), "{r:?}");
+            // Matching digests but ewfverify failed: a failure, never a pass
+            let r = evaluate_ewfverify(sel, &acquisition, &clean, false, "exit 1", "ewfverify");
+            assert!(matches!(r, VerificationResult::Failed { .. }), "{r:?}");
 
-        // A requested digest ewfverify did not recompute
-        let only256 = parse_ewfverify(fixture!("clean", "ewfverify-sha256.stdout"), "");
-        let r = evaluate_ewfverify(sel, &acquisition, &only256, true, "exit 0", "ewfverify");
-        let VerificationResult::Failed { reason } = r else {
-            panic!("{r:?}")
-        };
-        assert!(reason.contains("MD5 was not recomputed"), "{reason}");
+            // A requested digest ewfverify did not recompute
+            let only256 = parse_ewfverify(fx(root, "clean", "ewfverify-sha256.stdout"), "");
+            let r = evaluate_ewfverify(sel, &acquisition, &only256, true, "exit 0", "ewfverify");
+            let VerificationResult::Failed { reason } = r else {
+                panic!("{r:?}")
+            };
+            let missing = if root.is_empty() { "MD5" } else { "SHA-1" };
+            assert!(
+                reason.contains(&format!("{missing} was not recomputed")),
+                "{reason}"
+            );
 
-        // An unfinalized image
-        let broken = parse_ewfverify(
-            fixture!("aborted", "ewfverify.stdout"),
-            fixture!("aborted", "ewfverify.stderr"),
-        );
-        let r = evaluate_ewfverify(sel, &acquisition, &broken, false, "exit 1", "ewfverify");
-        assert!(matches!(r, VerificationResult::Failed { .. }), "{r:?}");
+            // An unfinalized image
+            let broken = parse_ewfverify(
+                fx(root, "aborted", "ewfverify.stdout"),
+                fx(root, "aborted", "ewfverify.stderr"),
+            );
+            let r = evaluate_ewfverify(sel, &acquisition, &broken, false, "exit 1", "ewfverify");
+            assert!(!r.is_matched(), "{r:?}");
+            if root.is_empty() {
+                assert!(matches!(r, VerificationResult::Failed { .. }), "{r:?}");
+            }
+        }
     }
 
     // -- options, files, source --------------------------------------------
@@ -2344,6 +2579,83 @@ mod tests {
         );
         assert!(!argv.iter().any(|a| a.contains("not provided")), "{argv:?}");
         assert_eq!(argv.last().unwrap(), "/dev/disk/by-diskseq/9-part1");
+    }
+
+    #[test]
+    fn unknown_error_reports_fail_closed() {
+        for root in ROOTS {
+            // An ewfinfo -e format this parser does not know
+            let odd = parse_ewfinfo_errors("ewfinfo 20990101\n\nBad sectors found\n\t2048-2111\n");
+            assert!(odd.incomplete(), "{odd:?}");
+            let mut f = facts(
+                root,
+                "clean",
+                None,
+                Some(fx(root, "clean", "ewfinfo-m.stdout")),
+                0,
+            );
+            f.info_errors = Some(Ok(odd));
+            let out = assemble(&f).unwrap();
+            assert!(out.stop_reason.is_some(), "{:?}", out.notes);
+            assert_eq!(verdict(&out), Outcome::Incomplete);
+            assert!(out.notes.iter().any(|n| n.contains("Bad sectors found")));
+
+            // An error line on ewfacquire's output in an unknown form
+            let mut f = facts(
+                root,
+                "clean",
+                Some(fx(root, "clean", "ewfinfo-e.stdout")),
+                Some(fx(root, "clean", "ewfinfo-m.stdout")),
+                0,
+            );
+            let mut p = EwfacquireParser::new();
+            for line in fx(root, "clean", "ewfacquire.stdout").lines() {
+                if line.starts_with("MD5 hash") {
+                    p.feed(StreamTag::Stdout, "Read errors: 3 (positions follow)");
+                }
+                p.feed(StreamTag::Stdout, line);
+            }
+            f.acquire = p.finish();
+            let out = assemble(&f).unwrap();
+            assert!(out.stop_reason.is_some(), "{:?}", out.notes);
+            assert_eq!(verdict(&out), Outcome::Incomplete);
+            // The known outputs stay clean
+            let f = facts(
+                root,
+                "clean",
+                Some(fx(root, "clean", "ewfinfo-e.stdout")),
+                Some(fx(root, "clean", "ewfinfo-m.stdout")),
+                0,
+            );
+            assert_eq!(assemble(&f).unwrap().stop_reason, None);
+        }
+    }
+
+    #[test]
+    fn sources_without_whole_sectors_are_refused() {
+        assert_eq!(check_source_size(4 * MIB), Ok(()));
+        assert_eq!(check_source_size(0), Ok(()));
+        let err = check_source_size(3_000_000).unwrap_err();
+        assert!(
+            err.contains("192 bytes more than 5859 whole 512-byte sectors"),
+            "{err}"
+        );
+        assert!(err.contains("RAW engine"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_source_without_whole_sectors_is_a_usage_error_before_ewfacquire_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = context(
+            tmp.path(),
+            CaseMetadata::default(),
+            AcquisitionConfig::ewf(tmp.path()),
+        );
+        ctx.identity.size_bytes = 3_000_000;
+        let err = acquire(&ctx).await.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage);
+        assert!(ctx.provenance.commands().is_empty());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
