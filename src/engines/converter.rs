@@ -22,7 +22,8 @@
 //! 4. The tool through [`process::run`] (LC_ALL=C, own process group, both
 //!    streams read; abort = SIGINT, 15 s grace, then SIGTERM and SIGKILL; a
 //!    force flag kills at once); progress from its status lines.
-//! 5. fsync and page-cache eviction of every output, then verification:
+//! 5. fsync and page-cache eviction of every output (an output image that
+//!    cannot be fsynced fails the verification), then verification:
 //!    RAW to E01 re-reads the E01 with ewfverify and compares the digests with
 //!    the source's (from its report, or computed by dfdisk while ewfacquire
 //!    reads the image); E01 to RAW hashes the written RAW file and compares
@@ -43,7 +44,6 @@ use crate::engines::ewf::{self, RunBlock};
 use crate::engines::preflight::{self, DestinationFacts, DestinationRules};
 use crate::engines::process::{self, ProcessEvent, ProcessOutcome, ProcessSpec, StreamTag};
 use crate::engines::progress::ProgressSink;
-use crate::engines::session::flush_and_evict;
 use crate::models::case::{check_filename_length, sanitize_header, CaseMetadata};
 use crate::models::config::{
     CompressionLevel, EngineKind, HashAlgorithm, HashSelection, SplitSize,
@@ -54,7 +54,7 @@ use crate::models::conversion::{
     LONGEST_CONVERSION_SUFFIX,
 };
 use crate::models::info_report::{
-    sha256_file, AuditInfo, AuditStatus, FileDigest, ForensicInfoReport, HashResults,
+    sha256_file, sync_dir, AuditInfo, AuditStatus, FileDigest, ForensicInfoReport, HashResults,
 };
 use crate::models::outcome::{Outcome, RangeKind, ReadErrorTable, VerificationResult};
 use crate::models::protection::RegistryPresence;
@@ -132,6 +132,38 @@ pub struct ConvertEnv {
     pub grace: Duration,
     /// Copy the audit log into the output directory (`audit-<boot_id>.jsonl`)
     pub export_audit: bool,
+    /// fsync and page-cache eviction of an output file
+    pub flush: FileFlush,
+}
+
+/// fsync and page-cache eviction of one output file ([`ConvertEnv::flush`];
+/// tests inject failures).
+#[derive(Debug, Clone, Copy)]
+pub struct FileFlush {
+    pub sync: fn(&Path, &fs::File) -> io::Result<()>,
+    pub evict: fn(&Path, &fs::File) -> io::Result<()>,
+}
+
+impl Default for FileFlush {
+    fn default() -> Self {
+        Self {
+            sync: |_, f| f.sync_all(),
+            evict: evict_page_cache,
+        }
+    }
+}
+
+/// Drop `f`'s pages from the page cache (POSIX_FADV_DONTNEED), so a re-read
+/// comes from the destination medium.
+fn evict_page_cache(_: &Path, f: &fs::File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: advisory call on a descriptor we own
+    let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(rc))
+    }
 }
 
 impl ConvertEnv {
@@ -145,6 +177,7 @@ impl ConvertEnv {
             mountinfo: None,
             grace: TOOL_GRACE,
             export_audit: true,
+            flush: FileFlush::default(),
         }
     }
 }
@@ -2427,7 +2460,7 @@ async fn raw_to_e01(
         m.verification = Some(VerificationResult::NotPossible {
             reason: "the conversion did not complete".into(),
         });
-        flush(&m, plan, sink);
+        flush(env, &m, plan, sink);
         return Ok(m);
     }
     if let Some(seen) = tool
@@ -2444,15 +2477,16 @@ async fn raw_to_e01(
         }
     }
 
-    flush(&m, plan, sink);
+    let flushed = flush(env, &m, plan, sink);
 
     // Verification: what the E01 says, then a full re-read by ewfverify
     sink.phase(
         AcquisitionStatus::Verifying,
-        "Verifying the E01 (ewfverify, after fsync and page-cache eviction)",
+        format!("Verifying the E01 (ewfverify, {})", flushed.method()),
     );
     let first = m.output_files[0].clone();
-    let mut failure = None;
+    // T1: an output that is not durable on the destination is not verified
+    let mut failure = flushed.failure();
     match ewfinfo(env, &first, stop, recorder).await {
         Ok(info) => {
             m.bytes_converted = info.media_size.unwrap_or(0);
@@ -2540,13 +2574,14 @@ async fn raw_to_e01(
     }
     m.verification = Some(overall(&m.comparisons, failure));
     m.verification_method = format!(
-        "ewfverify -d {} of the E01 after fsync and page-cache eviction, compared with {}",
+        "ewfverify -d {} of the E01 {}, compared with {}",
         plan.selection
             .algorithms()
             .iter()
             .map(|a| a.label())
             .collect::<Vec<_>>()
             .join(","),
+        flushed.method(),
         match report_ref {
             Some(r) => format!(
                 "the digests of the {} report {}",
@@ -2560,20 +2595,98 @@ async fn raw_to_e01(
     Ok(m)
 }
 
-fn flush(m: &Measured, plan: &Plan, sink: &ProgressSink) {
+/// What flushing the outputs left (T1).
+#[derive(Debug, Default)]
+struct Flushed {
+    /// Why an output image (or its directory entry) may not be durable on
+    /// the destination
+    not_durable: Vec<String>,
+    /// Why an output image may still be in the page cache
+    not_evicted: Vec<String>,
+}
+
+impl Flushed {
+    /// The verification failure when an output image is not durable.
+    fn failure(&self) -> Option<String> {
+        (!self.not_durable.is_empty()).then(|| {
+            format!(
+                "the output could not be flushed durably to the destination: {}",
+                self.not_durable.join("; ")
+            )
+        })
+    }
+
+    /// How the output was flushed before it was re-read: only what happened.
+    fn method(&self) -> String {
+        if !self.not_durable.is_empty() {
+            "after a failed fsync of the output".into()
+        } else if !self.not_evicted.is_empty() {
+            format!(
+                "after fsync; the output could not be evicted from the page cache ({}), so the re-read may have come from memory",
+                self.not_evicted.join("; ")
+            )
+        } else {
+            "after fsync and page-cache eviction".into()
+        }
+    }
+}
+
+/// fsync every output and auxiliary file, evict it from the page cache,
+/// fsync the directory. Every problem is a warning (a note of the report);
+/// those of output images are returned for the verification.
+fn flush(env: &ConvertEnv, m: &Measured, plan: &Plan, sink: &ProgressSink) -> Flushed {
     sink.phase(
         AcquisitionStatus::Flushing,
         "Flushing the output to the destination and evicting it from the page cache",
     );
-    let files: Vec<PathBuf> = m
+    let mut out = Flushed::default();
+    let files = m
         .output_files
         .iter()
-        .chain(m.auxiliary.iter())
-        .cloned()
-        .collect();
-    for problem in flush_and_evict(&files, &plan.output_dir) {
-        sink.warn(problem);
+        .map(|p| (p, true))
+        .chain(m.auxiliary.iter().map(|p| (p, false)));
+    for (path, image) in files {
+        let problem = |p: String, list: &mut Vec<String>| {
+            sink.warn(p.clone());
+            if image {
+                list.push(p);
+            }
+        };
+        match fs::File::open(path) {
+            Ok(f) => {
+                if let Err(e) = (env.flush.sync)(path, &f) {
+                    problem(
+                        format!("fsync of {} failed: {e}", path.display()),
+                        &mut out.not_durable,
+                    );
+                }
+                if let Err(e) = (env.flush.evict)(path, &f) {
+                    problem(
+                        format!(
+                            "{} could not be evicted from the page cache: {e}",
+                            path.display()
+                        ),
+                        &mut out.not_evicted,
+                    );
+                }
+            }
+            Err(e) => problem(
+                format!("{} cannot be opened to flush it: {e}", path.display()),
+                &mut out.not_durable,
+            ),
+        }
     }
+    if let Err(e) = sync_dir(&plan.output_dir) {
+        let p = format!(
+            "fsync of the output directory {} failed: {e}",
+            plan.output_dir.display()
+        );
+        sink.warn(p.clone());
+        if !m.output_files.is_empty() {
+            out.not_durable.push(p);
+        }
+    }
+    out
 }
 
 /// Why an E01 to RAW output is not the whole source image, and the sectors
@@ -2712,19 +2825,20 @@ async fn e01_to_raw(
         m.verification = Some(VerificationResult::NotPossible {
             reason: "the conversion did not complete".into(),
         });
-        flush(&m, plan, sink);
+        flush(env, &m, plan, sink);
         return Ok(m);
     }
     if !problems.is_empty() {
         m.stop_reason = Some(problems.join("; "));
     }
-    flush(&m, plan, sink);
+    let flushed = flush(env, &m, plan, sink);
 
     sink.phase(
         AcquisitionStatus::Verifying,
-        "Hashing the written RAW file (after fsync and page-cache eviction)",
+        format!("Hashing the written RAW file ({})", flushed.method()),
     );
-    let mut failure = None;
+    // T1: an output that is not durable on the destination is not verified
+    let mut failure = flushed.failure();
     let output = match hash_with_gauge(vec![raw.clone()], plan.selection, stop, sink, out_len).await
     {
         Ok(h) => h,
@@ -2804,7 +2918,8 @@ async fn e01_to_raw(
     ));
     m.verification = Some(overall(&m.comparisons, failure));
     m.verification_method = format!(
-        "RAW file hashed by dfdisk after fsync and page-cache eviction, compared with {}",
+        "RAW file hashed by dfdisk {}, compared with {}",
+        flushed.method(),
         if references.is_empty() {
             "nothing independent".to_string()
         } else {

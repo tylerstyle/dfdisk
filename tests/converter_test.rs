@@ -8,7 +8,7 @@
 
 mod common;
 
-use dfdisk::engines::converter::{convert_with, ConvertEnv, ConverterTools};
+use dfdisk::engines::converter::{convert_with, ConvertEnv, ConverterTools, FileFlush};
 use dfdisk::engines::ErrorKind;
 use dfdisk::models::case::CaseMetadata;
 use dfdisk::models::config::{
@@ -97,6 +97,7 @@ fn fixture() -> Fixture {
         mountinfo: None,
         grace: Duration::from_secs(15),
         export_audit: false,
+        flush: FileFlush::default(),
     };
     Fixture {
         _tmp: tmp,
@@ -991,6 +992,97 @@ async fn zero_filled_sectors_recorded_only_in_the_e01_notes_are_never_verified()
     assert!(
         text.contains("its header notes (written by dfdisk) state: 2 sectors (1 KiB) in 1 range unreadable in the acquisition, zeros in this image; Zero-filled sectors of the rescue (ddrescue mapfile, 512 bytes each): 8-9"),
         "{text}"
+    );
+}
+
+/// fsync fails for output images (`.E01` segments, the `.raw` output).
+fn failing_image_sync(path: &Path, f: &std::fs::File) -> std::io::Result<()> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext.starts_with('e') || ext == "raw" {
+        Err(std::io::Error::from_raw_os_error(libc::EIO))
+    } else {
+        f.sync_all()
+    }
+}
+
+/// Eviction from the page cache fails for every file.
+fn failing_evict(_: &Path, _: &std::fs::File) -> std::io::Result<()> {
+    Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// T1: an output image that cannot be fsynced is not verified (exit 4), and
+/// no method text claims an fsync or an eviction that failed.
+#[tokio::test]
+async fn an_output_that_cannot_be_flushed_is_never_verified() {
+    if !have_libewf() {
+        return;
+    }
+    let f = fixture();
+    let content = data(1 << 20, 25);
+    let raw = f.src.join("x.raw");
+    std::fs::write(&raw, &content).unwrap();
+    let mut env = f.env.clone();
+    env.flush.sync = failing_image_sync;
+    let mut req = request(&raw, ConversionTarget::E01, &f.root.join("e01"));
+    req.case = Some(case());
+    let r = run(&env, req, StopFlags::new()).await.unwrap();
+    let text = r.render_text();
+    assert_eq!(r.outcome, Outcome::VerificationFailed, "{text}");
+    assert_eq!(r.exit_code, exit_code::FAILED);
+    let VerificationResult::Failed { reason } = &r.verification else {
+        panic!("{:?}", r.verification)
+    };
+    assert!(
+        reason.contains("could not be flushed durably to the destination"),
+        "{reason}"
+    );
+    assert!(reason.contains("x.E01"), "{reason}");
+    assert!(!r
+        .verification_method
+        .contains("fsync and page-cache eviction"));
+    assert!(!text.contains("after fsync and"), "{text}");
+
+    // E01 to RAW: the RAW output (of an E01 converted without trouble)
+    let mut req = request(&raw, ConversionTarget::E01, &f.root.join("good"));
+    req.case = Some(case());
+    let good = run(&f.env, req, StopFlags::new()).await.unwrap();
+    assert_eq!(good.outcome, Outcome::Verified, "{}", good.render_text());
+    let made = f.root.join("good").join("x.E01");
+    let r = run(
+        &env,
+        request(&made, ConversionTarget::Raw, &f.out),
+        StopFlags::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        r.outcome,
+        Outcome::VerificationFailed,
+        "{}",
+        r.render_text()
+    );
+    assert!(!r.verification_method.contains("page-cache eviction"));
+
+    // Eviction alone fails: verified, but the method says the re-read may
+    // have come from memory
+    let mut env = f.env.clone();
+    env.flush.evict = failing_evict;
+    let r = run(
+        &env,
+        request(&made, ConversionTarget::Raw, &f.root.join("evict")),
+        StopFlags::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.outcome, Outcome::Verified, "{}", r.render_text());
+    assert!(
+        r.verification_method
+            .contains("so the re-read may have come from memory"),
+        "{}",
+        r.verification_method
     );
 }
 
