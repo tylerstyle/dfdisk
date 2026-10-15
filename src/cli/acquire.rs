@@ -15,7 +15,7 @@ use crate::discovery::{identity, safety, writeprotect, DeviceScanner};
 use crate::engines::converter;
 pub use crate::engines::converter::rescue_notes;
 use crate::engines::session::{self, AcquisitionRequest, HostSystem, SessionHost};
-use crate::engines::AcquisitionError;
+use crate::engines::{AcquisitionError, ErrorKind};
 use crate::models::case::CaseMetadata;
 use crate::models::config::{
     AcquisitionConfig, CompressionLevel, EngineKind, ExpectIdentity, OnReadError, SmartPolicy,
@@ -447,12 +447,18 @@ pub enum ConversionStep {
 
 impl ConversionStep {
     /// Exit code of the conversion step (a skipped conversion adds nothing:
-    /// the rescue's own verdict already says why).
+    /// the rescue's own verdict already says why). A conversion that could
+    /// not start (usage error or refusal) counts as FAILED (4): the rescue
+    /// already wrote its image, so the run must not end with 2 or 3, which
+    /// say that nothing was written (I2).
     pub fn exit_code(&self) -> i32 {
         match self {
             ConversionStep::Skipped(_) => exit_code::VERIFIED,
             ConversionStep::Done(r) => r.exit_code(),
-            ConversionStep::Failed(e) => e.exit_code(),
+            ConversionStep::Failed(e) => match e.kind {
+                ErrorKind::Usage | ErrorKind::Refused => exit_code::FAILED,
+                _ => e.exit_code(),
+            },
         }
     }
 }
@@ -576,11 +582,20 @@ fn print_conversion_step(
         ConversionStep::Skipped(reason) => {
             vec![format!("[!] --rescue-to-e01: no conversion: {reason}")]
         }
-        ConversionStep::Failed(e) => vec![format!(
-            "[!] --rescue-to-e01: the conversion did not run ({}): {}",
-            e.kind.label(),
-            e.message
-        )],
+        ConversionStep::Failed(e) => {
+            let mut l = vec![format!(
+                "[!] --rescue-to-e01: the conversion did not run ({}): {}",
+                e.kind.label(),
+                e.message
+            )];
+            if step.exit_code() != e.exit_code() {
+                l.push(format!(
+                    "[!] --rescue-to-e01: counted as FAILED (exit code {}): the rescue image and its report were written",
+                    step.exit_code()
+                ));
+            }
+            l
+        }
         ConversionStep::Done(r) => {
             let mark = verdict_mark(r.outcome);
             let mut l: Vec<String> = r

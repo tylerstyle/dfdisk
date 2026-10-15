@@ -368,9 +368,18 @@ fn validate(request: &AcquisitionRequest) -> Result<Validated, AcquisitionError>
         return Err(AcquisitionError::usage("no output directory was given"));
     }
     request.config.validate().map_err(AcquisitionError::usage)?;
-    // E01 holds whole 512-byte sectors only (the identity check pins this size)
-    if request.engine() == EngineKind::Ewf {
-        ewf::check_source_size(request.device.size_bytes).map_err(AcquisitionError::usage)?;
+    // E01 holds whole 512-byte sectors only (the identity check pins this
+    // size); so does the E01 that --rescue-to-e01 makes of a rescue, and its
+    // refusal must come before anything is written (I2)
+    match request.engine() {
+        EngineKind::Ewf => {
+            ewf::check_source_size(request.device.size_bytes).map_err(AcquisitionError::usage)?
+        }
+        EngineKind::Rescue if request.config.rescue_to_e01 => {
+            ewf::check_source_size(request.device.size_bytes)
+                .map_err(|e| AcquisitionError::usage(format!("--rescue-to-e01: {e}")))?
+        }
+        _ => {}
     }
     let base_name = request
         .case

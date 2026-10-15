@@ -867,9 +867,23 @@ fn rescue_to_e01_converts_complete_rescues_only() {
     no_image.image_files.clear();
     assert!(plan_conversion(&no_image, &case, e01).is_err());
     assert_eq!(ConversionStep::Skipped("x".into()).exit_code(), 0);
+    // I2: after a written rescue, a conversion that could not start is
+    // FAILED (4), never 2 or 3 ("nothing was written")
     assert_eq!(
         ConversionStep::Failed(AcquisitionError::refused("x")).exit_code(),
-        3
+        4
+    );
+    assert_eq!(
+        ConversionStep::Failed(AcquisitionError::usage("x")).exit_code(),
+        4
+    );
+    assert_eq!(
+        ConversionStep::Failed(AcquisitionError::aborted("x")).exit_code(),
+        8
+    );
+    assert_eq!(
+        ConversionStep::Failed(AcquisitionError::failed("x")).exit_code(),
+        4
     );
 }
 

@@ -683,6 +683,31 @@ async fn usage_errors_write_and_record_nothing() {
     };
     assert_refused_before_writing(&fake, config, ErrorKind::Usage, "between 0 and 255").await;
 
+    // I2: --rescue-to-e01 of a source without whole 512-byte sectors is a
+    // usage error before the rescue writes anything
+    let mut fake = Fake::new();
+    fake.identity = disk_identity(SIZE + 100);
+    let config = AcquisitionConfig {
+        rescue_to_e01: true,
+        ..AcquisitionConfig::rescue(fake.out())
+    };
+    assert_refused_before_writing(
+        &fake,
+        config,
+        ErrorKind::Usage,
+        "--rescue-to-e01: the source is",
+    )
+    .await;
+    // ... while the rescue alone accepts it
+    let mut fake = Fake::new();
+    fake.identity = disk_identity(SIZE + 100);
+    let check = check_with(&fake, fake.request(AcquisitionConfig::rescue(fake.out()))).await;
+    assert!(
+        check.problems.iter().all(|p| p.kind != ErrorKind::Usage),
+        "{:?}",
+        check.problems
+    );
+
     // Missing required case fields
     let fake = Fake::new();
     let (tx, _rx) = mpsc::channel(100);
