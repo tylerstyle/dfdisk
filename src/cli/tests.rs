@@ -187,6 +187,10 @@ impl FakeHost {
 }
 
 impl SessionHost for FakeHost {
+    fn find_tool(&self, program: &str) -> Option<PathBuf> {
+        Some(PathBuf::from("/fake/bin").join(program))
+    }
+
     fn probe_identity(&self, path: &str) -> Result<SourceIdentity, String> {
         match &self.probe_error {
             Some(e) => Err(e.clone()),

@@ -639,6 +639,60 @@ fn check_writes_nothing_and_reports_readiness() {
     let output = check(&["--resume"]);
     assert_eq!(output.status.code(), Some(2), "{:?}", text(&output));
     assert!(!tmp.path().join("case").exists());
+
+    // I3: without ewfacquire on PATH an E01 is not READY (exit 4), and
+    // acquire fails before anything is written or recorded
+    let only_mocks = sandbox().join("bin");
+    let mut args: Vec<String> = [
+        "check",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-C",
+        "K",
+        "-E",
+        "E1",
+        "-e",
+        "X",
+        "--format",
+        "e01",
+        "--allow-tmpfs",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let output = dfdisk()
+        .env("PATH", &only_mocks)
+        .args(&args)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(4), "{stdout}\n{stderr}");
+    assert!(stdout.contains("ewfacquire"), "{stdout}");
+    args[0] = "acquire".into();
+    let log_before = std::fs::read_to_string(sandbox().join("audit.jsonl")).unwrap_or_default();
+    let output = dfdisk()
+        .env("PATH", &only_mocks)
+        .args(&args)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(4), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("Error (FAILED)") && stderr.contains("ewfacquire"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Starting"),
+        "nothing claims a start: {stderr}"
+    );
+    assert!(!stderr.contains("ACQUIRING"), "nothing started: {stderr}");
+    assert!(!tmp.path().join("case").exists());
+    let log_after = std::fs::read_to_string(sandbox().join("audit.jsonl")).unwrap_or_default();
+    assert!(
+        !log_after[log_before.len()..].contains(&src.to_string_lossy().into_owned()),
+        "no audit record for this run"
+    );
 }
 
 // ---------------------------------------------------------------------------

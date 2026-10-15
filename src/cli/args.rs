@@ -56,14 +56,15 @@ starts.
 const CHECK_AFTER_HELP: &str = "\
 check runs every step an acquisition runs before it reads the source (request,
 identity, registry, system disk, swap, mounts, holders, exclusive open,
-destination, capacity and SMART as configured) and writes nothing: no directory,
-no file, no audit record, no read-only flag.
+destination, the engine's external tools, capacity and SMART as configured) and
+writes nothing: no directory, no file, no audit record, no read-only flag.
 
 Exit codes:
   0  ready: the acquisition would start
   2  usage error: missing, invalid or inconsistent arguments
   3  refused: the acquisition would be refused (every reason is listed)
-  4  a check could not run
+  4  a check could not run, or a tool the engine runs (ewfacquire, ewfinfo,
+     ewfverify, ddrescue) is not installed
   8  interrupted (SIGINT, SIGTERM)";
 
 const VERIFY_AFTER_HELP: &str = "\

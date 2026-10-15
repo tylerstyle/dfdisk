@@ -120,6 +120,8 @@ struct Fake {
     /// Step 10 fails to fsync (or to evict) files whose name ends with this
     fsync_fail: Option<&'static str>,
     evict_fail: Option<&'static str>,
+    /// External programs this host does not have (every other one is found)
+    missing_tools: Vec<&'static str>,
     calls: Mutex<Vec<&'static str>>,
 }
 
@@ -161,6 +163,7 @@ impl Fake {
             reread: None,
             fsync_fail: None,
             evict_fail: None,
+            missing_tools: Vec::new(),
             calls: Mutex::new(Vec::new()),
             data,
             tmp,
@@ -213,6 +216,10 @@ impl Fake {
 }
 
 impl SessionHost for Fake {
+    fn find_tool(&self, program: &str) -> Option<PathBuf> {
+        (!self.missing_tools.contains(&program)).then(|| PathBuf::from("/fake/bin").join(program))
+    }
+
     fn probe_identity(&self, _path: &str) -> Result<SourceIdentity, String> {
         let n = self.probes.fetch_add(1, Ordering::SeqCst);
         if let Some(e) = &self.probe_error {
@@ -727,6 +734,68 @@ async fn usage_errors_write_and_record_nothing() {
         .await
         .unwrap_err();
     assert_eq!(e.kind, ErrorKind::Usage);
+}
+
+#[tokio::test]
+async fn a_missing_tool_fails_before_anything_is_written_sent_or_started() {
+    // I3: ewfacquire missing: FAILED (exit 4), nothing written, nothing sent
+    // to the source, no audit record at all (it never started)
+    let mut fake = Fake::new();
+    fake.missing_tools = vec!["ewfacquire"];
+    let config = AcquisitionConfig::for_engine(EngineKind::Ewf, fake.out());
+    let (r, progress) = run_fake(&fake, config.clone()).await;
+    let e = r.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Failed, "{e}");
+    assert_eq!(e.exit_code(), 4);
+    assert!(
+        e.message
+            .contains("runs ewfacquire, ewfinfo, ewfverify, but ewfacquire is not installed"),
+        "{e}"
+    );
+    assert!(e.message.contains("Nothing was written"), "{e}");
+    assert!(!fake.out().exists());
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    assert!(fake.records().is_empty());
+    assert!(matches!(progress.status, AcquisitionStatus::Failed(_)));
+    // check says the same, with exit 4
+    let check = check_with(&fake, fake.request(config)).await;
+    assert!(!check.ready);
+    assert_eq!(check.problems[0].step, "tools");
+    assert_eq!(check.exit_code(), 4);
+    assert!(check.render_text().contains("would not start"));
+
+    // ddrescue for a rescue; the libewf tools too with --rescue-to-e01
+    let mut fake = Fake::new();
+    fake.missing_tools = vec!["ddrescue", "ewfverify"];
+    let e = run_fake(&fake, AcquisitionConfig::rescue(fake.out()))
+        .await
+        .0
+        .unwrap_err();
+    assert!(
+        e.message
+            .contains("runs ddrescue, but ddrescue is not installed"),
+        "{e}"
+    );
+    let config = AcquisitionConfig {
+        rescue_to_e01: true,
+        ..AcquisitionConfig::rescue(fake.out())
+    };
+    let e = run_fake(&fake, config).await.0.unwrap_err();
+    assert!(
+        e.message
+            .contains("but ddrescue, ewfverify are not installed"),
+        "{e}"
+    );
+    assert!(
+        e.message
+            .contains("--rescue-to-e01 runs ddrescue, ewfacquire"),
+        "{e}"
+    );
+    // RAW needs no external tool
+    assert!(required_tools(&AcquisitionConfig::raw("/x")).is_empty());
+    let mut fake = Fake::new();
+    fake.missing_tools = vec!["ewfacquire", "ddrescue"];
+    assert!(run_fake(&fake, fake.raw()).await.0.is_ok());
 }
 
 #[tokio::test]

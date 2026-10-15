@@ -123,6 +123,8 @@ RAW engine re-reads with `O_DIRECT` where the filesystem supports it.
 
 dfdisk needs these external tools at run time. The Nix package puts them on its
 own PATH; the .deb depends on them; with a tarball you install them yourself.
+An acquisition (and `dfdisk check`) fails with exit code 4 before it writes
+anything or sends anything to the device when a tool its engine runs is missing.
 
 | Tool | Debian / Ubuntu package | Nix package | Used for |
 |------|-------------------------|-------------|----------|

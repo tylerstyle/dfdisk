@@ -382,7 +382,8 @@ pub async fn execute_acquisition(
     let case = request.case.clone();
     let (tx, rx) = mpsc::channel(PROGRESS_CHANNEL);
     let mut printer = ProgressPrinter::new(console, options.verbose);
-    console.note("[*] Starting the acquisition (Ctrl+C stops it gracefully)");
+    // Not "starting": the checks of steps 1-4 run first and may end the run
+    console.note("[*] Preparing the acquisition (Ctrl+C stops it gracefully)");
     let report = drive(
         session::run_with(host, request, tx, controller.stop_flags()),
         rx,

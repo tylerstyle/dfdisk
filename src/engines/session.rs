@@ -11,8 +11,8 @@
 //! - 3 source safety: dfnix registry by pinned major:minor, system disk,
 //!   active swap (R8) and mounts in the source tree, holders, O_EXCL open
 //!   held for the whole run (R1)
-//! - 4 destination checks, then the first write: output directory and report
-//!   reservation (R11)
+//! - 4 destination checks, the engine's external tools can be run (I3), then
+//!   the first write: output directory and report reservation (R11)
 //! - 7 audit "started" (refuses on dfnix if it cannot be written)
 //! - 5 write protection, 6 capacity probe (R6) and SMART before (§8)
 //! - 8 engine acquire, 9 identity re-check, 10 fsync + cache eviction (an
@@ -36,7 +36,7 @@ mod host;
 mod tests;
 
 pub use self::check::{CheckProblem, CheckReport};
-pub use self::host::{parse_proc_swaps, HostSystem, SessionHost, SwapEntry};
+pub use self::host::{find_on_path, parse_proc_swaps, HostSystem, SessionHost, SwapEntry};
 pub use crate::engines::progress::ProgressSink;
 pub use crate::models::config::EngineKind;
 pub use crate::signals::StopFlags;
@@ -390,6 +390,47 @@ fn validate(request: &AcquisitionRequest) -> Result<Validated, AcquisitionError>
         selection: HashSelection::for_engine(&request.config),
         base_name,
     })
+}
+
+/// The external programs a run of `config` starts: E01 ewfacquire, ewfinfo
+/// and ewfverify; rescue ddrescue (and, with --rescue-to-e01, the libewf
+/// programs of the conversion); RAW none.
+pub fn required_tools(config: &AcquisitionConfig) -> Vec<&'static str> {
+    const LIBEWF: [&str; 3] = ["ewfacquire", "ewfinfo", "ewfverify"];
+    match config.engine() {
+        EngineKind::Ewf => LIBEWF.to_vec(),
+        EngineKind::Rescue if config.rescue_to_e01 => {
+            std::iter::once(rescue::DDRESCUE).chain(LIBEWF).collect()
+        }
+        EngineKind::Rescue => vec![rescue::DDRESCUE],
+        EngineKind::Raw => Vec::new(),
+    }
+}
+
+/// Step 4 (I3): every external program of the engine can be run, so a
+/// missing tool fails the run before anything is written, sent to the
+/// source or recorded as started (FAILED, exit 4; `check` lists it too).
+fn check_tools(host: &dyn SessionHost, config: &AcquisitionConfig) -> Result<(), AcquisitionError> {
+    let required = required_tools(config);
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|t| host.find_tool(t).is_none())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(AcquisitionError::failed(format!(
+        "{} runs {}, but {} {} not installed (not found as an executable on PATH); install ewf-tools and gddrescue (Debian/Ubuntu) or libewf and ddrescue (Nix). Nothing was written and nothing was sent to the source",
+        if config.engine() == EngineKind::Rescue && config.rescue_to_e01 {
+            "the rescue with --rescue-to-e01".to_string()
+        } else {
+            format!("the {} engine", config.engine().label())
+        },
+        required.join(", "),
+        missing.join(", "),
+        if missing.len() == 1 { "is" } else { "are" }
+    )))
 }
 
 /// Step 2: probe the source and require it to be the selected device (and
@@ -802,6 +843,9 @@ fn pre_start(
     let source_fd = host.open_source(&identity).map_err(as_probed)?;
     let destination =
         destination_checks(host, request, &identity, v.engine, &v.base_name).map_err(as_probed)?;
+    // I3: a missing tool fails before the first write and before "started"
+    // (after the refusals, which are the more important answer)
+    check_tools(host, &request.config).map_err(as_probed)?;
     let effective = EffectiveConfig::build(&request.config, Some(&identity));
     let tool_source_path = host.tool_source_path(&identity);
     if stop.is_aborted() {
