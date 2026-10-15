@@ -18,7 +18,7 @@ use crate::models::outcome::{
 };
 use crate::models::protection::WriteProtection;
 use crate::models::provenance::{ClockInfo, ToolProvenance};
-use crate::models::text::{format_iec, sanitize_line};
+use crate::models::text::{format_iec, plural, sanitize_line};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -907,8 +907,8 @@ impl ForensicInfoReport {
                 out,
                 "Piecewise SHA-256",
                 format!(
-                    "{} pieces of {} in {} (SHA-256 {})",
-                    p.count,
+                    "{} of {} in {} (SHA-256 {})",
+                    plural(p.count, "piece", "pieces"),
                     format_iec(p.piece_size),
                     p.file,
                     p.file_sha256
@@ -1243,6 +1243,21 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("VERIFIED - ALL HASHES MATCH"));
+    }
+
+    #[test]
+    fn piece_counts_are_plural_only_when_more_than_one() {
+        let mut r = verified();
+        r.piecewise = Some(PiecewiseInfo {
+            piece_size: 1 << 30,
+            file: "b.pieces.tsv".into(),
+            file_sha256: "cd".repeat(32),
+            count: 1,
+        });
+        let text = r.render_text();
+        assert!(text.contains("1 piece of 1 GiB in b.pieces.tsv"), "{text}");
+        r.piecewise.as_mut().unwrap().count = 3;
+        assert!(r.render_text().contains("3 pieces of 1 GiB"));
     }
 
     #[test]
