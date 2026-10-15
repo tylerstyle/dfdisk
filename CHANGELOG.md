@@ -283,7 +283,8 @@ and when something was not done the report says so.
   with the RTC offset, documented exit codes, `dfdisk check` (dry run),
   `acquire --json`, `list --json`; `check`, `verify` and `unmount` with
   `--json` and the error object carry `schema_version` 1 and are documented in
-  docs/report-format.md.
+  docs/report-format.md. With `--json` an argument error (an unknown option, a
+  malformed digest) is printed as that error object too.
 - **F6** Re-verification as an audited addendum (`dfdisk verify`, TUI re-verify
   screen, `--report`, `--pieces`) and an optional second read of the source
   (`--verify-source`).

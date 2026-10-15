@@ -763,6 +763,22 @@ fn verify_exit_codes() {
         let (_, stderr) = text(&o);
         assert_eq!(o.status.code(), Some(2), "{flag} {bad}: {stderr}");
         assert!(stderr.contains("hexadecimal digits"), "{stderr}");
+        // I-J1: with --json the usage error is the one JSON document
+        let o = run(&["verify", img, flag, bad, "--json"]);
+        let (stdout, stderr) = text(&o);
+        assert_eq!(o.status.code(), Some(2), "{flag} {bad}: {stderr}");
+        let v: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{flag} {bad}: not one JSON document ({e}): {stdout}"));
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["error"]["kind"], "usage");
+        assert_eq!(v["error"]["exit_code"], 2);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("hexadecimal digits")),
+            "{stdout}"
+        );
+        assert!(stderr.contains("hexadecimal digits"), "{stderr}");
     }
     assert_eq!(addenda(), before, "no addendum for a usage error");
     // Upper case and surrounding blanks are fine

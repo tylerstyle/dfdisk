@@ -964,3 +964,39 @@ async fn a_panic_exits_1_not_101() {
     .await;
     assert_eq!(code, 1);
 }
+
+#[test]
+fn argument_errors_are_json_when_the_command_line_asks_for_json() {
+    // I-J1: the parser failed, so the command line is read without it
+    use clap::Parser;
+    let argv = |a: &[&str]| -> Vec<std::ffi::OsString> {
+        std::iter::once("dfdisk")
+            .chain(a.iter().copied())
+            .map(Into::into)
+            .collect()
+    };
+    for (args, json) in [
+        (&["verify", "x.raw", "--md5", "xyz", "--json"][..], true),
+        (&["convert", "--json", "--bogus"][..], true),
+        (&["list", "-j", "--bogus"][..], true),
+        (&["list", "-sj"][..], true),
+        (&["verify", "x.raw", "--md5", "xyz"][..], false),
+        // -j is list's short flag only; after "--" nothing is an option
+        (&["acquire", "-j"][..], false),
+        (&["verify", "--bogus", "--", "--json"][..], false),
+    ] {
+        let a = argv(args);
+        assert_eq!(super::wants_json(&a), json, "{args:?}");
+        let err = Cli::try_parse_from(&a).map(|_| ()).unwrap_err();
+        let doc = super::usage_error_document(&a, &err.render().to_string());
+        assert_eq!(doc.is_some(), json, "{args:?}");
+        if let Some(doc) = doc {
+            let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+            assert_eq!(v["schema_version"], 1);
+            assert_eq!(v["error"]["kind"], "usage");
+            assert_eq!(v["error"]["exit_code"], 2);
+            let m = v["error"]["message"].as_str().unwrap();
+            assert!(!m.starts_with("error:") && !m.contains('\n'), "{m}");
+        }
+    }
+}
