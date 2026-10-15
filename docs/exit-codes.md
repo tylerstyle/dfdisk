@@ -52,8 +52,8 @@ source device, when for example:
 - the device is protected by the dfnix protected-device registry, or the registry
   exists but cannot be read (fail closed);
 - the device is a system disk, is mounted (in dfdisk's mount namespace), holds
-  active swap, or has holders (device-mapper, LVM, md) and `--allow-holders` was
-  not given;
+  active swap, or has holders (device-mapper, LVM, md, LUKS): a holder claims the
+  device, so it has to be closed first (there is no override);
 - the device cannot be opened exclusively (`O_EXCL` returns EBUSY: it is in use,
   for example mounted in another mount namespace);
 - the destination is on the source, on a dfnix evidence mount, on tmpfs/ramfs

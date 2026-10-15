@@ -200,7 +200,6 @@ fn acquire_help_documents_every_flag_and_the_required_fields() {
         "--verify-source",
         "--smart",
         "--write-protect",
-        "--allow-holders",
         "--allow-tmpfs",
         "--allow-low-space",
         "--refuse-hidden-areas",
@@ -221,6 +220,8 @@ fn acquire_help_documents_every_flag_and_the_required_fields() {
     for placeholder in ["CASE001", "cf01]", "Forensic Examiner", "Law Enforcement"] {
         assert!(!stdout.contains(placeholder), "{placeholder}");
     }
+    // No override for holders: a holder claims the source exclusively
+    assert!(!stdout.contains("--allow-holders"), "{stdout}");
 }
 
 #[test]

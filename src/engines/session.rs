@@ -434,7 +434,6 @@ fn source_safety(
 ) -> Safety {
     let config = &request.config;
     let mut errors = Vec::new();
-    let mut notes = Vec::new();
 
     let registry = host.registry();
     let presence = match &registry {
@@ -525,23 +524,18 @@ fn source_safety(
             write_protection.mounts_before.join(", ")
         )));
     }
+    // A holder (dm, LVM, md, bcache, LUKS) claims the source exclusively,
+    // so the exclusive open would refuse it anyway; there is no override
     if !write_protection.holders.is_empty() {
-        if config.allow_holders {
-            notes.push(format!(
-                "devices stacked on the source were allowed by --allow-holders: {}",
-                write_protection.holders.join(", ")
-            ));
-        } else {
-            errors.push(AcquisitionError::refused(format!(
-                "devices are stacked on the source ({}): device-mapper, LVM, md or LUKS keep it open and may write to it. Close them first, or pass --allow-holders",
-                write_protection.holders.join(", ")
-            )));
-        }
+        errors.push(AcquisitionError::refused(format!(
+            "devices are stacked on the source ({}): device-mapper, LVM, md or LUKS keep it open and may write to it. Close them first (for example cryptsetup close, vgchange -an, mdadm --stop), then acquire again",
+            write_protection.holders.join(", ")
+        )));
     }
     Safety {
         registry: presence,
         write_protection,
-        notes,
+        notes: Vec::new(),
         errors,
     }
 }

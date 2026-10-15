@@ -397,10 +397,6 @@ pub struct AcquisitionOptions {
     )]
     pub write_protect: CliWriteProtect,
 
-    /// Acquire a source with device-mapper/LVM/md/LUKS devices stacked on it
-    #[arg(long, help_heading = "Safety")]
-    pub allow_holders: bool,
-
     /// Accept a destination on tmpfs/ramfs (lost at power-off)
     #[arg(long, help_heading = "Safety")]
     pub allow_tmpfs: bool,

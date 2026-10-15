@@ -798,21 +798,15 @@ async fn swap_mount_holder_and_busy_refusals() {
     let config = fake.raw();
     assert_refused_before_writing(&fake, config, ErrorKind::Refused, "/mnt/evidence").await;
 
-    // Holders (dm on the source) refuse unless allowed
+    // Holders (dm on the source) refuse; there is no override (a holder
+    // claims the source exclusively): they have to be closed first
     let fake = Fake::new();
     fake.sys.add_virtual("dm-0", (254, 0), SIZE / 512);
     fake.sys.stack("dm-0", "sdx1");
     let config = fake.raw();
-    assert_refused_before_writing(&fake, config, ErrorKind::Refused, "--allow-holders").await;
-    let fake = Fake::new();
-    fake.sys.add_virtual("dm-0", (254, 0), SIZE / 512);
-    fake.sys.stack("dm-0", "sdx1");
-    let config = AcquisitionConfig {
-        allow_holders: true,
-        ..fake.raw()
-    };
-    let report = run_fake(&fake, config).await.0.unwrap();
-    assert!(report.notes.iter().any(|n| n.contains("--allow-holders")));
+    assert_refused_before_writing(&fake, config, ErrorKind::Refused, "Close them first").await;
+    let e = run_fake(&fake, fake.raw()).await.0.unwrap_err();
+    assert!(!e.message.contains("--allow-holders"), "{e}");
 
     // In use (O_EXCL: EBUSY)
     let mut fake = Fake::new();

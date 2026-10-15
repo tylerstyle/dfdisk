@@ -288,7 +288,7 @@ Acquisition options:
 | `--write-protect auto\|off` | set the kernel read-only flag (default `auto`) or only record it |
 | `--refuse-hidden-areas` | refuse when an HPA or DCO is found |
 | `--expect-serial`, `--expect-wwn`, `--expect-size` | refuse unless the device has this serial, WWN or size in bytes |
-| `--allow-holders`, `--allow-tmpfs`, `--allow-low-space` | accept device-mapper/LVM/md holders, a tmpfs destination, or an E01 destination with less free space than the source size |
+| `--allow-tmpfs`, `--allow-low-space` | accept a tmpfs destination, or an E01 destination with less free space than the source size |
 | `--auto-unmount` | unmount the source's filesystems first (audited, same as `dfdisk unmount`) |
 | `--digests md5,sha1,sha256` | digests to compute and verify (default all three; E01 always adds MD5) |
 | `--error-granularity <SECTORS>` | E01: ewfacquire error granularity (default physical / logical sector size) |
@@ -390,8 +390,9 @@ identify-class queries that the report records.
   protected-device registry (and fails closed when the registry exists but cannot
   be read), a system disk, a device with mounted filesystems (in dfdisk's mount
   namespace; a mount in another namespace makes the exclusive open below fail)
-  or active swap, and a device with holders (dm-crypt, LVM, md) unless
-  `--allow-holders` is given. Unmounting is a separate, explicit, audited
+  or active swap, and a device with holders (dm-crypt, LVM, md): a holder
+  claims the device, so it has to be closed first (there is no override).
+  Unmounting is a separate, explicit, audited
   action (`dfdisk unmount`, `--auto-unmount`) that refuses system mounts and
   protected devices and never forces or lazily unmounts.
 - **Exclusive open.** The source is opened with `O_EXCL` and held for the whole

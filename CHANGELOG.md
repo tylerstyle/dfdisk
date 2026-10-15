@@ -39,8 +39,8 @@ and when something was not done the report says so.
 - **dfcore 0.2.0** is required (registry matching by device number, typed
   refusals, per-boot audit export, `DeviceIdentity::same_attachment`).
 - **Stricter refusals.** Mounted sources are refused (unmounting is the explicit
-  `dfdisk unmount` / `--auto-unmount`), as are sources with holders (unless
-  `--allow-holders`), sources with active swap, sources in use (`O_EXCL`), tmpfs
+  `dfdisk unmount` / `--auto-unmount`), as are sources with holders (they have
+  to be closed first), sources with active swap, sources in use (`O_EXCL`), tmpfs
   destinations (unless `--allow-tmpfs`) and E01 destinations with less free space
   than the source (unless `--allow-low-space`).
 - **Write protection on by default.** `--write-protect auto` sets the kernel
@@ -196,7 +196,7 @@ and when something was not done the report says so.
   (`$XDG_CONFIG_HOME/dfdisk/profile.toml`) with an evidence-number suggestion.
 - **F12** SMART policy `--smart off|basic|full`, before and (rescue) after the
   acquisition.
-- `--expect-serial`, `--expect-wwn`, `--expect-size`, `--allow-holders`,
+- `--expect-serial`, `--expect-wwn`, `--expect-size`,
   `--allow-tmpfs`, `--allow-low-space` (also for `convert`),
   `--write-protect auto|off`, `--on-read-error stop|zero-fill`.
 - Sources are selected from the device scan by device number: partitions,

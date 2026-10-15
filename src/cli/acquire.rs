@@ -176,7 +176,6 @@ pub fn config_from_options(o: &AcquisitionOptions) -> Result<AcquisitionConfig, 
         CliWriteProtect::Auto => WriteProtectPolicy::Auto,
         CliWriteProtect::Off => WriteProtectPolicy::Off,
     };
-    c.allow_holders = o.allow_holders;
     c.allow_tmpfs = o.allow_tmpfs;
     c.allow_low_space = o.allow_low_space;
     c.refuse_hidden_areas = o.refuse_hidden_areas;

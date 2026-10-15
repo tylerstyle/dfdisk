@@ -611,7 +611,6 @@ fn every_new_flag_reaches_the_configuration() {
         "full",
         "--write-protect",
         "off",
-        "--allow-holders",
         "--allow-tmpfs",
         "--allow-low-space",
         "--refuse-hidden-areas",
@@ -645,7 +644,27 @@ fn every_new_flag_reaches_the_configuration() {
     assert!(c.verify_source);
     assert_eq!(c.smart, SmartPolicy::Full);
     assert_eq!(c.write_protect, WriteProtectPolicy::Off);
-    assert!(c.allow_holders && c.allow_tmpfs && c.allow_low_space && c.refuse_hidden_areas);
+    assert!(c.allow_tmpfs && c.allow_low_space && c.refuse_hidden_areas);
+    // --allow-holders is gone (a holder claims the source; it could never apply)
+    let e = Cli::try_parse_from([
+        "dfdisk",
+        "acquire",
+        "/dev/sdx",
+        "-o",
+        "/tmp/x",
+        "-C",
+        "C",
+        "-E",
+        "E",
+        "-e",
+        "X",
+        "--allow-holders",
+    ])
+    .unwrap_err();
+    assert!(
+        e.use_stderr(),
+        "an unknown argument is a usage error (exit 2)"
+    );
     assert_eq!(c.expect.serial.as_deref(), Some("S123"));
     assert_eq!(c.expect.wwn.as_deref(), Some("0x5000c500a1b2c3d4"));
     assert_eq!(c.expect.size, Some(1 << 30));
