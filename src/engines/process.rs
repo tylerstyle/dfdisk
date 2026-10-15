@@ -866,15 +866,19 @@ pub fn first_line<'a>(lines: impl IntoIterator<Item = &'a String>) -> Option<Str
         .find(|l| !l.is_empty())
 }
 
+/// The version line of a version query: only from a run that exited 0 (a
+/// failing tool's first line is an error message, never its version), stdout
+/// first, else stderr (ewfexport prints its version there).
 fn version_from(output: &CollectedOutput) -> Option<String> {
-    if output.outcome.timed_out || output.outcome.force_killed {
+    if !output.outcome.success() {
         return None;
     }
     first_line(&output.stdout).or_else(|| first_line(&output.stderr))
 }
 
-/// First line `program args` prints (stdout, else stderr), e.g.
-/// "ewfacquire 20231119"; `None` when it cannot be run or times out.
+/// First line `program args` prints (stdout, else stderr) when it exits 0,
+/// e.g. "ewfacquire 20231119"; `None` when it cannot be run, fails or times
+/// out.
 pub async fn tool_version(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let spec = ProcessSpec::new(program).args(args).timeout(timeout);
     let out = run_collect(&spec, &StopControl::none(), None).await.ok()?;
@@ -1173,6 +1177,27 @@ mod tests {
         );
         assert_eq!(
             tool_version("sh", &["-c", "sleep 5"], Duration::from_millis(100)).await,
+            None
+        );
+        // A failing tool's message is not a version
+        assert_eq!(
+            tool_version(
+                "sh",
+                &[
+                    "-c",
+                    "echo 'error while loading shared libraries' >&2; exit 127"
+                ],
+                Duration::from_secs(5)
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            tool_version_blocking(
+                "sh",
+                &["-c", "echo 'tool 1.0'; exit 1"],
+                Duration::from_secs(5)
+            ),
             None
         );
     }
