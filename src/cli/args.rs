@@ -12,6 +12,7 @@ macro_rules! exit_code_table {
     () => {
         "Exit codes:
   0  verified: complete, and the re-read image matches the acquisition digests
+     (a rescue: matches a second read of the source)
   1  internal error
   2  usage error: missing, invalid or inconsistent arguments
   3  refused: a safety, identity or destination check failed; nothing was read

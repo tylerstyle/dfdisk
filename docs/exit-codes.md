@@ -6,12 +6,12 @@ codes; the text and JSON reports carry the same code (`exit_code` in
 
 | Code | Name | Meaning |
 |-----:|------|---------|
-| 0 | Verified | The whole source was acquired without read errors, and the digests recomputed from the written image match the digests computed while reading the source. |
+| 0 | Verified | The whole source was acquired without read errors, and the digests recomputed from the written image match the digests computed while reading the source (for a rescue, where ddrescue computes none: the digests of a second, independent read of the source with `--verify-source`). |
 | 1 | Internal error | A bug or an unexpected internal failure (including a panic, which is reported as "Error (INTERNAL ERROR): …" rather than with Rust's exit code 101). Please report it. |
 | 2 | Usage error | Invalid arguments or inconsistent options. Nothing was written and nothing was sent to the device. |
 | 3 | Refused | A safety or preflight rule refused the run (see below). Nothing was acquired. |
 | 4 | Failed | The run could not be carried out (for example a required tool is missing: ewfacquire, ewfinfo and ewfverify for E01 and `--rescue-to-e01`, ddrescue for a rescue; this is found after the refusal checks and before anything is written, sent to the device or recorded as started), or the verification could not run or complete (outcome VERIFICATION FAILED). |
-| 5 | Mismatch | A digest recomputed from the image, or from a second read of the source, differs from the digest computed during acquisition. |
+| 5 | Mismatch | A digest recomputed from the image, or from a second read of the source, differs from the digest computed during acquisition (for a rescue: the second read differs from the image). The report says which digests were compared. |
 | 6 | Incomplete | Not all of the source was acquired: the run stopped early, areas were never read, the source was lost or changed, or the destination filled up. |
 | 7 | Completed with read errors | The full length was written, but unreadable sectors were replaced by zeros. The digests describe the image including the substituted sectors, not the original medium. |
 | 8 | Aborted | Stopped by the examiner or by a signal (SIGINT, SIGTERM). |
