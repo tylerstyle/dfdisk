@@ -95,7 +95,11 @@ fn identity_of(dev: &BlockDevice) -> SourceIdentity {
     id
 }
 
-fn check_for(req: &AcquisitionRequest, problems: Vec<CheckProblem>) -> CheckReport {
+fn check_for(
+    req: &AcquisitionRequest,
+    problems: Vec<CheckProblem>,
+    missing_tools: Vec<String>,
+) -> CheckReport {
     let id = identity_of(&req.device);
     CheckReport {
         ready: problems.is_empty(),
@@ -114,6 +118,7 @@ fn check_for(req: &AcquisitionRequest, problems: Vec<CheckProblem>) -> CheckRepo
         destination: None,
         capacity: None,
         smart: None,
+        missing_tools: Some(missing_tools),
         problems,
         notes: Vec::new(),
     }
@@ -173,6 +178,8 @@ struct Script {
     scans: VecDeque<Vec<BlockDevice>>,
     last_scan: Vec<BlockDevice>,
     problems: VecDeque<Vec<CheckProblem>>,
+    /// The engine's programs the dry run reports as not installed
+    missing_tools: Vec<String>,
     check_requests: Vec<AcquisitionRequest>,
     acquire_requests: Vec<AcquisitionRequest>,
     acquire: Acquire,
@@ -197,6 +204,7 @@ impl Fake {
             scans: VecDeque::new(),
             last_scan: devices,
             problems: VecDeque::new(),
+            missing_tools: Vec::new(),
             check_requests: Vec::new(),
             acquire_requests: Vec::new(),
             acquire: Acquire::Verified,
@@ -260,8 +268,9 @@ impl TuiBackend for Fake {
         let me = self.clone();
         Box::pin(async move {
             let problems = me.s().problems.pop_front().unwrap_or_default();
+            let missing = me.s().missing_tools.clone();
             me.s().check_requests.push(request.clone());
-            check_for(&request, problems)
+            check_for(&request, problems, missing)
         })
     }
 
@@ -660,13 +669,83 @@ async fn a_refused_check_cannot_be_started() {
     to_case_setup(&mut app, "/mnt/case");
     to_confirm(&mut app).await;
     assert!(!app.confirm.as_ref().unwrap().ready());
+    assert_eq!(
+        sheet_text(&app)[0],
+        "NOT READY: this would be refused. Nothing has been written or changed."
+    );
     typ(&mut app, "KD7Y");
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(app.screen, Screen::Confirm);
+    assert_eq!(
+        app.confirm.as_ref().unwrap().error.as_deref(),
+        Some("The acquisition would be refused (see the problems on this sheet); nothing was started.")
+    );
     assert!(fake.s().acquire_requests.is_empty());
     // Esc goes back without starting
     app.handle_key(key(KeyCode::Esc));
     assert_eq!(app.screen, Screen::CaseSetup);
+}
+
+/// A tool the engine runs that is not installed is not a refusal (nothing
+/// refuses the source; the run would fail before it starts, exit 4): the
+/// sheet names what is missing instead of saying "refused".
+#[tokio::test]
+async fn a_missing_tool_is_named_not_called_a_refusal() {
+    let fake = Fake::new(vec![evidence()]);
+    fake.s().missing_tools = vec!["ewfacquire".into()];
+    let tools = CheckProblem {
+        step: "tools".into(),
+        kind: ErrorKind::Failed,
+        message: "the E01 engine runs ewfacquire, ewfinfo, ewfverify, but ewfacquire is not installed (not found as an executable on PATH)".into(),
+    };
+    fake.s().problems.push_back(vec![tools.clone()]);
+    let mut app = app_with(&fake);
+    to_case_setup(&mut app, "/mnt/case");
+    to_confirm(&mut app).await;
+    let sheet = sheet_text(&app);
+    assert_eq!(
+        sheet[0],
+        "NOT READY: ewfacquire is not installed. Nothing has been written or changed."
+    );
+    assert!(
+        !sheet.iter().any(|l| l.to_lowercase().contains("refused")),
+        "{sheet:?}"
+    );
+    typ(&mut app, "KD7Y");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen, Screen::Confirm);
+    assert_eq!(
+        app.confirm.as_ref().unwrap().error.as_deref(),
+        Some("ewfacquire is not installed (see the problems on this sheet); nothing was started.")
+    );
+    assert!(fake.s().acquire_requests.is_empty());
+
+    // Several missing tools are all named
+    fake.s().missing_tools = vec!["ddrescue".into(), "ewfverify".into()];
+    fake.s().problems.push_back(vec![tools.clone()]);
+    app.handle_key(key(KeyCode::Esc));
+    to_confirm(&mut app).await;
+    assert_eq!(
+        sheet_text(&app)[0],
+        "NOT READY: ddrescue, ewfverify are not installed. Nothing has been written or changed."
+    );
+
+    // A missing tool next to a refusal: neither alone describes the run
+    fake.s().problems.push_back(vec![
+        CheckProblem {
+            step: "destination".into(),
+            kind: ErrorKind::Refused,
+            message: "tmpfs destination".into(),
+        },
+        tools,
+    ]);
+    app.handle_key(key(KeyCode::Esc));
+    to_confirm(&mut app).await;
+    assert_eq!(
+        sheet_text(&app)[0],
+        "NOT READY: the acquisition would not start. Nothing has been written or changed."
+    );
+    assert!(fake.s().acquire_requests.is_empty());
 }
 
 #[tokio::test]

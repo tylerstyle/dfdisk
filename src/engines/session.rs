@@ -407,19 +407,27 @@ pub fn required_tools(config: &AcquisitionConfig) -> Vec<&'static str> {
     }
 }
 
+/// The programs of [`required_tools`] that are not found on PATH.
+fn missing_tools(host: &dyn SessionHost, config: &AcquisitionConfig) -> Vec<&'static str> {
+    required_tools(config)
+        .into_iter()
+        .filter(|t| host.find_tool(t).is_none())
+        .collect()
+}
+
 /// Step 4 (I3): every external program of the engine can be run, so a
 /// missing tool fails the run before anything is written, sent to the
 /// source or recorded as started (FAILED, exit 4; `check` lists it too).
 fn check_tools(host: &dyn SessionHost, config: &AcquisitionConfig) -> Result<(), AcquisitionError> {
-    let required = required_tools(config);
-    let missing: Vec<&str> = required
-        .iter()
-        .copied()
-        .filter(|t| host.find_tool(t).is_none())
-        .collect();
+    tools_error(config, &missing_tools(host, config))
+}
+
+/// The error for the `missing` programs of `config`'s engine (none: Ok).
+fn tools_error(config: &AcquisitionConfig, missing: &[&str]) -> Result<(), AcquisitionError> {
     if missing.is_empty() {
         return Ok(());
     }
+    let required = required_tools(config);
     Err(AcquisitionError::failed(format!(
         "{} runs {}, but {} {} not installed (not found as an executable on PATH); install ewf-tools and gddrescue (Debian/Ubuntu) or libewf and ddrescue (Nix). Nothing was written and nothing was sent to the source",
         if config.engine() == EngineKind::Rescue && config.rescue_to_e01 {

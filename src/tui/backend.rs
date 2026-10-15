@@ -200,6 +200,7 @@ impl TuiBackend for OfflineBackend {
                 destination: None,
                 capacity: None,
                 smart: None,
+                missing_tools: None,
                 problems: vec![crate::engines::session::CheckProblem {
                     step: "request".into(),
                     kind: crate::engines::ErrorKind::Failed,

@@ -499,6 +499,7 @@ fn confirm_app() -> App {
             errors: Vec::new(),
         }),
         smart: None,
+        missing_tools: Some(Vec::new()),
         problems: Vec::new(),
         notes: Vec::new(),
     };
