@@ -263,7 +263,7 @@ case values the conversion records (E01 header < report < form), each with
 where it comes from, and names a report next to the image that describes
 another image and is not used. Notices are wrapped
 rather than cut, the ones that do not fit are counted, and Ctrl+X dismisses only
-the notices shown.
+the notices shown on the screen (none while the terminal is too small).
 
 ### Command line
 

@@ -796,8 +796,9 @@ pub struct App {
 
     pub notices: Vec<Notice>,
     notice_seq: u64,
-    /// Terminal size of the last frame drawn: which notices were shown
-    pub frame_size: (u16, u16),
+    /// Ids of the notices the last frame drew (I-N4): Ctrl+X dismisses only
+    /// these; none on the "terminal too small" screen
+    pub notices_drawn: Vec<u64>,
     pub profile: CaseProfile,
     pub profile_path: Option<PathBuf>,
     pub ssh_warning: Option<String>,
@@ -900,7 +901,7 @@ impl App {
             verify_due: None,
             notices: Vec::new(),
             notice_seq: 0,
-            frame_size: (MIN_WIDTH, MIN_HEIGHT),
+            notices_drawn: Vec::new(),
             profile: CaseProfile::default(),
             profile_path: None,
             ssh_warning: None,
@@ -1022,16 +1023,11 @@ impl App {
         (height as usize / 4).max(NOTICE_MIN_LINES)
     }
 
-    /// Acknowledge the notices shown (Ctrl+X); the ones that did not fit
-    /// stay and move up.
+    /// Acknowledge the notices shown (Ctrl+X): those the last frame drew.
+    /// The ones that did not fit, arrived after it or were never drawn (the
+    /// "terminal too small" screen) stay.
     pub fn dismiss_notices(&mut self) {
-        let (w, h) = self.frame_size;
-        let ids: Vec<u64> = self
-            .notice_page(w as usize, Self::notice_lines_max(h))
-            .shown
-            .iter()
-            .map(|(n, _)| n.id)
-            .collect();
+        let ids = std::mem::take(&mut self.notices_drawn);
         self.notices.retain(|n| !ids.contains(&n.id));
     }
 
@@ -3371,6 +3367,7 @@ mod tests {
         app.tick();
         assert_eq!(app.notices.len(), 1);
         assert_eq!(app.notices[0].text, "error");
+        draw(&mut app, 80, 24);
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         assert!(app.notices.is_empty());
     }
@@ -3409,21 +3406,47 @@ mod tests {
         );
     }
 
+    fn draw(app: &mut App, w: u16, h: u16) {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        t.draw(|f| crate::tui::ui::render(f, app)).unwrap();
+    }
+
     #[test]
     fn ctrl_x_dismisses_only_the_notices_shown() {
         let mut app = App::with_devices(Vec::new());
         for i in 0..4 {
             app.notify(Level::Error, long_error(i));
         }
-        app.frame_size = (80, 24);
+        draw(&mut app, 80, 24);
         let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
         app.handle_key(ctrl_x);
         // The two shown are gone; the two that did not fit stay, unread
         let left: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
         assert_eq!(left.len(), 2, "{left:?}");
         assert!(left[0].starts_with("error number 0") && left[1].starts_with("error number 1"));
+        // Not drawn since: a second Ctrl+X dismisses nothing
+        app.handle_key(ctrl_x);
+        assert_eq!(app.notices.len(), 2);
+        draw(&mut app, 80, 24);
         app.handle_key(ctrl_x);
         assert!(app.notices.is_empty());
+    }
+
+    #[test]
+    fn ctrl_x_never_dismisses_notices_that_were_not_drawn() {
+        // I-N4: on the "terminal too small" screen no notice is drawn
+        let mut app = App::with_devices(Vec::new());
+        app.notify(Level::Error, "the destination is full");
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        draw(&mut app, MIN_WIDTH - 1, MIN_HEIGHT);
+        app.handle_key(ctrl_x);
+        assert_eq!(app.notices.len(), 1, "never shown, so never dismissed");
+        // A notice that arrived after the last frame stays as well
+        draw(&mut app, 80, 24);
+        app.notify(Level::Error, "the source disappeared");
+        app.handle_key(ctrl_x);
+        let left: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(left, ["the source disappeared"]);
     }
 
     #[test]

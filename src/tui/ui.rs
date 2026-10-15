@@ -65,12 +65,13 @@ fn block(title: impl Into<String>, color: Color) -> Block<'static> {
 /// Draw the whole screen.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    app.frame_size = (area.width, area.height);
+    app.notices_drawn.clear();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_too_small(frame, area);
         return;
     }
-    let notice_lines = notice_lines(app, area.width as usize, area.height);
+    let (notice_lines, drawn) = notice_lines(app, area.width as usize, area.height);
+    app.notices_drawn = drawn;
     let [header, notices, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(notice_lines.len() as u16),
@@ -196,8 +197,10 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 /// Notification lines: errors first, then warnings, then information,
 /// newest first, each wrapped in full ([`App::notice_page`]); a last line
 /// counts the notices that did not fit, errors among them.
-fn notice_lines(app: &App, width: usize, height: u16) -> Vec<Line<'static>> {
+/// The notification area's lines and the ids of the notices in them.
+fn notice_lines(app: &App, width: usize, height: u16) -> (Vec<Line<'static>>, Vec<u64>) {
     let page = app.notice_page(width, App::notice_lines_max(height));
+    let drawn = page.shown.iter().map(|(n, _)| n.id).collect();
     let mut lines = Vec::new();
     for (n, text) in &page.shown {
         let color = match n.level {
@@ -233,7 +236,7 @@ fn notice_lines(app: &App, width: usize, height: u16) -> Vec<Line<'static>> {
             },
         )));
     }
-    lines
+    (lines, drawn)
 }
 
 pub(crate) fn footer_hints(app: &App) -> String {

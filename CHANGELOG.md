@@ -103,7 +103,8 @@ and when something was not done the report says so.
   banner, coloured by outcome, shows the key numbers and paths, scrolls the full
   report and stays until acknowledged; errors no longer expire. Notices are
   wrapped instead of cut at the terminal width, the ones that do not fit are
-  counted, and Ctrl+X dismisses only the notices shown.
+  counted, and Ctrl+X dismisses only the notices shown (none on the "terminal
+  too small" screen, none that arrived after the last screen was drawn).
 - **H2** No signal handling: SIGINT, SIGTERM and SIGQUIT abort gracefully
   (SIGINT to the tool's process group, grace period, then SIGTERM and SIGKILL),
   a second SIGINT kills at once, SIGHUP lets the run finish headless; every
