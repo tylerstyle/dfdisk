@@ -218,7 +218,8 @@ sudo install -m 755 target/release/dfdisk /usr/local/bin/
 ```
 
 `dfdisk --version` prints the git revisions of dfdisk and dfcore it was built
-from; every report records them too.
+from, with "-dirty" when a tracked file differed from that commit; every report
+records them too.
 
 ## Usage
 
@@ -236,11 +237,19 @@ destination and settings; starting requires typing the last four characters of
 the serial number (the whole serial when it is shorter, the evidence number when
 the device has no serial). The result screen shows the verdict first and stays
 until it is acknowledged; when the TUI ends before a result was acknowledged
-(for example after SIGHUP) it exits with that result's exit code. `?` or F1 shows the keys of the current screen. Esc goes back and
-never aborts an acquisition; aborting asks for confirmation. The TUI also
-converts images, re-verifies an image against its report, resumes a rescue, and
-remembers examiner, authority and the last destination in
-`$XDG_CONFIG_HOME/dfdisk/profile.toml`.
+(for example after SIGHUP) it exits with that result's exit code. `?` or F1
+shows the keys of the current screen. Esc goes back and never aborts an
+acquisition; aborting asks for confirmation. The TUI also converts images,
+re-verifies an image against its report, resumes a rescue, and remembers
+examiner, authority and the last destination in
+`$XDG_CONFIG_HOME/dfdisk/profile.toml`. The converter fills its empty case
+number, evidence number, examiner and description fields from the image's
+`.info.json` and names the fields it took; when the source changes, the values
+taken from the earlier image's report that were not edited are emptied. Case
+values the converter form has no field for (EA, authority, seal number, seizure
+time and place) come from the report the converter uses. Notices are wrapped
+rather than cut, the ones that do not fit are counted, and Ctrl+X dismisses only
+the notices shown.
 
 ### Command line
 
@@ -331,12 +340,17 @@ output. Its report is `<base>.conversion.info` / `.conversion.info.json`.
 
 ### Signals
 
-SIGINT or SIGTERM stops an acquisition gracefully: the running tool is asked to
-stop (ewfacquire gets 15 s, ddrescue 30 s so it can save its map), the partial
-output is kept, the report is written with verdict ABORTED and dfdisk exits 8. A
-second SIGINT kills the tool at once; the report is still written. SIGHUP (a
-closed terminal or SSH session) lets the acquisition finish headless and write
-its report.
+SIGINT, SIGTERM or SIGQUIT stops an acquisition gracefully: the running tool is
+asked to stop (ewfacquire gets 15 s, ddrescue 30 s so it can save its map), the
+partial output is kept, the report is written with verdict ABORTED and dfdisk
+exits 8. A second SIGINT kills the tool at once; the report is still written.
+SIGHUP (a closed terminal or SSH session) lets the acquisition finish headless
+and write its report. If dfdisk itself is killed in a way it cannot handle
+(SIGKILL, the OOM killer, a crash), its running tool gets SIGTERM from the
+kernel and ends too; no report is written then. An unmount (`dfdisk unmount`,
+or U in the TUI) is not cut short by SIGINT, SIGTERM, SIGQUIT or SIGHUP: dfdisk
+finishes it, checks whether anything stayed mounted and writes its audit record
+before it exits.
 
 ## Exit codes
 
@@ -394,28 +408,36 @@ identify-class queries that the report records.
   one that changes or disappears during the run makes the verdict INCOMPLETE.
   External tools read through `/dev/disk/by-diskseq/<N>` when that link points
   at the pinned device.
-- **Refusals.** dfdisk refuses (exit 3) an empty device (size 0: no medium,
-  or the size is unknown), a device listed in the dfnix
-  protected-device registry (and fails closed when the registry exists but cannot
-  be read), a system disk, a device with mounted filesystems (in dfdisk's mount
-  namespace; a mount in another namespace makes the exclusive open below fail)
-  or active swap, and a device with holders (dm-crypt, LVM, md): a holder
-  claims the device, so it has to be closed first (there is no override).
-  Unmounting is a separate, explicit, audited
+- **Refusals.** dfdisk refuses (exit 3) an empty device (size 0: no medium, or
+  the size is unknown), a device listed in the dfnix protected-device registry
+  (and fails closed when the registry exists but cannot be read), a system disk,
+  a device with mounted filesystems (in dfdisk's mount namespace; a mount in
+  another namespace makes the exclusive open below fail) or active swap, and a
+  device with holders (dm-crypt, LVM, md, or a loop device whose backing file is
+  the source or one of its partitions; mounts of such a loop device count as
+  mounts of the source): a holder keeps the device open, so it has to be closed
+  first (there is no override). Unmounting is a separate, explicit, audited
   action (`dfdisk unmount`, `--auto-unmount`) that refuses system mounts and
   protected devices and never forces or lazily unmounts.
 - **Exclusive open.** The source is opened with `O_EXCL` and held for the whole
-  run, so nothing can mount or assemble it meanwhile; EBUSY means it is in use.
+  run, so the kernel refuses to mount it or to assemble device-mapper, LVM or md
+  devices on it meanwhile (setting up a loop device needs no exclusive claim and
+  is not stopped by it); EBUSY means it is in use.
 - **Destination checks** before anything is written: not on the source, not on a
   dfnix evidence mount, not tmpfs/ramfs, writable, enough free space, file size
   limits of FAT, no existing output of the same name (case-insensitive). A 1 MiB
   reservation guarantees room for the report.
 - **Write protection.** With `--write-protect auto` (default) dfdisk sets the
-  kernel read-only flag (BLKROSET) on the source node and on the disk it is
-  stored on together with every partition node of that disk (a disk that has
-  other mounted filesystems stays writable, with a note in the report). It
-  refuses if a flag cannot be set, leaves the flags set afterwards and records
-  every node. `--write-protect off` only records the state.
+  kernel read-only flag (BLKROSET) on the source node, its own partitions, every
+  node it sits on down to the disk (the partition and intermediate dm/md devices
+  under a LUKS, LVM or md source) and the disk(s) it is stored on together with
+  every partition node of those disks. A disk that has other mounted filesystems
+  stays writable together with its partitions outside the source's chain (as
+  does a node of the chain that another mounted device depends on); the report
+  names exactly the nodes left writable. It refuses if a flag cannot be set,
+  leaves the flags set afterwards and records every node; each node keeps its
+  own flag (`blockdev --setrw <node>` clears one node). `--write-protect off`
+  only records the state.
 - **Order.** Nothing is sent to the device (BLKROSET, hdparm, smartctl) before
   the audit "acquisition_started" record is written. On dfnix an audit log that
   cannot be written refuses the acquisition.
@@ -498,7 +520,7 @@ Source layout:
 ```
 src/
 ├── main.rs            exit codes, error printing
-├── signals.rs         SIGINT/SIGTERM/SIGHUP handling shared by CLI and TUI
+├── signals.rs         SIGINT/SIGTERM/SIGQUIT/SIGHUP handling shared by CLI and TUI
 ├── cli/               argument parsing and subcommands
 ├── tui/               ratatui interface
 ├── discovery/         device scan, identity probe, sysfs, write protection,
