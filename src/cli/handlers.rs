@@ -6,9 +6,9 @@ use crate::cli::args::{CliImageFormat, ConvertArgs, ListArgs, UnmountArgs, Verif
 use crate::cli::console::{progress_line, Console, ProgressPrinter};
 use crate::cli::drive::{drive, with_signals, Activity};
 use crate::cli::resolve::{resolve_argument, ResolvedSource};
+use crate::discovery::devices::{self, Scan};
 use crate::discovery::{identity, safety, smart, DeviceScanner};
 use crate::engines::converter;
-use crate::engines::process::StopControl;
 use crate::engines::verify::{
     self, CheckStatus, ExpectedHashes, ImageVerification, VerifyEvent, VerifyOptions,
 };
@@ -17,7 +17,7 @@ use crate::models::case::CaseMetadata;
 use crate::models::config::SmartPolicy;
 use crate::models::conversion::{ConversionRequest, ConversionTarget};
 use crate::models::device::BlockDevice;
-use crate::models::identity::{SourceIdentity, SourceKind};
+use crate::models::identity::SourceKind;
 use crate::models::info_report::INFO_JSON_SUFFIX;
 use crate::models::outcome::{exit_code, Outcome, VerificationResult};
 use crate::models::telemetry::{AcquisitionStatus, PhaseProgress, ProgressTelemetry};
@@ -32,43 +32,48 @@ use tokio::sync::mpsc;
 // list
 // ---------------------------------------------------------------------------
 
-/// `dfdisk list [--json] [--smart]`.
+/// `dfdisk list [--json] [--smart]`: one lsblk + sysfs scan (nothing is
+/// sent to any device); `--json` prints the scan's listing (schema 1,
+/// partitions and stacked devices nested in `children`).
 pub async fn handle_list(args: ListArgs, console: &Console) -> Result<i32, AcquisitionError> {
-    let mut devices = tokio::task::spawn_blocking(DeviceScanner::scan_devices)
+    let scan = tokio::task::spawn_blocking(DeviceScanner::scan)
         .await
         .map_err(|e| AcquisitionError::failed(format!("the device scan stopped: {e}")))?
         .map_err(|e| AcquisitionError::failed(format!("cannot list the block devices: {e}")))?;
-    if args.smart {
-        add_smart(&mut devices).await;
-    }
     if console.json() {
+        let mut list = scan.listing();
+        if args.smart {
+            list.attach_smart(&scan, SmartPolicy::Basic).await;
+        }
         console.data(
-            &serde_json::to_string_pretty(&devices)
+            &serde_json::to_string_pretty(&list)
                 .map_err(|e| AcquisitionError::failed(e.to_string()))?,
         );
-    } else {
-        console.data(&device_table(&devices, args.smart));
+        return Ok(exit_code::VERIFIED);
     }
+    let mut devices = scan.devices();
+    if args.smart {
+        add_smart(&scan, &mut devices).await;
+    }
+    for note in &scan.notes {
+        console.note(&format!("[!] {}", sanitize_line(note)));
+    }
+    console.data(&device_table(&devices, args.smart));
     Ok(exit_code::VERIFIED)
 }
 
-/// SMART summary of every whole disk (on request only: §8 keeps SMART out of
-/// scans). Inaccessible SMART stays UNKNOWN.
-async fn add_smart(devices: &mut [BlockDevice]) {
-    let control = StopControl::none();
+/// SMART summary of every whole disk, queried on demand (§8: never part of a
+/// scan; `-n standby` does not wake a sleeping disk). Inaccessible SMART
+/// stays UNKNOWN.
+async fn add_smart(scan: &Scan, devices: &mut [BlockDevice]) {
     let jobs = devices
         .iter()
         .enumerate()
         .filter(|(_, d)| d.kind == SourceKind::Disk)
-        .map(|(i, d)| {
-            let id = SourceIdentity::from_block_device(d);
-            let control = &control;
-            async move {
-                (
-                    i,
-                    smart::snapshot(&id, SmartPolicy::Basic, None, control, None).await,
-                )
-            }
+        .filter_map(|(i, d)| {
+            let node = scan.nodes.iter().find(|n| n.device.path == d.path)?;
+            let id = node.identity.clone();
+            Some(async move { (i, smart::query_on_demand(&id, SmartPolicy::Basic).await) })
         })
         .collect::<Vec<_>>();
     for (i, snap) in futures::future::join_all(jobs).await {
@@ -78,23 +83,10 @@ async fn add_smart(devices: &mut [BlockDevice]) {
     }
 }
 
-/// The state badges of a device: SYSTEM or MOUNTED, PROTECTED, RO, IN-USE.
+/// The state badges of a device (the scan's: SYSTEM, PROTECTED, MOUNTED,
+/// RO, IN-USE), or "-".
 pub fn badges(dev: &BlockDevice) -> String {
-    let mut b: Vec<&str> = Vec::new();
-    if dev.safety.is_system() {
-        b.push("SYSTEM");
-    } else if dev.safety.is_mounted() {
-        b.push("MOUNTED");
-    }
-    if dev.protected.is_some() {
-        b.push("PROTECTED");
-    }
-    if dev.is_read_only {
-        b.push("RO");
-    }
-    if !dev.holders.is_empty() {
-        b.push("IN-USE");
-    }
+    let b = devices::badges(dev, None);
     if b.is_empty() {
         "-".into()
     } else {
@@ -550,6 +542,7 @@ mod tests {
             transport: Some("usb".into()),
             hotplug: true,
             safety: DeviceSafety::Mounted(vec!["/media/x".into()]),
+            mountpoints: vec!["/media/x".into()],
             protected: Some("dfnix boot medium".into()),
             is_read_only: true,
             holders: vec!["dm-0".into()],
@@ -568,7 +561,7 @@ mod tests {
         let t = device_table(&devices, true);
         assert!(t.contains("WD-WCC4E1234567890ABCDEFGH"), "{t}");
         assert!(
-            t.contains("MOUNTED PROTECTED RO IN-USE / not queried"),
+            t.contains("PROTECTED MOUNTED RO IN-USE / not queried"),
             "{t}"
         );
         assert!(t.contains("/dev/sdb1"), "{t}");

@@ -735,16 +735,18 @@ fn verify_takes_the_expected_digests_from_a_report() {
 
 #[test]
 fn list_json_structure() {
+    // Names and device numbers no host has (major 511 is unassigned), so
+    // the scan finds no sysfs entry, mount or device link of the real host
     let tmp = scratch();
     let lsblk = tmp.path().join("lsblk");
     std::fs::write(
         &lsblk,
         r#"#!/bin/sh
 cat << 'EOF'
-{"blockdevices": [{"name": "nvme0n1", "path": "/dev/nvme0n1", "maj:min": "259:0",
+{"blockdevices": [{"name": "nvme97n1", "path": "/dev/nvme97n1", "maj:min": "511:96",
   "size": 1000204886016, "type": "disk", "model": "Example NVMe 1TB", "vendor": "Example",
   "serial": "S5GXNF0R123456", "tran": "nvme", "mountpoints": [null],
-  "children": [{"name": "nvme0n1p1", "path": "/dev/nvme0n1p1", "maj:min": "259:1",
+  "children": [{"name": "nvme97n1p1", "path": "/dev/nvme97n1p1", "maj:min": "511:97",
     "size": 536870912, "type": "part", "fstype": "vfat", "mountpoints": [null]}]}]}
 EOF
 "#,
@@ -760,29 +762,42 @@ EOF
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{:?}", text(&output));
     let v: serde_json::Value = serde_json::from_str(&text(&output).0).unwrap();
-    let devices = v.as_array().expect("an array of devices");
+    assert_eq!(v["schema_version"], 1, "{v}");
+    assert!(v.get("registry").is_some(), "{v}");
+    let devices = v["devices"].as_array().expect("an array of devices");
     assert_eq!(devices.len(), 1);
     let d = &devices[0];
     for field in [
         "name",
         "path",
-        "bus_type",
+        "kernel_name",
+        "transport",
         "serial",
+        "serial_candidates",
         "maj_min",
         "kind",
-        "partitions",
+        "holders",
+        "mountpoints",
+        "system",
+        "badges",
+        "children",
     ] {
         assert!(d.get(field).is_some(), "{field}: {d}");
     }
     assert_eq!(d["size_bytes"], 1000204886016u64);
-    assert_eq!(d["maj_min"], "259:0");
-    assert_eq!(d["partitions"][0]["maj_min"], "259:1");
+    assert_eq!(d["maj_min"], "511:96");
+    assert_eq!(d["serial"], "S5GXNF0R123456");
+    assert_eq!(d["transport"], "nvme");
+    assert_eq!(d["children"][0]["maj_min"], "511:97");
+    assert_eq!(d["children"][0]["path"], "/dev/nvme97n1p1");
+    // No SMART in a scan (section 8)
+    assert!(d.get("smart").is_none(), "{d}");
 
     let output = dfdisk().args(["list"]).env("PATH", &path).output().unwrap();
     assert_eq!(output.status.code(), Some(0));
     let (stdout, _) = text(&output);
     assert!(stdout.contains("S5GXNF0R123456"), "{stdout}");
-    assert!(stdout.contains("/dev/nvme0n1p1"), "{stdout}");
+    assert!(stdout.contains("/dev/nvme97n1p1"), "{stdout}");
 }
 
 #[test]

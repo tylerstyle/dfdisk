@@ -166,8 +166,9 @@ pub struct ListArgs {
     #[arg(long, short = 'j')]
     pub json: bool,
 
-    /// Also query the SMART health of every disk (smartctl -i -H -A -l error;
-    /// sends identify-class commands to each disk, so it is off by default)
+    /// Also query the SMART health of every whole disk (smartctl -j -i -H -A
+    /// -l error -n standby: identify-class commands, a disk in standby is not
+    /// woken; off by default, never part of a scan)
     #[arg(long)]
     pub smart: bool,
 }
