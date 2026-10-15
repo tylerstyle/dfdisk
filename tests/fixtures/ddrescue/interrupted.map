@@ -1,0 +1,10 @@
+# Mapfile. Created by GNU ddrescue version 1.30
+# Command line: ddrescue -r 0 -b 512 -Z 262144 -H test.map src.bin img.raw img.map
+# Start time:   2026-10-15 01:07:52
+# Current time: 2026-10-15 01:07:54
+# Copying non-tried blocks... Pass 1 (forwards)
+# current_pos  current_status  current_pass
+0x000A0000     ?               1
+#      pos        size  status
+0x00000000  0x000A0000  +
+0x000A0000  0x00360000  ?
