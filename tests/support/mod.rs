@@ -74,7 +74,8 @@ impl FakeDev {
     /// Make `source` a fake device with these shim settings, e.g.
     /// `[("FAKEDEV_BAD", "1048576:512")]`. Extra keys the wrapper knows:
     /// `FAKEDEV_VANISH_AFTER=1` renames the source to `<source>.vanished`
-    /// after ewfacquire exited.
+    /// after ewfacquire exited; `FAKEDEV_SHRINK_AFTER=<bytes>` truncates it
+    /// to that size after ewfacquire exited.
     pub fn configure(&self, source: &Path, settings: &[(&str, &str)]) {
         let mut text = String::new();
         for (k, v) in settings {
@@ -149,12 +150,17 @@ if [ -n "$last" ] && [ -f "$last.fakedev" ]; then
     . "$last.fakedev"
     set +a
     export FAKEDEV_TARGET="$last" FAKEDEV_PROG=ewfacquire LD_PRELOAD='{lib}'
-    if [ -z "$FAKEDEV_VANISH_AFTER" ]; then
+    if [ -z "$FAKEDEV_VANISH_AFTER" ] && [ -z "$FAKEDEV_SHRINK_AFTER" ]; then
         exec '{real}' "$@"
     fi
     '{real}' "$@"
     status=$?
-    mv "$last" "$last.vanished"
+    if [ -n "$FAKEDEV_VANISH_AFTER" ]; then
+        mv "$last" "$last.vanished"
+    fi
+    if [ -n "$FAKEDEV_SHRINK_AFTER" ]; then
+        truncate -s "$FAKEDEV_SHRINK_AFTER" "$last"
+    fi
     exit $status
 fi
 exec '{real}' "$@"

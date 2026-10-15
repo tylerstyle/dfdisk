@@ -94,7 +94,11 @@ and when something was not done the report says so.
   shows a confirmation sheet. An E01 acquisition of a source that ends before
   its size while it stays attached no longer waits forever: after 60 s without
   progress dfdisk checks the source and, when it is gone or smaller, stops
-  ewfacquire (INCOMPLETE, "source lost at offset X").
+  ewfacquire (INCOMPLETE, "source lost at offset X"). When ewfacquire
+  zero-filled to the end of the medium and the source is gone or smaller
+  afterwards (presence and size are checked), those zeros are listed as not
+  acquired ("source lost at offset X"); only a source still present with its
+  full size makes them read errors of the medium.
 - **H1** The TUI hid the verdict: the result screen starts with the verdict
   banner, coloured by outcome, shows the key numbers and paths, scrolls the full
   report and stays until acknowledged; errors no longer expire. Notices are
