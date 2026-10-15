@@ -1,200 +1,469 @@
-//! Rescue engine (§13 Rescue): GNU ddrescue copies what it can read into
-//! `<base>.raw` and records every area in `<base>.map`; dfdisk hashes the
-//! image afterwards.
+//! Rescue engine (§13 Rescue, review H4, R12): GNU ddrescue copies what it
+//! can read into `<base>.raw` and records every area in its map `<base>.map`.
 //!
-//! RESCUE AGENT: this is the 0.1 engine adapted to the session interface;
-//! map parsing into exact ranges, the identity sidecar and resume sessions,
-//! the process runner with graceful abort, and `--rescue-to-e01` (§13) are
-//! still to do.
+//! What the report says comes from the map only ([`ddrescue_map`]):
+//! - `+` finished: in the image as read;
+//! - `-` bad sector: zeros in the image (ddrescue never writes it), listed
+//!   as `Substituted`;
+//! - `?` non-tried, `*` non-trimmed, `/` non-scraped: `Unread`; the rescue is
+//!   incomplete until it is run again (resumed).
+//!
+//! The image is extended to the size of the source (`set_len`) only when the
+//! map covers the whole source and every block is finished or bad: ddrescue
+//! does not write unreadable sectors at the end of a device, so a finished
+//! image can be shorter than the source. An unfinished image is never padded.
+//!
+//! ddrescue runs through [`process`] (both streams, `LC_ALL=C`, own process
+//! group); an abort sends SIGINT, on which ddrescue saves its map, with 30 s
+//! of grace before SIGTERM and SIGKILL. Progress comes from ddrescue's
+//! "pct rescued" line, the live bad-sector count from the map ddrescue saves
+//! while it runs.
+//!
+//! Resume (`config.resume`): the first start writes `<base>.identity.json`
+//! (the probed identity of the source). A resume requires that record and the
+//! same device (WWN / serial, or the same attachment for a device without
+//! either) of the same size ([`check_resume_identity`], which the session also
+//! runs before anything is written), keeps the previous report as
+//! `<base>.info.session-N` (+ `<base>.info.session-N.json`), lists every
+//! earlier session, states whether the map changed since the last report,
+//! and passes `-I` so ddrescue checks the size of the source against the map.
+//!
+//! Verification: ddrescue computes no digest while reading. [`verify`]
+//! hashes the image after the session's flush and cache eviction and returns
+//! `NotPossible`; only a matching second read of the source
+//! (`--verify-source`, run by the session through `raw::hash_source`) makes a
+//! clean rescue `Verified`. A rescue with bad sectors is never verified.
+//!
+//! `--rescue-to-e01` is orchestrated by the caller (CLI) after the rescue
+//! report is written, with `engines::converter::convert`; this engine only
+//! records that it was requested.
 
+use crate::engines::ddrescue_map::{self, Mapfile, MAP_SOURCE};
 use crate::engines::error::AcquisitionError;
-use crate::engines::hasher::{HashProgress, MultiHasher};
+use crate::engines::preflight;
+use crate::engines::process::{self, ProcessEvent, ProcessSpec, StreamTag};
 use crate::engines::session::{EngineContext, EngineOutput};
-use crate::models::{
-    info_report::HashResults,
-    outcome::{ReadErrorTable, VerificationResult},
-    telemetry::{AcquisitionStatus, ProgressTelemetry},
+use crate::models::config::{EngineSettings, HashSelection, RescueSettings, SmartPolicy};
+use crate::models::identity::{normalize_wwn, SerialSource, SourceIdentity, SourceKind};
+use crate::models::info_report::{
+    sha256_file, sync_dir, write_atomic, ForensicInfoReport, HashResults, SessionInfo,
+    INFO_JSON_SUFFIX, INFO_SUFFIX,
 };
+use crate::models::outcome::{RangeKind, ReadErrorTable, VerificationResult};
+use crate::models::provenance::{DFDISK_GIT_REV, DFDISK_VERSION};
+use crate::models::telemetry::ProgressTelemetry;
+use crate::models::text::sanitize_line;
+use chrono::{DateTime, Utc};
+use digest::Digest;
 use regex::Regex;
-use std::fs;
-use std::process::Stdio;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
-use tokio::sync::mpsc;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, OpenOptions};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
+use std::time::{Duration, Instant, SystemTime};
+
+/// The ddrescue program (looked up in PATH).
+pub const DDRESCUE: &str = "ddrescue";
+/// The rescued image, `<base>.raw`.
+pub const IMAGE_SUFFIX: &str = ".raw";
+/// ddrescue's map, `<base>.map`.
+pub const MAP_SUFFIX: &str = ".map";
+/// Identity of the source recorded at the first start, `<base>.identity.json`.
+pub const IDENTITY_SUFFIX: &str = ".identity.json";
+/// A kept report of an earlier session: `<base>.info.session-N` and
+/// `<base>.info.session-N.json`.
+pub const SESSION_SUFFIX: &str = ".info.session-";
+/// SIGINT → SIGTERM delay on abort: ddrescue saves its map on SIGINT.
+pub const DDRESCUE_GRACE: Duration = Duration::from_secs(30);
+/// How often the map is re-read for the live bad-sector count.
+const MAP_POLL: Duration = Duration::from_secs(2);
+/// Chunk size for hashing the image.
+const HASH_CHUNK: usize = 4 << 20;
+
+const NO_STREAM_DIGEST: &str = "ddrescue computes no digest while reading, so the image digests have nothing to be compared with; --verify-source compares them with a second read of the source";
+
+// ---------------------------------------------------------------------------
+// The engine
+// ---------------------------------------------------------------------------
 
 /// Rescue the source into `<base>.raw` with its map `<base>.map` (step 8).
 pub async fn acquire(ctx: &EngineContext) -> Result<EngineOutput, AcquisitionError> {
+    acquire_with(ctx, OsStr::new(DDRESCUE)).await
+}
+
+/// [`acquire`] with another ddrescue program (tests).
+pub async fn acquire_with(
+    ctx: &EngineContext,
+    program: &OsStr,
+) -> Result<EngineOutput, AcquisitionError> {
     let config = ctx.config();
-    if config.rescue_to_e01 {
-        return Err(AcquisitionError::usage(
-            "--rescue-to-e01 is not available in this build",
-        ));
-    }
-    let instant_start = Instant::now();
     let expected = ctx.expected_bytes();
     let sector_size = ctx.sector_size();
-    let raw_path = ctx.output_path(".raw");
-    let map_path = ctx.output_path(".map");
-
-    let mut cmd = Command::new("ddrescue");
-    cmd.arg("-d"); // Direct I/O
-    cmd.arg("-r").arg(config.error_retries.to_string());
-    cmd.arg("-b").arg(sector_size.to_string());
-    if config.resume {
-        // The map must describe a source of the same size
-        cmd.arg("-I");
-    }
-    cmd.arg(&ctx.tool_source_path);
-    cmd.arg(&raw_path);
-    cmd.arg(&map_path);
-    cmd.env("LC_ALL", "C");
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
-    cmd.kill_on_drop(true);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AcquisitionError::failed(format!("cannot start ddrescue: {e}")))?;
-    let child_pid = child.id();
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AcquisitionError::failed("cannot capture the output of ddrescue"))?;
-    let mut reader = BufReader::new(stdout).lines();
-
-    let mut telemetry = ProgressTelemetry {
-        status: AcquisitionStatus::Acquiring,
-        total_bytes: expected,
-        current_segment: format!("{}.raw", ctx.base_name),
-        status_message: "Starting resilient ddrescue acquisition...".to_string(),
-        ..Default::default()
+    let image = ctx.output_path(IMAGE_SUFFIX);
+    let map = ctx.output_path(MAP_SUFFIX);
+    let sidecar = ctx.output_path(IDENTITY_SUFFIX);
+    // Direct access applies to devices; a regular-file source is read like
+    // any file
+    let direct_io = ctx.identity.is_block_device();
+    let settings = RescueSettings {
+        retries: config.error_retries,
+        direct_io,
+        sector_size,
+        resume: config.resume,
+        rescue_to_e01: config.rescue_to_e01,
     };
+    let mut notes: Vec<String> = Vec::new();
 
-    let mut bad_sectors = 0u64;
-    let regex_pct = Regex::new(r"pct rescued:\s*(\d+(?:\.\d+)?)%").unwrap();
-    let regex_bad_size =
-        Regex::new(r"(?:bad-sector|errsize):\s*(\d+(?:\.\d+)?)\s*([kKMGT]?i?B)").unwrap();
-    let regex_speed =
-        Regex::new(r"(?:current rate|average rate):\s*(\d+(?:\.\d+)?)\s*([kKMGT]?i?B/s)").unwrap();
-    let regex_read_errors = Regex::new(r"read errors:\s*(\d+)").unwrap();
-    let mut poll_interval = tokio::time::interval(Duration::from_millis(100));
-    let mut last_read_bytes = 0u64;
-    let mut last_poll_time = Instant::now();
+    // Nothing is written before ddrescue is known to run
+    let program_name = program.to_string_lossy().into_owned();
+    let version = process::tool_version(&program_name, &["--version"], Duration::from_secs(10))
+        .await
+        .ok_or_else(|| {
+            AcquisitionError::failed(format!(
+                "GNU ddrescue ({program_name}) is not available on this host or does not run; install it and retry"
+            ))
+        })?;
+    ctx.provenance.set_tool_version(DDRESCUE, &version);
 
-    loop {
-        if ctx.abort.load(Ordering::SeqCst) {
-            let _ = child.kill().await;
-            telemetry.push_log("Rescue aborted by the examiner.");
-            ctx.progress.send(telemetry.take_update());
-            return Err(AcquisitionError::aborted(
-                "the rescue was aborted by the examiner",
-            ));
-        }
-        tokio::select! {
-            _ = poll_interval.tick() => {
-                if let Some(rchar) = child_pid.and_then(read_proc_rchar) {
-                    let total = expected.max(1);
-                    let processed = rchar.min(total);
-                    telemetry.bytes_processed = processed;
-                    telemetry.percentage = (processed as f64 / total as f64) * 100.0;
-                    let dt = last_poll_time.elapsed().as_secs_f64();
-                    if dt >= 0.1 {
-                        telemetry.speed_bps = processed.saturating_sub(last_read_bytes) as f64 / dt;
-                        last_read_bytes = processed;
-                        last_poll_time = Instant::now();
+    let mut resume_sessions = Vec::new();
+    if config.resume {
+        let (sessions, resume_notes) = prepare_resume(ctx, &map)?;
+        resume_sessions = sessions;
+        notes.extend(resume_notes);
+    } else {
+        write_identity_record(&sidecar, ctx)?;
+    }
+    if !direct_io {
+        notes.push(
+            "the source is a regular file: ddrescue reads it without direct access (-d applies to devices)"
+                .into(),
+        );
+    }
+    if config.smart == SmartPolicy::Off && ctx.identity.is_block_device() {
+        notes.push(
+            "no SMART snapshot before and after the rescue (--smart off): the health of the drive is not recorded"
+                .into(),
+        );
+    }
+    if config.rescue_to_e01 {
+        notes.push(
+            "--rescue-to-e01 was requested: the image is converted to E01 after this report is written; the conversion has its own report, which refers to this one. This report does not state the result of the conversion"
+                .into(),
+        );
+    }
+
+    let mut args: Vec<OsString> = Vec::new();
+    if direct_io {
+        args.push("-d".into());
+    }
+    args.push("-r".into());
+    args.push(config.error_retries.to_string().into());
+    args.push("-b".into());
+    args.push(sector_size.to_string().into());
+    if config.resume {
+        // ddrescue refuses when the size of the source differs from the map
+        args.push("-I".into());
+    }
+    args.push(ctx.tool_source_path.clone().into());
+    args.push(image.clone().into());
+    args.push(map.clone().into());
+    let spec = ProcessSpec::new(program).args(args).grace(DDRESCUE_GRACE);
+
+    let image_name = file_name(&image);
+    ctx.progress.update(|t| {
+        t.total_bytes = expected;
+        t.current_segment = image_name.clone();
+        t.status_message = format!("Starting {version}");
+    });
+    let t0 = Instant::now();
+    let mut screen = ScreenStatus::default();
+    let mut stderr_tail: Vec<String> = Vec::new();
+    let mut map_checked: Option<Instant> = None;
+    let mut map_mtime: Option<SystemTime> = None;
+    let run = process::run(
+        &spec,
+        &ctx.stop_control(),
+        Some(&ctx.provenance),
+        |ev| match ev {
+            ProcessEvent::Line {
+                stream: StreamTag::Stdout,
+                text,
+                ..
+            } => match screen.feed(text) {
+                Some(ScreenEvent::Progress) => {
+                    ctx.progress
+                        .update(|t| screen.apply(t, expected, t0.elapsed()));
+                }
+                Some(ScreenEvent::Phase(phase)) => ctx.progress.log(format!("ddrescue: {phase}")),
+                Some(ScreenEvent::Message(m)) => ctx.progress.log(format!("ddrescue: {m}")),
+                None => {}
+            },
+            ProcessEvent::Line {
+                stream: StreamTag::Stderr,
+                text,
+                ..
+            } => {
+                let line = sanitize_line(&strip_ansi(text));
+                if !line.is_empty() {
+                    ctx.progress.log(format!("ddrescue: {line}"));
+                    stderr_tail.push(line);
+                    if stderr_tail.len() > 20 {
+                        stderr_tail.remove(0);
                     }
-                    let elapsed = instant_start.elapsed().as_secs_f64();
-                    telemetry.elapsed_secs = elapsed as u64;
-                    if elapsed > 0.0 {
-                        telemetry.avg_speed_bps = processed as f64 / elapsed;
-                    }
-                    if telemetry.avg_speed_bps > 0.0 && total > processed {
-                        telemetry.eta_secs = Some(((total - processed) as f64 / telemetry.avg_speed_bps) as u64);
-                    }
-                    ctx.progress.send(telemetry.take_update());
                 }
             }
-            line_res = reader.next_line() => {
-                match line_res {
-                    Ok(Some(line)) => {
-                        let text = line.trim();
-                        if !text.is_empty() {
-                            if let Some(caps) = regex_pct.captures(text) {
-                                if let Ok(pct) = caps[1].parse::<f64>() {
-                                    telemetry.percentage = pct;
-                                }
-                            }
-                            if let Some(caps) = regex_speed.captures(text) {
-                                let val = caps[1].parse::<f64>().unwrap_or(0.0);
-                                let mult = match &caps[2] {
-                                    "kB/s" | "KB/s" => 1_000.0,
-                                    "MB/s" | "mB/s" => 1_000_000.0,
-                                    "GB/s" => 1_000_000_000.0,
-                                    "KiB/s" => 1024.0,
-                                    "MiB/s" => 1024.0 * 1024.0,
-                                    "GiB/s" => 1024.0 * 1024.0 * 1024.0,
-                                    _ => 1.0,
-                                };
-                                telemetry.speed_bps = val * mult;
-                            }
-                            if let Some(caps) = regex_bad_size.captures(text) {
-                                if let Ok(val) = caps[1].parse::<f64>() {
-                                    let bad_bytes = parse_size_to_bytes(val, &caps[2]);
-                                    bad_sectors = bad_bytes.div_ceil(u64::from(sector_size));
-                                    telemetry.bad_sectors = bad_sectors;
-                                }
-                            }
-                            if let Some(caps) = regex_read_errors.captures(text) {
-                                if let Ok(err_count) = caps[1].parse::<u64>() {
-                                    if bad_sectors == 0 && err_count > 0 {
-                                        bad_sectors = err_count;
-                                        telemetry.bad_sectors = bad_sectors;
-                                    }
-                                }
-                            }
-                            telemetry.status_message = text.to_string();
-                            ctx.progress.send(telemetry.take_update());
+            ProcessEvent::Tick { .. } => {
+                if map_checked.is_none_or(|t| t.elapsed() >= MAP_POLL) {
+                    map_checked = Some(Instant::now());
+                    let mtime = fs::metadata(&map).and_then(|m| m.modified()).ok();
+                    if mtime.is_some() && mtime != map_mtime {
+                        map_mtime = mtime;
+                        if let Ok(m) = ddrescue_map::read(&map) {
+                            let bad = m.bad_sectors(sector_size);
+                            ctx.progress.update(|t| t.bad_sectors = bad);
                         }
                     }
-                    Ok(None) | Err(_) => break,
                 }
             }
-        }
-    }
+        },
+    )
+    .await;
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| AcquisitionError::failed(format!("cannot wait for ddrescue: {e}")))?;
-    if !status.success() {
+    let outcome = match run {
+        Ok(o) => o,
+        Err(e) => {
+            discard_unused_record(config.resume, &sidecar, &image, &map);
+            return Err(AcquisitionError::failed(format!(
+                "cannot start ddrescue: {e}"
+            )));
+        }
+    };
+    let aborted = outcome.aborted || outcome.force_killed || ctx.is_aborted();
+    if !config.resume && !image.exists() && !map.exists() {
+        // ddrescue wrote nothing: there is nothing to report about
+        discard_unused_record(false, &sidecar, &image, &map);
+        if aborted {
+            return Err(AcquisitionError::aborted(
+                "the rescue was aborted before ddrescue wrote anything",
+            ));
+        }
         return Err(AcquisitionError::failed(format!(
-            "ddrescue failed with exit code {:?}",
-            status.code()
+            "ddrescue wrote neither an image nor a map ({})",
+            exit_description(&outcome, &stderr_tail)
         )));
     }
 
-    let image_len = fs::metadata(&raw_path).map(|m| m.len()).unwrap_or(0);
-    let (bytes_acquired, stop_reason) = rescue_extent(bad_sectors, image_len, expected);
+    let fin = finalize(&map, &image, expected, sector_size);
+    notes.extend(fin.notes);
+    let mut stop_reason = fin.stop_reason;
+    if outcome.force_killed {
+        notes.push(
+            "ddrescue was killed at once (forced stop): it could not save its map a last time, so the map may miss its most recent progress; those areas count as not acquired and a resume reads them again"
+                .into(),
+        );
+    } else if aborted {
+        let signals: Vec<&str> = outcome.signals_sent.iter().map(|s| s.name()).collect();
+        notes.push(if signals.is_empty() {
+            "the rescue was aborted".to_string()
+        } else {
+            format!(
+                "the rescue was stopped with {}; ddrescue writes its map when it is interrupted, and this report describes the map as ddrescue left it",
+                signals.join(", ")
+            )
+        });
+    } else if !outcome.success() {
+        let reason = format!(
+            "ddrescue ended abnormally ({})",
+            exit_description(&outcome, &stderr_tail)
+        );
+        stop_reason = Some(match stop_reason {
+            Some(s) => format!("{reason}; {s}"),
+            None => reason,
+        });
+    }
+    ctx.progress.update(|t| {
+        t.bad_sectors = fin.bad_sectors;
+        t.bytes_processed = fin.bytes_acquired;
+        t.percentage = if expected > 0 {
+            fin.bytes_acquired as f64 * 100.0 / expected as f64
+        } else {
+            100.0
+        };
+        t.elapsed_secs = t0.elapsed().as_secs();
+        t.eta_secs = None;
+    });
+
+    let mut auxiliary_files = Vec::new();
+    if map.exists() {
+        auxiliary_files.push(map.clone());
+    }
+    if sidecar.exists() {
+        auxiliary_files.push(sidecar.clone());
+    }
     Ok(EngineOutput {
-        bytes_acquired,
+        bytes_acquired: fin.bytes_acquired,
         expected_bytes: expected,
-        read_errors: ReadErrorTable::new(
-            sector_size,
-            "ddrescue screen output (map not parsed by this engine version)",
-        ),
+        read_errors: fin.read_errors,
         stop_reason,
-        image_files: vec![raw_path],
-        auxiliary_files: vec![map_path],
+        aborted,
+        image_files: if image.exists() {
+            vec![image]
+        } else {
+            Vec::new()
+        },
+        auxiliary_files,
+        notes,
+        settings: Some(EngineSettings::Rescue(settings)),
+        resume_sessions,
         ..Default::default()
     })
 }
 
+/// Remove the identity record a first start wrote when ddrescue left
+/// nothing behind (a resume never removes anything).
+fn discard_unused_record(resume: bool, sidecar: &Path, image: &Path, map: &Path) {
+    if resume || image.exists() || map.exists() {
+        return;
+    }
+    if fs::remove_file(sidecar).is_ok() {
+        if let Some(dir) = sidecar.parent() {
+            let _ = sync_dir(dir);
+        }
+    }
+}
+
+fn exit_description(outcome: &process::ProcessOutcome, stderr_tail: &[String]) -> String {
+    let status = match (outcome.exit_code, outcome.signal) {
+        (Some(1), _) => {
+            "exit status 1: environmental problem (file not found, invalid option, I/O error)"
+                .to_string()
+        }
+        (Some(2), _) => "exit status 2: corrupt or invalid input file or map".to_string(),
+        (Some(3), _) => "exit status 3: internal error in ddrescue".to_string(),
+        (Some(c), _) => format!("exit status {c}"),
+        (None, Some(s)) => format!("ended by signal {s}"),
+        (None, None) => "no exit status".to_string(),
+    };
+    let timed_out = if outcome.timed_out { ", timed out" } else { "" };
+    let start = stderr_tail.len().saturating_sub(3);
+    let lines = &stderr_tail[start..];
+    if lines.is_empty() {
+        format!("{status}{timed_out}")
+    } else {
+        format!("{status}{timed_out}: {}", lines.join(" / "))
+    }
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// What the map says once ddrescue ended.
+#[derive(Debug, Clone)]
+struct Finalized {
+    read_errors: ReadErrorTable,
+    bytes_acquired: u64,
+    stop_reason: Option<String>,
+    bad_sectors: u64,
+    notes: Vec<String>,
+}
+
+/// Parse the map, extend a finished image to the size of the source when
+/// only bad sectors are missing at its end, and derive the facts.
+fn finalize(map_path: &Path, image_path: &Path, expected: u64, sector_size: u32) -> Finalized {
+    let image_len = fs::metadata(image_path).map(|m| m.len()).ok();
+    let map = match ddrescue_map::read(map_path) {
+        Ok(m) => m,
+        Err(e) => {
+            let mut table = ReadErrorTable::new(sector_size, MAP_SOURCE);
+            table.push(0, expected, RangeKind::Unread);
+            return Finalized {
+                read_errors: table,
+                bytes_acquired: 0,
+                stop_reason: Some(format!(
+                    "{e}; without a readable map nothing can be said about the rescued areas, so the whole source counts as not acquired"
+                )),
+                bad_sectors: 0,
+                notes: Vec::new(),
+            };
+        }
+    };
+    let mut notes = Vec::new();
+    let mut len = image_len.unwrap_or(0);
+    if image_len.is_none() {
+        notes.push(format!(
+            "the image file {} does not exist",
+            image_path.display()
+        ));
+    }
+    if image_len.is_some()
+        && len < expected
+        && map.covers(expected)
+        && map.is_finished()
+        && map.assess(expected, len, sector_size).rescued_beyond_image == 0
+    {
+        match extend_image(image_path, expected) {
+            Ok(()) => {
+                notes.push(format!(
+                    "the image file was extended from {len} to {expected} bytes: ddrescue does not write unreadable sectors at the end of the source, and the bad-sector blocks the map lists there are zeros in the image"
+                ));
+                len = expected;
+            }
+            Err(e) => notes.push(format!(
+                "the image file could not be extended to the size of the source ({e}); the bad sectors at its end count as not acquired"
+            )),
+        }
+    }
+    if len > expected {
+        notes.push(format!(
+            "the image file is {len} bytes long, longer than the source ({expected} bytes); its digests cover the whole file"
+        ));
+    }
+    let a = map.assess(expected, len, sector_size);
+    notes.push(map_summary(&map, map_path, &a.counts));
+    notes.extend(a.notes.iter().cloned());
+    Finalized {
+        bad_sectors: map.bad_sectors(sector_size),
+        read_errors: a.read_errors,
+        bytes_acquired: a.bytes_acquired,
+        stop_reason: None,
+        notes,
+    }
+}
+
+fn map_summary(map: &Mapfile, path: &Path, counts: &ddrescue_map::MapCounts) -> String {
+    format!(
+        "ddrescue map {} ({}; last phase: {}): {}",
+        file_name(path),
+        map.created_by().unwrap_or("ddrescue version not recorded"),
+        ddrescue_map::phase_label(map.current_status),
+        counts.describe()
+    )
+}
+
+/// Grow (never shrink) the image to `len` bytes; the new bytes are zeros.
+fn extend_image(path: &Path, len: u64) -> io::Result<()> {
+    let f = OpenOptions::new().write(true).open(path)?;
+    if f.metadata()?.len() < len {
+        f.set_len(len)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
 /// Hash the rescued image (step 11, after the session's flush and cache
 /// eviction). ddrescue computes no digest while reading, so there is nothing
-/// to compare with; `--verify-source` can verify it.
+/// to compare with: `NotPossible`; the session's `--verify-source` second
+/// read can verify a clean rescue.
 pub async fn verify(ctx: &EngineContext, out: &EngineOutput) -> (VerificationResult, HashResults) {
     let Some(image) = out.image_files.first().cloned() else {
         return (
@@ -206,30 +475,26 @@ pub async fn verify(ctx: &EngineContext, out: &EngineOutput) -> (VerificationRes
     };
     let selection = ctx.selection;
     let abort = ctx.abort.clone();
-    let (tx, mut rx) = mpsc::channel::<HashProgress>(50);
-    let task = tokio::spawn(async move {
-        MultiHasher::hash_stream_with_abort(
-            &image,
-            selection.md5,
-            selection.sha1,
-            selection.sha256,
-            Some(tx),
-            Some(abort),
-        )
-        .await
+    let sink = ctx.progress.clone();
+    let t0 = Instant::now();
+    let task = tokio::task::spawn_blocking(move || {
+        hash_image(&image, selection, &abort, |done, total| {
+            let secs = t0.elapsed().as_secs_f64();
+            let speed = if secs > 0.0 { done as f64 / secs } else { 0.0 };
+            sink.phase_progress(done, total, speed);
+        })
     });
-    while let Some(hp) = rx.recv().await {
-        ctx.progress
-            .phase_progress(hp.bytes_hashed, hp.total_bytes, hp.speed_bps);
-    }
     match task.await {
         Ok(Ok(hashes)) => (
             VerificationResult::NotPossible {
-                reason: "ddrescue computes no digest while reading and the source was not read a second time".into(),
+                reason: NO_STREAM_DIGEST.into(),
             },
             hashes,
         ),
-        Ok(Err(e)) => (VerificationResult::Failed { reason: e }, HashResults::default()),
+        Ok(Err(e)) => (
+            VerificationResult::Failed { reason: e.message },
+            HashResults::default(),
+        ),
         Err(e) => (
             VerificationResult::Failed {
                 reason: format!("the hashing task failed: {e}"),
@@ -239,147 +504,1579 @@ pub async fn verify(ctx: &EngineContext, out: &EngineOutput) -> (VerificationRes
     }
 }
 
-/// Bytes this engine version can claim for a rescue, and why it is not the
-/// whole source: it reads unreadable sectors from ddrescue's screen output,
-/// not their ranges from the map, so any reported bad sector makes the
-/// acquisition count as incomplete rather than as complete.
-pub fn rescue_extent(bad_sectors: u64, image_len: u64, expected: u64) -> (u64, Option<String>) {
-    let acquired = image_len.min(expected);
-    let stop = if bad_sectors > 0 {
-        Some(format!(
-            "ddrescue reported {bad_sectors} unreadable sectors; this engine version does not read their ranges from the map file"
-        ))
-    } else if acquired < expected {
-        Some(format!("the image holds {acquired} of {expected} bytes"))
-    } else {
-        None
+/// Digests of the whole image file, read with positioned reads; its page
+/// cache is dropped first and behind every chunk so the bytes come from the
+/// destination medium.
+pub fn hash_image(
+    path: &Path,
+    selection: HashSelection,
+    abort: &AtomicBool,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<HashResults, AcquisitionError> {
+    use std::os::unix::fs::FileExt;
+    use std::os::unix::io::AsRawFd;
+    let file = File::open(path).map_err(|e| {
+        AcquisitionError::failed(format!("cannot open the image {}: {e}", path.display()))
+    })?;
+    let len = file
+        .metadata()
+        .map_err(|e| {
+            AcquisitionError::failed(format!("cannot inspect the image {}: {e}", path.display()))
+        })?
+        .len();
+    let evict = |offset: u64, n: u64| {
+        // SAFETY: advisory call on a descriptor we own
+        unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                offset as libc::off_t,
+                n as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
     };
-    (acquired, stop)
+    evict(0, 0);
+    let mut md5 = selection.md5.then(md5::Md5::new);
+    let mut sha1 = selection.sha1.then(sha1::Sha1::new);
+    let mut sha256 = selection.sha256.then(sha2::Sha256::new);
+    let mut buf = vec![0u8; HASH_CHUNK];
+    let mut offset = 0u64;
+    let mut last = Instant::now();
+    while offset < len {
+        if abort.load(Ordering::SeqCst) {
+            return Err(AcquisitionError::aborted(format!(
+                "hashing the image was aborted at byte offset {offset}"
+            )));
+        }
+        let want = (len - offset).min(HASH_CHUNK as u64) as usize;
+        let n = loop {
+            match file.read_at(&mut buf[..want], offset) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(AcquisitionError::failed(format!(
+                        "read error in the image {} at byte offset {offset}: {e}",
+                        path.display()
+                    )))
+                }
+                Ok(n) => break n,
+            }
+        };
+        if n == 0 {
+            return Err(AcquisitionError::failed(format!(
+                "the image {} ended at byte offset {offset} while it was hashed; {len} bytes were expected",
+                path.display()
+            )));
+        }
+        let chunk = &buf[..n];
+        if let Some(h) = md5.as_mut() {
+            h.update(chunk);
+        }
+        if let Some(h) = sha1.as_mut() {
+            h.update(chunk);
+        }
+        if let Some(h) = sha256.as_mut() {
+            h.update(chunk);
+        }
+        evict(offset, n as u64);
+        offset += n as u64;
+        if last.elapsed() >= Duration::from_millis(100) || offset == len {
+            progress(offset, len);
+            last = Instant::now();
+        }
+    }
+    Ok(HashResults {
+        md5: md5.map(|h| hex::encode(h.finalize())),
+        sha1: sha1.map(|h| hex::encode(h.finalize())),
+        sha256: sha256.map(|h| hex::encode(h.finalize())),
+    })
 }
 
-pub fn parse_size_to_bytes(val: f64, unit: &str) -> u64 {
-    let mult: f64 = match unit {
-        "B" | "b" => 1.0,
-        "kB" | "KB" => 1_000.0,
-        "MB" => 1_000_000.0,
-        "GB" => 1_000_000_000.0,
-        "TB" => 1_000_000_000_000.0,
-        "KiB" => 1024.0,
-        "MiB" => 1024.0 * 1024.0,
-        "GiB" => 1024.0 * 1024.0 * 1024.0,
-        "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => 1.0,
-    };
-    (val * mult) as u64
+// ---------------------------------------------------------------------------
+// Identity record and resume
+// ---------------------------------------------------------------------------
+
+/// Version of [`IdentityRecord`].
+pub const IDENTITY_RECORD_SCHEMA: u32 = 1;
+
+/// `<base>.identity.json`: who the source was when the rescue first started.
+/// Written once, never changed; a resume must match it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdentityRecord {
+    pub schema_version: u32,
+    pub purpose: String,
+    pub recorded_at: DateTime<Utc>,
+    pub dfdisk_version: String,
+    pub dfdisk_git_rev: String,
+    pub base_name: String,
+    /// The path ddrescue read the source through
+    pub tool_source_path: String,
+    pub sector_size: u32,
+    pub identity: SourceIdentity,
 }
 
-pub(crate) fn parse_rchar(content: &str) -> Option<u64> {
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("rchar:") {
-            if let Ok(bytes) = rest.trim().parse::<u64>() {
-                return Some(bytes);
+impl IdentityRecord {
+    pub fn new(
+        identity: &SourceIdentity,
+        base_name: &str,
+        tool_source_path: &str,
+        sector_size: u32,
+    ) -> Self {
+        Self {
+            schema_version: IDENTITY_RECORD_SCHEMA,
+            purpose: "identity of the source of this rescue at its first start; a resumed rescue must be the same device of the same size".into(),
+            recorded_at: Utc::now(),
+            dfdisk_version: DFDISK_VERSION.into(),
+            dfdisk_git_rev: DFDISK_GIT_REV.into(),
+            base_name: base_name.into(),
+            tool_source_path: tool_source_path.into(),
+            sector_size,
+            identity: identity.clone(),
+        }
+    }
+}
+
+/// `<dir>/<base>.identity.json`.
+pub fn identity_record_path(dir: &Path, base: &str) -> PathBuf {
+    dir.join(format!("{base}{IDENTITY_SUFFIX}"))
+}
+
+fn write_identity_record(path: &Path, ctx: &EngineContext) -> Result<(), AcquisitionError> {
+    if path.exists() {
+        return Err(AcquisitionError::refused(format!(
+            "{} already exists; refusing to overwrite the identity record of another rescue",
+            path.display()
+        )));
+    }
+    let record = IdentityRecord::new(
+        &ctx.identity,
+        &ctx.base_name,
+        &ctx.tool_source_path,
+        ctx.sector_size(),
+    );
+    let json = serde_json::to_string_pretty(&record)
+        .map_err(|e| AcquisitionError::failed(format!("cannot encode the identity record: {e}")))?;
+    write_atomic(path, json.as_bytes())
+        .and_then(|()| sync_dir(path.parent().unwrap_or(Path::new("."))))
+        .map_err(|e| {
+            AcquisitionError::failed(format!(
+                "cannot write the identity record {}: {e}",
+                path.display()
+            ))
+        })
+}
+
+/// Read `<base>.identity.json`.
+pub fn read_identity_record(path: &Path) -> Result<IdentityRecord, String> {
+    let text = fs::read_to_string(path).map_err(|e| match e.kind() {
+        io::ErrorKind::NotFound => format!("the identity record {} does not exist", path.display()),
+        _ => format!("the identity record {} cannot be read: {e}", path.display()),
+    })?;
+    let record: IdentityRecord = serde_json::from_str(&text)
+        .map_err(|e| format!("the identity record {} is not valid: {e}", path.display()))?;
+    if record.schema_version != IDENTITY_RECORD_SCHEMA {
+        return Err(format!(
+            "the identity record {} has schema version {}, this dfdisk reads version {IDENTITY_RECORD_SCHEMA}",
+            path.display(),
+            record.schema_version
+        ));
+    }
+    Ok(record)
+}
+
+/// Every serial value of `id` with where it was read (`None`: the preferred
+/// serial without a candidate entry).
+fn serial_values(id: &SourceIdentity) -> Vec<(Option<SerialSource>, String)> {
+    let mut v: Vec<(Option<SerialSource>, String)> = id
+        .serial_candidates
+        .iter()
+        .map(|c| (Some(c.source), c.value.trim().to_string()))
+        .filter(|(_, s)| !s.is_empty())
+        .collect();
+    if let Some(s) = id
+        .serial
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !v.iter().any(|(_, x)| x.eq_ignore_ascii_case(s)) {
+            v.push((None, s.to_string()));
+        }
+    }
+    v
+}
+
+fn distinct(values: &[(Option<SerialSource>, String)]) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for (_, s) in values {
+        if !out.iter().any(|x| x.eq_ignore_ascii_case(s)) {
+            out.push(s);
+        }
+    }
+    out.join(" / ")
+}
+
+/// The serial that ties `now` to `recorded`: `Ok(None)` when neither has a
+/// serial; `Err` when only one has one, when a source both read differs (e.g.
+/// another drive behind the same USB bridge answers IDENTIFY differently),
+/// or when no value is shared.
+fn serial_tie(recorded: &SourceIdentity, now: &SourceIdentity) -> Result<Option<String>, String> {
+    let a = serial_values(recorded);
+    let b = serial_values(now);
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => return Ok(None),
+        (true, false) => {
+            return Err(format!(
+                "serial {}, the first start recorded none",
+                distinct(&b)
+            ))
+        }
+        (false, true) => return Err(format!("no serial reported, was {}", distinct(&a))),
+        (false, false) => {}
+    }
+    for (sa, x) in &a {
+        for (sb, y) in &b {
+            if let (Some(sa), Some(sb)) = (sa, sb) {
+                if sa == sb && !x.eq_ignore_ascii_case(y) {
+                    return Err(format!("serial {y} ({}), was {x}", sa.label()));
+                }
             }
         }
     }
-    None
+    a.iter()
+        .find(|(_, x)| b.iter().any(|(_, y)| x.eq_ignore_ascii_case(y)))
+        .map(|(_, x)| Some(x.clone()))
+        .ok_or_else(|| format!("serial {}, was {}", distinct(&b), distinct(&a)))
 }
 
-fn read_proc_rchar(pid: u32) -> Option<u64> {
-    let path = format!("/proc/{}/io", pid);
-    let content = fs::read_to_string(path).ok()?;
-    parse_rchar(&content)
+/// Both known and different (trimmed, case-insensitive).
+fn differs(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => !a.trim().eq_ignore_ascii_case(b.trim()),
+        _ => false,
+    }
+}
+
+/// Is `now` the device `recorded` describes (same device, same size)?
+/// Stricter than dfcore's `same_device`: kind, size, logical sector size,
+/// model and partition placement must agree where both are known; a WWN
+/// present on both sides must match; the serials must share a value and no
+/// serial source may disagree; a device with neither serial nor WWN is
+/// accepted only in the same attachment (major:minor, disk sequence number),
+/// because a re-attached drive without either cannot be told from another.
+/// Regular files: same canonical path and file identity. `Ok` says what tied
+/// them; `Err` lists every difference.
+pub fn compare_resume_identity(
+    recorded: &SourceIdentity,
+    now: &SourceIdentity,
+) -> Result<String, String> {
+    let mut diffs: Vec<String> = Vec::new();
+    let mut basis: Vec<String> = Vec::new();
+    if recorded.kind != now.kind {
+        diffs.push(format!(
+            "{}, was {}",
+            now.kind.label(),
+            recorded.kind.label()
+        ));
+    }
+    if recorded.size_bytes != now.size_bytes {
+        diffs.push(format!(
+            "size {} bytes, was {} bytes",
+            now.size_bytes, recorded.size_bytes
+        ));
+    }
+    if recorded.logical_sector_size != 0
+        && now.logical_sector_size != 0
+        && recorded.logical_sector_size != now.logical_sector_size
+    {
+        diffs.push(format!(
+            "logical sector size {} bytes, was {} bytes",
+            now.logical_sector_size, recorded.logical_sector_size
+        ));
+    }
+    if now.kind == SourceKind::RegularFile || recorded.kind == SourceKind::RegularFile {
+        if recorded.canonical_path != now.canonical_path {
+            diffs.push(format!(
+                "file {}, was {}",
+                now.canonical_path, recorded.canonical_path
+            ));
+        }
+        match (&recorded.file_id, &now.file_id) {
+            (Some(a), Some(b)) if a != b => diffs.push(format!(
+                "file identity (device:inode) {b}, was {a}: another file at the same path"
+            )),
+            _ => basis.push(format!("the same file {}", now.canonical_path)),
+        }
+    } else {
+        if differs(&recorded.model, &now.model) {
+            diffs.push(format!(
+                "model {}, was {}",
+                now.model.as_deref().unwrap_or("-"),
+                recorded.model.as_deref().unwrap_or("-")
+            ));
+        }
+        if let (Some(a), Some(b)) = (recorded.partition_number, now.partition_number) {
+            if a != b {
+                diffs.push(format!("partition {b}, was {a}"));
+            }
+        }
+        if let (Some(a), Some(b)) = (recorded.partition_start_sector, now.partition_start_sector) {
+            if a != b {
+                diffs.push(format!("partition start sector {b}, was {a}"));
+            }
+        }
+        let wwn_pair = match (&recorded.wwn, &now.wwn) {
+            (Some(a), Some(b)) => {
+                if normalize_wwn(a) == normalize_wwn(b) {
+                    basis.push(format!("WWN {b}"));
+                } else {
+                    diffs.push(format!("WWN {b}, was {a}"));
+                }
+                true
+            }
+            _ => false,
+        };
+        match serial_tie(recorded, now) {
+            Ok(Some(s)) => basis.push(format!("serial {s}")),
+            Ok(None) if !wwn_pair => {
+                // dfcore's fallback (name + major:minor) cannot tell a
+                // re-attached drive from another one: the same attachment only
+                let seq_ok = match (recorded.diskseq, now.diskseq) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                };
+                if recorded.maj_min.is_some()
+                    && recorded.maj_min == now.maj_min
+                    && recorded.kernel_name == now.kernel_name
+                    && seq_ok
+                {
+                    basis.push(format!(
+                        "no serial number or WWN; the same attachment ({}, major:minor {}{})",
+                        now.kernel_name,
+                        now.maj_min.as_deref().unwrap_or("-"),
+                        now.diskseq
+                            .map(|s| format!(", disk sequence number {s}"))
+                            .unwrap_or_default()
+                    ));
+                } else {
+                    let unknown = || "unknown".to_string();
+                    diffs.push(format!(
+                        "the source reports no serial number and no WWN, so only the same attachment can tie it to this rescue; it is now {} major:minor {} disk sequence number {}, was {} major:minor {} disk sequence number {} (a re-attached drive without serial cannot be told from another drive)",
+                        now.kernel_name,
+                        now.maj_min.clone().unwrap_or_else(unknown),
+                        now.diskseq.map(|s| s.to_string()).unwrap_or_else(unknown),
+                        recorded.kernel_name,
+                        recorded.maj_min.clone().unwrap_or_else(unknown),
+                        recorded.diskseq.map(|s| s.to_string()).unwrap_or_else(unknown),
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(d) => diffs.push(d),
+        }
+    }
+    if diffs.is_empty() {
+        basis.push(format!("{} bytes", now.size_bytes));
+        Ok(basis.join(", "))
+    } else {
+        Err(diffs.join("; "))
+    }
+}
+
+/// Before a resumed rescue writes anything (session step 4, and the engine
+/// again with the identity that includes the SMART IDENTIFY serial): the
+/// identity recorded at the first start must exist and describe this source.
+/// Returns the statement for the report; `Refused` otherwise.
+pub fn check_resume_identity(
+    dir: &Path,
+    base: &str,
+    now: &SourceIdentity,
+) -> Result<Vec<String>, AcquisitionError> {
+    let path = identity_record_path(dir, base);
+    let record = read_identity_record(&path).map_err(|e| {
+        AcquisitionError::refused(format!(
+            "cannot resume the rescue: {e}. Without the identity recorded at its first start the map and image cannot be tied to this source; start a new rescue under a new evidence number"
+        ))
+    })?;
+    if !record.base_name.eq_ignore_ascii_case(base) {
+        return Err(AcquisitionError::refused(format!(
+            "cannot resume the rescue: {} was written for the acquisition {}, not {base}",
+            path.display(),
+            record.base_name
+        )));
+    }
+    let tie = compare_resume_identity(&record.identity, now).map_err(|d| {
+        AcquisitionError::refused(format!(
+            "cannot resume the rescue: the source is not the device this rescue started on ({d}). The map and image belong to {} ({}, {} bytes, serial {}), recorded at {} in {}. dfdisk never merges two devices into one image",
+            record.identity.path,
+            record.identity.display_name(),
+            record.identity.size_bytes,
+            record.identity.serial_with_provenance(),
+            record.recorded_at.to_rfc3339(),
+            path.display()
+        ))
+    })?;
+    Ok(vec![format!(
+        "resumed rescue: the source matches the identity recorded at the first start of this rescue ({}, {}): {tie}",
+        file_name(&path),
+        record.recorded_at.to_rfc3339()
+    )])
+}
+
+/// Session number of `file_name` if it is a kept report of `base`
+/// (`<base>.info.session-N` or `<base>.info.session-N.json`); the flag says
+/// whether it is the JSON twin.
+fn session_number(base: &str, file_name: &str) -> Option<(u32, bool)> {
+    let lower = file_name.to_lowercase();
+    let rest = lower.strip_prefix(&format!("{}{SESSION_SUFFIX}", base.to_lowercase()))?;
+    let (digits, json) = match rest.strip_suffix(".json") {
+        Some(d) => (d, true),
+        None => (rest, false),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().map(|n| (n, json))
+}
+
+/// A kept session: number, text report, JSON report.
+type KeptSession = (u32, Option<PathBuf>, Option<PathBuf>);
+
+/// Kept reports of `base` in `dir`, by session number.
+fn kept_sessions(dir: &Path, base: &str) -> Vec<KeptSession> {
+    let mut sessions: BTreeMap<u32, (Option<PathBuf>, Option<PathBuf>)> = BTreeMap::new();
+    for p in preflight::existing_outputs(dir, base) {
+        let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if let Some((n, json)) = session_number(base, &name) {
+            let entry = sessions.entry(n).or_default();
+            if json {
+                entry.1 = Some(p);
+            } else {
+                entry.0 = Some(p);
+            }
+        }
+    }
+    sessions
+        .into_iter()
+        .map(|(n, (text, json))| (n, text, json))
+        .collect()
+}
+
+/// Keep the report of the previous session (`<base>.info`, `<base>.info.json`)
+/// as `<base>.info.session-N` and `<base>.info.session-N.json`, N one past the
+/// highest kept session. Returns N and the kept files, `None` when there was
+/// no report. Never overwrites.
+pub fn keep_previous_report(dir: &Path, base: &str) -> io::Result<Option<(u32, Vec<PathBuf>)>> {
+    let text = dir.join(format!("{base}{INFO_SUFFIX}"));
+    let json = dir.join(format!("{base}{INFO_JSON_SUFFIX}"));
+    if !text.exists() && !json.exists() {
+        return Ok(None);
+    }
+    let n = kept_sessions(dir, base)
+        .last()
+        .map(|(n, _, _)| n + 1)
+        .unwrap_or(1);
+    let text_to = dir.join(format!("{base}{SESSION_SUFFIX}{n}"));
+    let json_to = dir.join(format!("{base}{SESSION_SUFFIX}{n}.json"));
+    let mut kept = Vec::new();
+    for (from, to) in [(&text, &text_to), (&json, &json_to)] {
+        if !from.exists() {
+            continue;
+        }
+        if to.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists", to.display()),
+            ));
+        }
+        fs::rename(from, to)?;
+        kept.push(to.clone());
+    }
+    sync_dir(dir)?;
+    Ok(Some((n, kept)))
+}
+
+/// Every kept session report of `base` in `dir`, with the digest of the
+/// report file and, from its JSON twin, start, end and outcome.
+pub fn list_sessions(dir: &Path, base: &str) -> Vec<SessionInfo> {
+    kept_sessions(dir, base)
+        .into_iter()
+        .filter_map(|(n, text, json)| {
+            let report = text.or_else(|| json.clone())?;
+            let parsed = json
+                .as_deref()
+                .and_then(|j| fs::read_to_string(j).ok())
+                .and_then(|s| ForensicInfoReport::from_json(&s).ok());
+            Some(SessionInfo {
+                session: n,
+                report_file: report.to_string_lossy().into_owned(),
+                report_sha256: sha256_file(&report).ok(),
+                started_at: parsed.as_ref().map(|r| r.started_at),
+                ended_at: parsed.as_ref().map(|r| r.ended_at),
+                outcome: parsed.as_ref().map(|r| r.outcome),
+            })
+        })
+        .collect()
+}
+
+/// SHA-256 of the map the report of kept session `session` lists.
+fn map_digest_in_report(dir: &Path, base: &str, session: u32) -> Option<String> {
+    let json = dir.join(format!("{base}{SESSION_SUFFIX}{session}.json"));
+    let report = ForensicInfoReport::from_json(&fs::read_to_string(json).ok()?).ok()?;
+    report
+        .auxiliary_files
+        .iter()
+        .find(|f| f.path.to_lowercase().ends_with(MAP_SUFFIX))
+        .map(|f| f.sha256.clone())
+}
+
+/// Resume: keep the previous report, list the sessions, state whether the
+/// map changed since the last report, and check the identity again (now
+/// with the SMART IDENTIFY serial, when SMART ran). The previous report is
+/// kept before anything can refuse, so it is never overwritten.
+fn prepare_resume(
+    ctx: &EngineContext,
+    map: &Path,
+) -> Result<(Vec<SessionInfo>, Vec<String>), AcquisitionError> {
+    let dir = &ctx.output_dir;
+    let base = &ctx.base_name;
+    let mut notes = Vec::new();
+    match keep_previous_report(dir, base) {
+        Ok(Some((_, files))) => notes.push(format!(
+            "the report of the previous session was kept as {}",
+            files
+                .iter()
+                .map(|f| file_name(f))
+                .collect::<Vec<_>>()
+                .join(" and ")
+        )),
+        Ok(None) => notes.push(
+            "no report of the previous session was found: it ended without writing one".into(),
+        ),
+        Err(e) => {
+            return Err(AcquisitionError::failed(format!(
+                "cannot keep the report of the previous session: {e}"
+            )))
+        }
+    }
+    let sessions = list_sessions(dir, base);
+    for s in &sessions {
+        let when =
+            |t: Option<DateTime<Utc>>| t.map(|t| t.to_rfc3339()).unwrap_or_else(|| "?".into());
+        notes.push(format!(
+            "earlier session {}: {}, {} to {}, report {}{}",
+            s.session,
+            s.outcome
+                .map(|o| o.label().to_string())
+                .unwrap_or_else(|| "outcome unknown (no readable JSON report)".into()),
+            when(s.started_at),
+            when(s.ended_at),
+            file_name(Path::new(&s.report_file)),
+            s.report_sha256
+                .as_deref()
+                .map(|h| format!(" (SHA-256 {h})"))
+                .unwrap_or_default()
+        ));
+    }
+    match sha256_file(map) {
+        Ok(now) => {
+            let last = sessions.last();
+            let recorded = last.and_then(|s| map_digest_in_report(dir, base, s.session));
+            notes.push(match (last, recorded) {
+                (Some(s), Some(r)) if r.eq_ignore_ascii_case(&now) => format!(
+                    "the map at the start of this session (SHA-256 {now}) is the map the report of session {} lists",
+                    s.session
+                ),
+                (Some(s), Some(r)) => format!(
+                    "the map changed after the report of session {} (SHA-256 then {r}, now {now}): a session that ended without a report continued the rescue, or the map was edited; ddrescue continues from the map as it is now",
+                    s.session
+                ),
+                (Some(s), None) => format!(
+                    "the map at the start of this session has SHA-256 {now}; the report of session {} lists no map digest to compare it with",
+                    s.session
+                ),
+                (None, _) => format!(
+                    "no report of an earlier session exists; the map at the start of this session (SHA-256 {now}) was written by a session that ended without a report"
+                ),
+            });
+        }
+        Err(e) => notes.push(format!(
+            "the map could not be hashed before this session: {e}"
+        )),
+    }
+    // Defence in depth: the session checked the identity before anything was
+    // written; now the identity includes a SMART IDENTIFY serial when SMART ran
+    check_resume_identity(dir, base, &ctx.identity)?;
+    Ok((sessions, notes))
+}
+
+// ---------------------------------------------------------------------------
+// ddrescue's status screen (progress only; never a source of facts)
+// ---------------------------------------------------------------------------
+
+static ANSI: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]").expect("valid regex"));
+static PCT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"pct rescued:\s*([0-9]+(?:\.[0-9]+)?)%").expect("valid regex"));
+static CURRENT_RATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"current rate:\s*([0-9]+(?:\.[0-9]+)?)\s*([kMGTPEZYR]?)(i?)B/s")
+        .expect("valid regex")
+});
+static AVERAGE_RATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"average rate:\s*([0-9]+(?:\.[0-9]+)?)\s*([kMGTPEZYR]?)(i?)B/s")
+        .expect("valid regex")
+});
+static REMAINING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"remaining time:\s*(.*)$").expect("valid regex"));
+static DURATION_PART: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"([0-9]+)\s*([dhms])\b").expect("valid regex"));
+static PHASE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(Copying|Trimming|Scraping|Retrying|Filling|Generating)\b.*\.\.\.")
+        .expect("valid regex")
+});
+
+/// Remove terminal control sequences (ddrescue moves the cursor up).
+pub fn strip_ansi(line: &str) -> String {
+    ANSI.replace_all(line, "").into_owned()
+}
+
+fn rate(caps: &regex::Captures<'_>) -> Option<f64> {
+    let value: f64 = caps[1].parse().ok()?;
+    let base: f64 = if caps[3].is_empty() { 1000.0 } else { 1024.0 };
+    let exp = match &caps[2] {
+        "" => 0,
+        "k" => 1,
+        "M" => 2,
+        "G" => 3,
+        "T" => 4,
+        "P" => 5,
+        "E" => 6,
+        "Z" => 7,
+        "Y" => 8,
+        _ => 9,
+    };
+    Some(value * base.powi(exp))
+}
+
+/// ddrescue's "remaining time" ("1h 23m", "11s", "2d 3h") in seconds;
+/// `None` for "n/a".
+pub fn parse_remaining(text: &str) -> Option<u64> {
+    let mut total = 0u64;
+    let mut any = false;
+    for c in DURATION_PART.captures_iter(text) {
+        let n: u64 = c[1].parse().ok()?;
+        total += n * match &c[2] {
+            "d" => 86_400,
+            "h" => 3_600,
+            "m" => 60,
+            _ => 1,
+        };
+        any = true;
+    }
+    any.then_some(total)
+}
+
+/// What a line of the status screen changed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScreenEvent {
+    /// The "pct rescued" line (once per screen refresh)
+    Progress,
+    /// A new phase, e.g. "Trimming failed blocks... (forwards)"
+    Phase(String),
+    /// "Finished", "Interrupted by user", the initial status of a resume
+    Message(String),
+}
+
+/// The latest values of ddrescue's status screen. Display only: rounded,
+/// SI-prefixed numbers; the report takes its facts from the map.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScreenStatus {
+    pub pct_rescued: Option<f64>,
+    /// Bytes per second
+    pub current_rate: Option<f64>,
+    pub average_rate: Option<f64>,
+    pub remaining_secs: Option<u64>,
+    pub phase: Option<String>,
+}
+
+impl ScreenStatus {
+    /// Take one line of ddrescue's standard output.
+    pub fn feed(&mut self, raw: &str) -> Option<ScreenEvent> {
+        let clean = strip_ansi(raw);
+        let line = clean.trim();
+        if line.is_empty() {
+            return None;
+        }
+        if let Some(c) = CURRENT_RATE.captures(line) {
+            self.current_rate = rate(&c);
+        }
+        if let Some(c) = AVERAGE_RATE.captures(line) {
+            self.average_rate = rate(&c);
+        }
+        if let Some(c) = PCT.captures(line) {
+            self.pct_rescued = c[1].parse().ok();
+            self.remaining_secs = REMAINING
+                .captures(line)
+                .and_then(|r| parse_remaining(&r[1]));
+            return Some(ScreenEvent::Progress);
+        }
+        if PHASE.is_match(line) {
+            let phase = sanitize_line(line);
+            if self.phase.as_deref() != Some(phase.as_str()) {
+                self.phase = Some(phase.clone());
+                return Some(ScreenEvent::Phase(phase));
+            }
+            return None;
+        }
+        if line == "Finished"
+            || line.starts_with("Interrupted")
+            || line.starts_with("Initial status")
+            // The initial status of a resume ("rescued: .., tried: .., ..")
+            || (line.starts_with("rescued:") && line.contains("tried:"))
+        {
+            return Some(ScreenEvent::Message(sanitize_line(line)));
+        }
+        None
+    }
+
+    /// Copy the values into the progress telemetry.
+    pub fn apply(&self, t: &mut ProgressTelemetry, expected: u64, elapsed: Duration) {
+        if let Some(p) = self.pct_rescued {
+            let p = p.clamp(0.0, 100.0);
+            t.percentage = p;
+            t.bytes_processed = ((expected as f64 * p / 100.0).round() as u64).min(expected);
+        }
+        if let Some(r) = self.current_rate {
+            t.speed_bps = r;
+        }
+        if let Some(r) = self.average_rate {
+            t.avg_speed_bps = r;
+        }
+        t.eta_secs = self.remaining_secs;
+        t.elapsed_secs = elapsed.as_secs();
+        t.status_message = match (&self.phase, self.pct_rescued) {
+            (Some(ph), Some(p)) => format!("ddrescue: {ph}, {p:.2}% rescued"),
+            (Some(ph), None) => format!("ddrescue: {ph}"),
+            (None, Some(p)) => format!("ddrescue: {p:.2}% rescued"),
+            (None, None) => "ddrescue running".into(),
+        };
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::process::LineSplitter;
+    use crate::engines::session::AcquisitionRequest;
+    use crate::models::case::CaseMetadata;
+    use crate::models::config::AcquisitionConfig;
+    use crate::models::device::BlockDevice;
+    use crate::models::outcome::Outcome;
 
-    #[test]
-    fn test_parse_rchar() {
-        let sample_io = "rchar: 104857600\nwchar: 52428800\nsyscr: 100\nsyscw: 50\n";
-        assert_eq!(parse_rchar(sample_io), Some(104857600));
+    const MIB: u64 = 1 << 20;
+    const BAD_TAIL: &str = include_str!("../../tests/fixtures/ddrescue/bad_tail.map");
+    const BAD_MIDDLE: &str = include_str!("../../tests/fixtures/ddrescue/bad_middle.map");
+    const INTERRUPTED: &str = include_str!("../../tests/fixtures/ddrescue/interrupted.map");
+    const SCREEN_BAD_MIDDLE: &[u8] =
+        include_bytes!("../../tests/fixtures/ddrescue/screen_bad_middle.txt");
+    const SCREEN_INTERRUPTED: &[u8] =
+        include_bytes!("../../tests/fixtures/ddrescue/screen_interrupted.txt");
 
-        let invalid_io = "wchar: 1000\nsyscr: 20\n";
-        assert_eq!(parse_rchar(invalid_io), None);
-    }
-
-    #[test]
-    fn rescue_never_claims_more_than_it_knows() {
-        // Clean and full length: complete, but without a source digest
-        assert_eq!(rescue_extent(0, 1000, 1000), (1000, None));
-        // Bad sectors without ranges: not complete
-        let (n, stop) = rescue_extent(5, 1000, 1000);
-        assert_eq!(n, 1000);
-        assert!(stop.unwrap().contains("5 unreadable sectors"));
-        // Short image
-        let (n, stop) = rescue_extent(0, 600, 1000);
-        assert_eq!(n, 600);
-        assert!(stop.unwrap().contains("600 of 1000 bytes"));
-    }
-
-    #[test]
-    fn test_rescue_report_hash_truthfulness() {
-        use crate::models::{
-            case::CaseMetadata,
-            config::{AcquisitionConfig, EffectiveConfig, EngineKind},
-            device::BlockDevice,
-            identity::SourceIdentity,
-            info_report::{ForensicInfoReport, HashResults},
-            outcome::Outcome,
-        };
-        let device = BlockDevice {
-            name: "sdc".to_string(),
-            path: "/dev/dfdisk-test-sdc".to_string(),
-            size_bytes: 1000,
+    fn disk() -> SourceIdentity {
+        let mut id = SourceIdentity {
+            path: "/dev/sdx".into(),
+            canonical_path: "/dev/sdx".into(),
+            kernel_name: "sdx".into(),
+            maj_min: Some("8:16".into()),
+            diskseq: Some(7),
+            kind: SourceKind::Disk,
+            size_bytes: 1_000_204_886_016,
             logical_sector_size: 512,
-            physical_sector_size: 512,
+            physical_sector_size: 4096,
+            model: Some("WDC WD10EZEX".into()),
+            wwn: Some("0x50014ee2b5a5c5c5".into()),
             ..Default::default()
         };
-        let config = AcquisitionConfig {
-            rescue_mode: true,
+        id.add_serial_candidate("WD-WCC4M0000001", SerialSource::VpdPage80);
+        id.add_serial_candidate("WD-WCC4M0000001", SerialSource::UdevIdSerialShort);
+        id
+    }
+
+    fn no_serial() -> SourceIdentity {
+        SourceIdentity {
+            wwn: None,
+            serial: None,
+            serial_candidates: Vec::new(),
+            model: None,
+            ..disk()
+        }
+    }
+
+    #[test]
+    fn the_same_disk_resumes_even_re_attached() {
+        let rec = disk();
+        // Re-plugged: another node, another disk sequence number
+        let mut now = disk();
+        now.kernel_name = "sdy".into();
+        now.path = "/dev/sdy".into();
+        now.maj_min = Some("8:32".into());
+        now.diskseq = Some(12);
+        now.wwn = Some("naa.50014ee2b5a5c5c5".into());
+        let tie = compare_resume_identity(&rec, &now).unwrap();
+        assert!(
+            tie.contains("WWN") && tie.contains("serial WD-WCC4M0000001"),
+            "{tie}"
+        );
+        assert!(tie.contains("1000204886016 bytes"), "{tie}");
+        // The first start had an IDENTIFY serial (SMART), this probe has none
+        let mut rec = disk();
+        rec.add_serial_candidate("WD-WCC4M0000001", SerialSource::SmartctlIdentify);
+        assert!(compare_resume_identity(&rec, &disk()).is_ok());
+    }
+
+    #[test]
+    fn another_device_is_refused_with_every_difference() {
+        let rec = disk();
+        let mut now = disk();
+        now.size_bytes = 500;
+        now.wwn = Some("0x5000c500ffffffff".into());
+        now.model = Some("Other".into());
+        let e = compare_resume_identity(&rec, &now).unwrap_err();
+        assert!(e.contains("size 500 bytes, was 1000204886016 bytes"), "{e}");
+        assert!(e.contains("WWN 0x5000c500ffffffff"), "{e}");
+        assert!(e.contains("model Other, was WDC WD10EZEX"), "{e}");
+
+        // Same WWN unknown, other serial
+        let mut now = disk();
+        now.wwn = None;
+        now.serial_candidates.clear();
+        now.serial = None;
+        now.add_serial_candidate("WD-OTHER", SerialSource::VpdPage80);
+        let e = compare_resume_identity(&rec, &now).unwrap_err();
+        assert!(e.contains("WD-OTHER"), "{e}");
+
+        // A serial now, none at the first start, and the reverse
+        let e = compare_resume_identity(&no_serial(), &disk()).unwrap_err();
+        assert!(e.contains("the first start recorded none"), "{e}");
+        let mut now = no_serial();
+        now.wwn = None;
+        let mut rec = disk();
+        rec.wwn = None;
+        let e = compare_resume_identity(&rec, &now).unwrap_err();
+        assert!(e.contains("no serial reported, was WD-WCC4M0000001"), "{e}");
+
+        // Kind, sector size, partition placement
+        let mut now = disk();
+        now.kind = SourceKind::Partition;
+        now.logical_sector_size = 4096;
+        let e = compare_resume_identity(&rec, &now).unwrap_err();
+        assert!(e.contains("partition, was whole disk"), "{e}");
+        assert!(e.contains("logical sector size 4096"), "{e}");
+        let mut a = disk();
+        a.partition_start_sector = Some(2048);
+        a.partition_number = Some(1);
+        let mut b = a.clone();
+        b.partition_start_sector = Some(4096);
+        b.partition_number = Some(2);
+        let e = compare_resume_identity(&a, &b).unwrap_err();
+        assert!(e.contains("partition start sector 4096, was 2048"), "{e}");
+        assert!(e.contains("partition 2, was 1"), "{e}");
+    }
+
+    #[test]
+    fn another_drive_behind_the_same_usb_bridge_is_refused() {
+        // The bridge reports its own serial (VPD); IDENTIFY tells the drives apart
+        let mut rec = no_serial();
+        rec.transport = Some("usb".into());
+        rec.add_serial_candidate("BRIDGE0001", SerialSource::VpdPage80);
+        rec.add_serial_candidate("DRIVE-A", SerialSource::SmartctlIdentify);
+        let mut now = rec.clone();
+        now.serial_candidates.clear();
+        now.serial = None;
+        now.add_serial_candidate("BRIDGE0001", SerialSource::VpdPage80);
+        now.add_serial_candidate("DRIVE-B", SerialSource::SmartctlIdentify);
+        let e = compare_resume_identity(&rec, &now).unwrap_err();
+        assert!(
+            e.contains("DRIVE-B (ATA IDENTIFY (smartctl)), was DRIVE-A"),
+            "{e}"
+        );
+        // Without IDENTIFY on this side the bridge serial ties them
+        let mut now = rec.clone();
+        now.serial_candidates
+            .retain(|c| c.source == SerialSource::VpdPage80);
+        now.choose_serial();
+        assert!(compare_resume_identity(&rec, &now).is_ok());
+    }
+
+    #[test]
+    fn a_device_without_serial_or_wwn_resumes_only_in_the_same_attachment() {
+        let rec = no_serial();
+        let tie = compare_resume_identity(&rec, &no_serial()).unwrap();
+        assert!(
+            tie.contains("the same attachment (sdx, major:minor 8:16, disk sequence number 7)"),
+            "{tie}"
+        );
+        // Re-attached (new disk sequence number): cannot be told from another drive
+        let mut now = no_serial();
+        now.diskseq = Some(8);
+        let e = compare_resume_identity(&rec, &now).unwrap_err();
+        assert!(e.contains("only the same attachment"), "{e}");
+        let mut now = no_serial();
+        now.maj_min = Some("8:32".into());
+        assert!(compare_resume_identity(&rec, &now).is_err());
+        // WWN alone ties a device without serial
+        let mut a = no_serial();
+        a.wwn = Some("eui.0025388b91b0a1c2".into());
+        let mut b = a.clone();
+        b.diskseq = Some(99);
+        assert!(compare_resume_identity(&a, &b).unwrap().contains("WWN"));
+    }
+
+    #[test]
+    fn regular_files_resume_only_as_the_same_file() {
+        let f = SourceIdentity {
+            path: "/x/src.bin".into(),
+            canonical_path: "/x/src.bin".into(),
+            kind: SourceKind::RegularFile,
+            size_bytes: 4096,
+            logical_sector_size: 512,
+            file_id: Some("2049:77".into()),
             ..Default::default()
         };
-        let source = SourceIdentity::from_block_device(&device);
-        let mut report = ForensicInfoReport::new(
-            EngineKind::Rescue,
+        assert!(compare_resume_identity(&f, &f.clone())
+            .unwrap()
+            .contains("the same file /x/src.bin"));
+        let mut other = f.clone();
+        other.file_id = Some("2049:78".into());
+        let e = compare_resume_identity(&f, &other).unwrap_err();
+        assert!(e.contains("another file at the same path"), "{e}");
+        let mut moved = f.clone();
+        moved.canonical_path = "/y/src.bin".into();
+        assert!(compare_resume_identity(&f, &moved).is_err());
+        assert!(compare_resume_identity(&f, &disk()).is_err());
+    }
+
+    #[test]
+    fn the_identity_record_ties_a_resume_to_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = "c_01_e_SER";
+        // Missing record: refused
+        let e = check_resume_identity(dir.path(), base, &disk()).unwrap_err();
+        assert!(e.is_refusal());
+        assert!(e.message.contains("does not exist"), "{e}");
+
+        let record = IdentityRecord::new(&disk(), base, "/dev/disk/by-diskseq/7", 512);
+        let path = identity_record_path(dir.path(), base);
+        std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+        assert_eq!(read_identity_record(&path).unwrap(), record);
+        let notes = check_resume_identity(dir.path(), base, &disk()).unwrap();
+        assert!(
+            notes[0].starts_with("resumed rescue: the source matches"),
+            "{notes:?}"
+        );
+
+        let mut other = disk();
+        other.size_bytes = 1;
+        let e = check_resume_identity(dir.path(), base, &other).unwrap_err();
+        assert!(e.is_refusal());
+        assert!(
+            e.message.contains("not the device this rescue started on"),
+            "{e}"
+        );
+        assert!(e.message.contains("never merges two devices"), "{e}");
+
+        // A record of another acquisition, a broken record, an unknown schema
+        let foreign = IdentityRecord::new(&disk(), "other", "/dev/sdx", 512);
+        std::fs::write(&path, serde_json::to_string(&foreign).unwrap()).unwrap();
+        assert!(check_resume_identity(dir.path(), base, &disk())
+            .unwrap_err()
+            .message
+            .contains("written for the acquisition other"));
+        std::fs::write(&path, "{").unwrap();
+        assert!(read_identity_record(&path)
+            .unwrap_err()
+            .contains("not valid"));
+        let mut future = record.clone();
+        future.schema_version = 99;
+        std::fs::write(&path, serde_json::to_string(&future).unwrap()).unwrap();
+        assert!(read_identity_record(&path)
+            .unwrap_err()
+            .contains("schema version 99"));
+    }
+
+    fn report_json(outcome: Outcome, map_sha: &str) -> String {
+        let source = disk();
+        let config = AcquisitionConfig::rescue("/out");
+        let mut r = ForensicInfoReport::new(
+            crate::models::config::EngineKind::Rescue,
             &CaseMetadata::default(),
             source.clone(),
-            EffectiveConfig::build(&config, Some(&source)),
+            crate::models::config::EffectiveConfig::build(&config, Some(&source)),
         );
-        report.bytes_acquired = 1000;
-        report.image_hashes = HashResults {
-            md5: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
-            sha1: None,
-            sha256: None,
-        };
-        report.verification.result = VerificationResult::NotPossible {
-            reason: "ddrescue computes no digest".into(),
-        };
-        report.apply_classification();
-
-        // No acquisition digest is invented; the verdict says unverified
-        assert!(report.acquisition_hashes.is_empty());
-        assert_eq!(report.outcome, Outcome::CompleteUnverified);
-        assert_eq!(report.exit_code, 9);
-        let text = report.render_text();
-        assert!(text.contains("COMPLETE, NOT VERIFIED"), "{text}");
-        assert!(text.contains("--verify-source"), "{text}");
-        assert!(!text.contains("ALL HASHES MATCH"));
-
-        let (_, stop) = rescue_extent(5, 1000, 1000);
-        report.stop_reason = stop;
-        report.apply_classification();
-        assert_eq!(report.outcome, Outcome::Incomplete);
+        r.outcome = outcome;
+        r.auxiliary_files
+            .push(crate::models::info_report::FileDigest {
+                path: "/out/b.map".into(),
+                sha256: map_sha.into(),
+            });
+        r.to_json()
     }
 
     #[test]
-    fn test_parse_size_to_bytes_units() {
-        assert_eq!(parse_size_to_bytes(512.0, "B"), 512);
-        assert_eq!(parse_size_to_bytes(10.0, "kB"), 10_000);
-        assert_eq!(parse_size_to_bytes(10.0, "KB"), 10_000);
-        assert_eq!(parse_size_to_bytes(4.0, "KiB"), 4096);
-        assert_eq!(parse_size_to_bytes(2.0, "MB"), 2_000_000);
-        assert_eq!(parse_size_to_bytes(1.0, "MiB"), 1_048_576);
-        assert_eq!(parse_size_to_bytes(1.0, "GiB"), 1_073_741_824);
+    fn earlier_reports_are_kept_numbered_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let base = "b";
+        assert_eq!(keep_previous_report(d, base).unwrap(), None);
+        std::fs::write(d.join("b.info"), "first").unwrap();
+        std::fs::write(d.join("b.info.json"), report_json(Outcome::Aborted, "aa")).unwrap();
+        let (n, kept) = keep_previous_report(d, base).unwrap().unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            kept,
+            vec![d.join("b.info.session-1"), d.join("b.info.session-1.json")]
+        );
+        assert!(!d.join("b.info").exists());
+        std::fs::write(d.join("b.info"), "second").unwrap();
+        let (n, _) = keep_previous_report(d, base).unwrap().unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(
+            std::fs::read_to_string(d.join("b.info.session-1")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join("b.info.session-2")).unwrap(),
+            "second"
+        );
+        // Numbering continues after the highest, gaps are not reused
+        std::fs::write(d.join("b.info.session-7.json"), "{}").unwrap();
+        std::fs::write(d.join("b.info"), "third").unwrap();
+        assert_eq!(keep_previous_report(d, base).unwrap().unwrap().0, 8);
+
+        let sessions = list_sessions(d, base);
+        assert_eq!(
+            sessions.iter().map(|s| s.session).collect::<Vec<_>>(),
+            vec![1, 2, 7, 8]
+        );
+        assert_eq!(sessions[0].outcome, Some(Outcome::Aborted));
+        assert_eq!(
+            sessions[0].report_sha256.as_deref(),
+            Some(crate::models::info_report::sha256_hex(b"first").as_str())
+        );
+        assert_eq!(sessions[1].outcome, None);
+        assert!(sessions[2].report_file.ends_with("b.info.session-7.json"));
+        assert_eq!(map_digest_in_report(d, base, 1).as_deref(), Some("aa"));
+        assert_eq!(map_digest_in_report(d, base, 2), None);
+        // Other names are not sessions
+        assert_eq!(session_number("b", "b.info.session-"), None);
+        assert_eq!(session_number("b", "b.info.session-x.json"), None);
+        assert_eq!(session_number("B", "b.INFO.SESSION-3"), Some((3, false)));
+        // A later resume accepts every kept report and its JSON twin
+        for (n, _, _) in kept_sessions(d, base) {
+            for name in [
+                format!("b.info.session-{n}"),
+                format!("b.info.session-{n}.json"),
+            ] {
+                assert!(preflight::resume_may_exist(base, &name), "{name}");
+            }
+        }
+        assert!(!preflight::resume_may_exist(base, "b.info.session-.json"));
+    }
+
+    #[test]
+    fn a_finished_image_short_of_its_bad_tail_is_extended() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("b.map");
+        let image = dir.path().join("b.raw");
+        std::fs::write(&map, BAD_TAIL).unwrap();
+        std::fs::write(&image, vec![7u8; (MIB - 0x400) as usize]).unwrap();
+        let fin = finalize(&map, &image, MIB, 512);
+        assert_eq!(std::fs::metadata(&image).unwrap().len(), MIB);
+        assert_eq!(fin.bytes_acquired, MIB);
+        assert_eq!(fin.read_errors.substituted_bytes(), 0x400);
+        assert_eq!(fin.read_errors.unread_bytes(), 0);
+        assert_eq!(fin.bad_sectors, 2);
+        assert!(fin.stop_reason.is_none());
+        assert!(
+            fin.notes[0].contains("extended from 1047552 to 1048576 bytes"),
+            "{:?}",
+            fin.notes
+        );
+        assert!(
+            fin.notes[1].contains("GNU ddrescue version 1.30"),
+            "{:?}",
+            fin.notes
+        );
+        let data = std::fs::read(&image).unwrap();
+        assert!(data[(MIB - 0x400) as usize..].iter().all(|b| *b == 0));
+        assert!(data[..(MIB - 0x400) as usize].iter().all(|b| *b == 7));
+    }
+
+    #[test]
+    fn an_unfinished_or_inconsistent_image_is_never_padded() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("b.map");
+        let image = dir.path().join("b.raw");
+        // Interrupted: non-tried blocks remain
+        std::fs::write(&map, INTERRUPTED).unwrap();
+        std::fs::write(&image, vec![1u8; 0xA0000]).unwrap();
+        let fin = finalize(&map, &image, 4 * MIB, 512);
+        assert_eq!(std::fs::metadata(&image).unwrap().len(), 0xA0000);
+        assert_eq!(fin.bytes_acquired, 0xA0000);
+        assert_eq!(fin.read_errors.unread_bytes(), 4 * MIB - 0xA0000);
+        // Finished map, but the image lacks rescued data at its end
+        std::fs::write(&map, BAD_MIDDLE).unwrap();
+        std::fs::write(&image, vec![1u8; (MIB / 2) as usize]).unwrap();
+        let fin = finalize(&map, &image, MIB, 512);
+        assert_eq!(std::fs::metadata(&image).unwrap().len(), MIB / 2);
+        assert_eq!(fin.read_errors.unread_bytes(), MIB / 2);
+        assert!(fin
+            .notes
+            .iter()
+            .any(|n| n.contains("as rescued beyond the end of the image file")));
+        // A map for a smaller source: not covering this one
+        std::fs::write(&map, BAD_TAIL).unwrap();
+        std::fs::write(&image, vec![1u8; (MIB - 0x400) as usize]).unwrap();
+        let fin = finalize(&map, &image, 2 * MIB, 512);
+        assert_eq!(std::fs::metadata(&image).unwrap().len(), MIB - 0x400);
+        assert_eq!(fin.read_errors.unread_bytes(), MIB + 0x400);
+        assert!(fin.notes.iter().any(|n| n.contains("does not list")));
+    }
+
+    #[test]
+    fn without_a_readable_map_nothing_is_claimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("b.map");
+        let image = dir.path().join("b.raw");
+        std::fs::write(&image, vec![1u8; 4096]).unwrap();
+        for content in [None, Some("not a map\n")] {
+            if let Some(c) = content {
+                std::fs::write(&map, c).unwrap();
+            }
+            let fin = finalize(&map, &image, 4096, 512);
+            assert_eq!(fin.bytes_acquired, 0);
+            assert_eq!(fin.read_errors.unread_bytes(), 4096);
+            assert!(fin
+                .stop_reason
+                .unwrap()
+                .contains("whole source counts as not acquired"));
+        }
+    }
+
+    /// Lines of a captured screen as the process runner delivers them.
+    fn screen_lines(bytes: &[u8]) -> Vec<String> {
+        let mut s = LineSplitter::new(64 * 1024);
+        let mut lines: Vec<String> = s.feed(bytes).into_iter().map(|l| l.text).collect();
+        lines.extend(s.finish().map(|l| l.text));
+        lines
+    }
+
+    #[test]
+    fn progress_from_the_real_status_screen() {
+        let mut st = ScreenStatus::default();
+        let mut phases = Vec::new();
+        let mut messages = Vec::new();
+        let mut progress = 0;
+        for line in screen_lines(SCREEN_BAD_MIDDLE) {
+            match st.feed(&line) {
+                Some(ScreenEvent::Phase(p)) => phases.push(p),
+                Some(ScreenEvent::Message(m)) => messages.push(m),
+                Some(ScreenEvent::Progress) => progress += 1,
+                None => {}
+            }
+        }
+        assert!(progress >= 3, "{progress}");
+        assert_eq!(st.pct_rescued, Some(99.85));
+        assert_eq!(st.current_rate, Some(1_047_000.0));
+        assert_eq!(st.average_rate, Some(1_047_000.0));
+        assert_eq!(st.remaining_secs, None);
+        assert_eq!(
+            phases,
+            vec![
+                "Copying non-tried blocks... Pass 1 (forwards)",
+                "Copying non-tried blocks... Pass 2 (backwards)",
+                "Trimming failed blocks... (forwards)",
+            ]
+        );
+        assert_eq!(messages, vec!["Finished"]);
+
+        let mut t = ProgressTelemetry::default();
+        st.apply(&mut t, MIB, Duration::from_secs(3));
+        assert_eq!(t.percentage, 99.85);
+        assert_eq!(t.bytes_processed, 1_047_003);
+        assert_eq!(t.elapsed_secs, 3);
+        assert!(
+            t.status_message.contains("Trimming failed blocks"),
+            "{}",
+            t.status_message
+        );
+
+        let mut st = ScreenStatus::default();
+        let mut messages = Vec::new();
+        for line in screen_lines(SCREEN_INTERRUPTED) {
+            if let Some(ScreenEvent::Message(m)) = st.feed(&line) {
+                messages.push(m);
+            }
+        }
+        assert_eq!(st.pct_rescued, Some(15.62));
+        assert_eq!(st.remaining_secs, Some(11));
+        assert_eq!(messages, vec!["Interrupted by user"]);
+    }
+
+    #[test]
+    fn screen_details() {
+        assert_eq!(strip_ansi("\x1b[A\x1b[A  ipos: 0 B"), "  ipos: 0 B");
+        assert_eq!(parse_remaining("1h 23m"), Some(4980));
+        assert_eq!(parse_remaining("2d 3h"), Some(183_600));
+        assert_eq!(parse_remaining("n/a"), None);
+        let mut st = ScreenStatus::default();
+        st.feed("     ipos: 1 B, non-trimmed: 0 B,   current rate:  2.5 MiB/s");
+        assert_eq!(st.current_rate, Some(2.5 * 1024.0 * 1024.0));
+        st.feed("     opos: 1 B, non-scraped: 0 B,   average rate:  12 B/s");
+        assert_eq!(st.average_rate, Some(12.0));
+        assert_eq!(
+            st.feed("Initial status (read from mapfile)"),
+            Some(ScreenEvent::Message(
+                "Initial status (read from mapfile)".into()
+            ))
+        );
+        // The initial status of a resume is a message, the status block is not
+        assert!(matches!(
+            st.feed("rescued: 655360 B, tried: 0 B, bad-sector: 0 B, bad areas: 0"),
+            Some(ScreenEvent::Message(_))
+        ));
+        assert!(st
+            .feed("  rescued:   786432 B,   bad areas:          0,       run time:          0s")
+            .is_none());
+        // A repeated phase is reported once
+        assert!(st
+            .feed("Retrying bad sectors... Retry 1 (forwards)")
+            .is_some());
+        assert!(st
+            .feed("Retrying bad sectors... Retry 1 (forwards)")
+            .is_none());
+        assert!(st.feed("GNU ddrescue 1.30").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // The engine against fake ddrescue programs (shell scripts)
+    // -----------------------------------------------------------------------
+
+    /// An executable script; waits until it can be executed (ETXTBSY races
+    /// with other tests forking while the file was open for writing).
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for _ in 0..100 {
+            match std::process::Command::new(&p).arg("--version").output() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                _ => break,
+            }
+        }
+        p
+    }
+
+    /// The fake prints a version for `--version`; otherwise it runs `body`
+    /// with $IMG and $MAP set to its last two arguments.
+    fn fake_ddrescue(dir: &Path, body: &str) -> PathBuf {
+        script(
+            dir,
+            "fake-ddrescue",
+            &format!(
+                "if [ \"$1\" = --version ]; then echo 'GNU ddrescue 1.30 (fake)'; exit 0; fi\n\
+                 for a; do IMG=\"$MAP\"; MAP=\"$a\"; done\n\
+                 echo \"$@\" > \"$MAP.args\"\n{body}"
+            ),
+        )
+    }
+
+    fn context(dir: &Path, size: u64, resume: bool) -> EngineContext {
+        let src = dir.join("src.bin");
+        std::fs::write(&src, vec![0x5au8; size as usize]).unwrap();
+        let identity = crate::discovery::identity::probe_file(&src.to_string_lossy()).unwrap();
+        let device = BlockDevice {
+            name: "src".into(),
+            path: src.to_string_lossy().into_owned(),
+            size_bytes: size,
+            ..Default::default()
+        };
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let config = AcquisitionConfig {
+            resume,
+            ..AcquisitionConfig::rescue(&out)
+        };
+        EngineContext::new(
+            AcquisitionRequest::new(device, CaseMetadata::default(), config),
+            identity,
+            "b",
+        )
+    }
+
+    #[tokio::test]
+    async fn the_engine_reports_what_the_map_says() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = fake_ddrescue(
+            tmp.path(),
+            &format!(
+                "head -c {} /dev/zero > \"$IMG\"\nprintf '%s' '{}' > \"$MAP\"\n\
+                 echo 'pct rescued:   99.90%, read errors:          2, remaining time:         n/a'\nexit 0\n",
+                MIB - 0x400,
+                BAD_TAIL
+            ),
+        );
+        let ctx = context(tmp.path(), MIB, false);
+        let out = acquire_with(&ctx, fake.as_os_str()).await.unwrap();
+        assert!(!out.aborted);
+        assert_eq!(out.stop_reason, None);
+        assert_eq!(out.bytes_acquired, MIB);
+        assert_eq!(out.expected_bytes, MIB);
+        assert_eq!(out.read_errors.source, MAP_SOURCE);
+        assert_eq!(out.read_errors.substituted_bytes(), 0x400);
+        assert_eq!(out.read_errors.ranges[0].offset, MIB - 0x400);
+        assert_eq!(out.image_files, vec![ctx.output_path(".raw")]);
+        assert_eq!(
+            out.auxiliary_files,
+            vec![ctx.output_path(".map"), ctx.output_path(".identity.json")]
+        );
+        assert_eq!(
+            std::fs::metadata(ctx.output_path(".raw")).unwrap().len(),
+            MIB
+        );
+        let Some(EngineSettings::Rescue(s)) = &out.settings else {
+            panic!("{:?}", out.settings)
+        };
+        assert!(!s.direct_io && !s.resume);
+        assert_eq!((s.retries, s.sector_size), (2, 512));
+        // Regular file: no -d; no -I on a first start
+        let args = std::fs::read_to_string(tmp.path().join("out/b.map.args")).unwrap();
+        assert!(args.starts_with("-r 2 -b 512 "), "{args}");
+        assert!(!args.contains("-d ") && !args.contains("-I"), "{args}");
+        // The identity record holds the probed identity
+        let record = read_identity_record(&ctx.output_path(".identity.json")).unwrap();
+        assert_eq!(record.identity, ctx.identity);
+        assert_eq!(record.base_name, "b");
+        // The command is recorded, with the version
+        let rec = ctx.provenance.commands();
+        assert_eq!(rec.len(), 1);
+        assert_eq!(rec[0].exit_code, Some(0));
+        assert_eq!(
+            ctx.provenance.tools().get(DDRESCUE).map(String::as_str),
+            Some("GNU ddrescue 1.30 (fake)")
+        );
+        assert_eq!(ctx.progress.snapshot().bad_sectors, 2);
+        assert!(out
+            .notes
+            .iter()
+            .any(|n| n.contains("without direct access")));
+    }
+
+    #[tokio::test]
+    async fn a_failing_ddrescue_is_an_incomplete_rescue_or_an_error() {
+        // It wrote a map, then failed: the facts stand, with the reason
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = fake_ddrescue(
+            tmp.path(),
+            &format!(
+                "printf '%s' '{INTERRUPTED}' > \"$MAP\"\n: > \"$IMG\"\n\
+                 echo 'ddrescue: Write error: No space left on device' >&2\nexit 1\n"
+            ),
+        );
+        let ctx = context(tmp.path(), 4 * MIB, false);
+        let out = acquire_with(&ctx, fake.as_os_str()).await.unwrap();
+        let stop = out.stop_reason.unwrap();
+        assert!(stop.contains("exit status 1"), "{stop}");
+        assert!(stop.contains("No space left on device"), "{stop}");
+        assert_eq!(out.bytes_acquired, 0);
+        assert_eq!(out.read_errors.unread_bytes(), 4 * MIB);
+
+        // It wrote nothing: an error, and the identity record goes again
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = fake_ddrescue(
+            tmp.path(),
+            "echo 'ddrescue: Cannot open input file' >&2\nexit 1\n",
+        );
+        let ctx = context(tmp.path(), MIB, false);
+        let e = acquire_with(&ctx, fake.as_os_str()).await.unwrap_err();
+        assert_eq!(e.kind, crate::engines::ErrorKind::Failed);
+        assert!(e.message.contains("Cannot open input file"), "{e}");
+        assert!(!ctx.output_path(".identity.json").exists());
+
+        // Not installed: nothing is written
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(tmp.path(), MIB, false);
+        let missing = tmp.path().join("no-such-ddrescue");
+        let e = acquire_with(&ctx, missing.as_os_str()).await.unwrap_err();
+        assert!(e.message.contains("not available"), "{e}");
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("out")).unwrap().count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_interrupts_ddrescue_which_saves_its_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = fake_ddrescue(
+            tmp.path(),
+            &format!(
+                "head -c 655360 /dev/zero > \"$IMG\"\nprintf '%s' '{INTERRUPTED}' > \"$MAP\"\n\
+                 trap 'echo Interrupted by user; exit 130' INT\n\
+                 i=0; while [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done\nexit 0\n"
+            ),
+        );
+        let ctx = context(tmp.path(), 4 * MIB, false);
+        let abort = ctx.abort.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            abort.store(true, Ordering::SeqCst);
+        });
+        let t0 = Instant::now();
+        let out = acquire_with(&ctx, fake.as_os_str()).await.unwrap();
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "SIGINT was not delivered"
+        );
+        assert!(out.aborted);
+        assert_eq!(out.stop_reason, None);
+        assert!(
+            out.notes.iter().any(|n| n.contains("stopped with SIGINT")),
+            "{:?}",
+            out.notes
+        );
+        assert_eq!(out.read_errors.unread_bytes(), 4 * MIB - 0xA0000);
+        let rec = &ctx.provenance.commands()[0];
+        assert!(
+            rec.stop.as_deref().unwrap_or("").contains("SIGINT"),
+            "{rec:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_the_previous_report_and_passes_dash_i() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = fake_ddrescue(
+            tmp.path(),
+            &format!("printf '%s' '{BAD_MIDDLE}' > \"$MAP\"\nexit 0\n"),
+        );
+        // First start
+        let ctx = context(tmp.path(), MIB, false);
+        std::fs::write(ctx.output_path(".raw"), vec![0u8; MIB as usize]).unwrap();
+        acquire_with(&ctx, fake.as_os_str()).await.unwrap();
+        let map_sha = sha256_file(&ctx.output_path(".map")).unwrap();
+        std::fs::write(ctx.output_path(".info"), "report 1").unwrap();
+        std::fs::write(
+            ctx.output_path(".info.json"),
+            report_json(Outcome::Aborted, &map_sha),
+        )
+        .unwrap();
+
+        // Resume, same source file
+        let ctx2 = context_again(&ctx, true);
+        let out = acquire_with(&ctx2, fake.as_os_str()).await.unwrap();
+        let args = std::fs::read_to_string(ctx.output_path(".map.args")).unwrap();
+        assert!(args.contains("-I "), "{args}");
+        assert_eq!(out.resume_sessions.len(), 1);
+        assert_eq!(out.resume_sessions[0].session, 1);
+        assert_eq!(out.resume_sessions[0].outcome, Some(Outcome::Aborted));
+        assert!(!ctx.output_path(".info").exists());
+        assert_eq!(
+            std::fs::read_to_string(ctx.output_path(".info.session-1")).unwrap(),
+            "report 1"
+        );
+        let notes = out.notes.join("\n");
+        assert!(
+            notes.contains("kept as b.info.session-1 and b.info.session-1.json"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("is the map the report of session 1 lists"),
+            "{notes}"
+        );
+        let Some(EngineSettings::Rescue(s)) = &out.settings else {
+            panic!()
+        };
+        assert!(s.resume);
+        // The identity record is not rewritten and is still listed
+        assert!(out
+            .auxiliary_files
+            .contains(&ctx.output_path(".identity.json")));
+
+        // Resuming again: the map changed since the last kept report
+        std::fs::write(ctx.output_path(".info"), "report 2").unwrap();
+        std::fs::write(
+            ctx.output_path(".info.json"),
+            report_json(Outcome::Incomplete, "00"),
+        )
+        .unwrap();
+        let out = acquire_with(&ctx2, fake.as_os_str()).await.unwrap();
+        assert_eq!(out.resume_sessions.len(), 2);
+        assert!(out
+            .notes
+            .join("\n")
+            .contains("the map changed after the report of session 2"));
+
+        // Another file at the same path: refused, the previous report kept anyway
+        std::fs::write(ctx.output_path(".info"), "report 3").unwrap();
+        let mut ctx3 = context_again(&ctx, true);
+        ctx3.identity.file_id = Some("0:0".into());
+        let e = acquire_with(&ctx3, fake.as_os_str()).await.unwrap_err();
+        assert!(e.is_refusal(), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(ctx.output_path(".info.session-3")).unwrap(),
+            "report 3"
+        );
+    }
+
+    /// A context for the same output as `ctx` (`resume` as given).
+    fn context_again(ctx: &EngineContext, resume: bool) -> EngineContext {
+        let mut config = ctx.request.config.clone();
+        config.resume = resume;
+        EngineContext::new(
+            AcquisitionRequest::new(ctx.request.device.clone(), CaseMetadata::default(), config),
+            ctx.identity.clone(),
+            ctx.base_name.clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn verify_hashes_the_image_and_never_claims_a_comparison() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = context(tmp.path(), 4096, false);
+        let image = ctx.output_path(".raw");
+        std::fs::write(&image, b"abc").unwrap();
+        let out = EngineOutput {
+            image_files: vec![image],
+            ..Default::default()
+        };
+        let (result, hashes) = verify(&ctx, &out).await;
+        assert!(
+            matches!(result, VerificationResult::NotPossible { .. }),
+            "{result:?}"
+        );
+        assert_eq!(
+            hashes.md5.as_deref(),
+            Some("900150983cd24fb0d6963f7d28e17f72")
+        );
+        assert_eq!(
+            hashes.sha256.as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+        assert_eq!(
+            hashes.sha1.as_deref(),
+            Some("a9993e364706816aba3e25717850c26c9cd0d89d")
+        );
+        // No image: failed
+        let (result, _) = verify(&ctx, &EngineOutput::default()).await;
+        assert!(matches!(result, VerificationResult::Failed { .. }));
+        // Abort while hashing
+        let abort = AtomicBool::new(true);
+        let e = hash_image(&ctx.output_path(".raw"), ctx.selection, &abort, |_, _| {}).unwrap_err();
+        assert_eq!(e.kind, crate::engines::ErrorKind::Aborted);
     }
 }

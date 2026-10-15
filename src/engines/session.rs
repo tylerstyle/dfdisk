@@ -601,10 +601,14 @@ fn destination_checks(
     })?;
     let resume = engine == EngineKind::Rescue && config.resume;
     let mut rules = DestinationRules::new(config, identity.size_bytes);
+    let mut resume_identity = Vec::new();
     if resume {
         rules.resumed_image_bytes = preflight::check_resume_files(dir, base_name)?;
+        // The map and image must belong to this source (identity at the first start)
+        resume_identity = rescue::check_resume_identity(dir, base_name, identity)?;
     }
     let mut notes = vec![format!("destination: {}", facts.summary())];
+    notes.extend(resume_identity);
     notes.extend(preflight::evaluate(&rules, &facts)?);
     if identity.is_block_device() {
         if let Some(source) = identity.maj_min.as_deref().and_then(parse_dev_num) {

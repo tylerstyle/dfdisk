@@ -1,0 +1,54 @@
+GNU ddrescue 1.30
+Press Ctrl-C to interrupt
+
+
+
+
+
+
+[A[A[A[A[A[A     ipos:        0 B, non-trimmed:        0 B,   current rate:       0 B/s
+     opos:        0 B, non-scraped:        0 B,   average rate:       0 B/s
+non-tried:    1048 kB,  bad-sector:        0 B,     error rate:       0 B/s
+  rescued:        0 B,   bad areas:          0,       run time:          0s
+pct rescued:    0.00%, read errors:          0, remaining time:         n/a
+                               time since last successful read:         n/a
+Copying non-tried blocks... Pass 1 (forwards)[A[A[A[A[A[A     ipos:   983040 B, non-trimmed:   131072 B,   current rate:       0 B/s
+     opos:   983040 B, non-scraped:        0 B,   average rate:       0 B/s
+non-tried:   131072 B,  bad-sector:        0 B,     error rate:       0 B/s
+  rescued:   786432 B,   bad areas:          0,       run time:          0s
+pct rescued:   75.00%, read errors:          2, remaining time:         n/a
+                               time since last successful read:          0s
+Copying non-tried blocks... Pass 1 (forwards)
+     ipos:   655360 B, non-trimmed:   131072 B,   current rate:       0 B/s
+     opos:   655360 B, non-scraped:        0 B,   average rate:       0 B/s
+non-tried:   131072 B,  bad-sector:        0 B,     error rate:       0 B/s
+  rescued:   786432 B,   bad areas:          0,       run time:          0s
+pct rescued:   75.00%, read errors:          2, remaining time:         n/a
+                               time since last successful read:          0s
+Copying non-tried blocks... Pass 2 (backwards)[A[A[A[A[A[A     ipos:   131072 B, non-trimmed:   131072 B,   current rate:       0 B/s
+     opos:   131072 B, non-scraped:        0 B,   average rate:       0 B/s
+non-tried:        0 B,  bad-sector:        0 B,     error rate:       0 B/s
+  rescued:   917504 B,   bad areas:          0,       run time:          0s
+pct rescued:   87.50%, read errors:          2, remaining time:         n/a
+                               time since last successful read:          0s
+Copying non-tried blocks... Pass 2 (backwards)
+     ipos:    65536 B, non-trimmed:   131072 B,   current rate:       0 B/s
+     opos:    65536 B, non-scraped:        0 B,   average rate:       0 B/s
+non-tried:        0 B,  bad-sector:        0 B,     error rate:       0 B/s
+  rescued:   917504 B,   bad areas:          0,       run time:          0s
+pct rescued:   87.50%, read errors:          2, remaining time:         n/a
+                               time since last successful read:          0s
+Trimming failed blocks... (forwards)          [A[A[A[A[A[A     ipos:   590336 B, non-trimmed:        0 B,   current rate:       0 B/s
+     opos:   590336 B, non-scraped:        0 B,   average rate:       0 B/s
+non-tried:        0 B,  bad-sector:     1536 B,     error rate:       0 B/s
+  rescued:    1047 kB,   bad areas:          2,       run time:          0s
+pct rescued:   99.85%, read errors:          5, remaining time:         n/a
+                               time since last successful read:          0s
+Trimming failed blocks... (forwards)[A[A[A[A[A[A     ipos:   590336 B, non-trimmed:        0 B,   current rate:   1047 kB/s
+     opos:   590336 B, non-scraped:        0 B,   average rate:   1047 kB/s
+non-tried:        0 B,  bad-sector:     1536 B,     error rate:    132 kB/s
+  rescued:    1047 kB,   bad areas:          2,       run time:          1s
+pct rescued:   99.85%, read errors:          5, remaining time:         n/a
+                               time since last successful read:          0s
+
+Finished                           

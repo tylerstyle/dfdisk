@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod converter;
+pub mod ddrescue_map;
 pub mod error;
 pub mod ewf;
 pub mod hasher;

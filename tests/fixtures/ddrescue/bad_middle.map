@@ -1,0 +1,13 @@
+# Mapfile. Created by GNU ddrescue version 1.30
+# Command line: ddrescue -d -r 0 -b 512 -H test.map src.bin img.raw img.map
+# Start time:   2026-10-15 01:06:30
+# Current time: 2026-10-15 01:06:30
+# Finished
+# current_pos  current_status  current_pass
+0x00090400     +               1
+#      pos        size  status
+0x00000000  0x00010000  +
+0x00010000  0x00000400  -
+0x00010400  0x0007FC00  +
+0x00090000  0x00000200  -
+0x00090200  0x0006FE00  +
