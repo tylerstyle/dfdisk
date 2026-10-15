@@ -122,7 +122,8 @@ and when something was not done the report says so.
   (last four characters of the serial, the whole serial when shorter, the
   evidence number without a serial), source identity on every screen, a
   scrolling device table that keeps the serial visible, abort with confirmation.
-- **H9** Exit codes: see Breaking changes; errors are printed once.
+- **H9** Exit codes: see Breaking changes; errors are printed once; a panic
+  exits 1 (internal error) with a message instead of Rust's 101.
 - **H10** Release and packaging: releases are built only after the test job
   passed; tag, Cargo.toml, Cargo.lock and package.nix versions must agree;
   pinned Rust toolchain; `cargo install --locked --version` for cross and

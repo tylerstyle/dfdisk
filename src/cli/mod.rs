@@ -59,6 +59,35 @@ async fn dispatch(
     }
 }
 
+/// Run `run` (a command or the TUI) and turn a panic into exit code 1
+/// (internal error) with a message on stderr, instead of Rust's 101 (T6).
+/// The panic hook has already printed where it happened; unwinding has run
+/// the audit guards ("acquisition_finished" with exit code 1) and the TUI's
+/// hook has restored the terminal.
+pub async fn exit_code_or_internal_error<F>(run: F) -> i32
+where
+    F: std::future::Future<Output = i32>,
+{
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(run).catch_unwind().await {
+        Ok(code) => code,
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".to_string());
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "Error (INTERNAL ERROR): dfdisk stopped on an internal error (panic: {}). This is a bug; please report it.",
+                crate::models::text::sanitize_line(&what)
+            );
+            crate::models::outcome::exit_code::INTERNAL_ERROR
+        }
+    }
+}
+
 /// The exit code of a command's result; an error is printed once (stderr,
 /// and as `{"error": ..}` on stdout with `--json`).
 pub fn finish(console: &Console, result: Result<i32, AcquisitionError>) -> i32 {

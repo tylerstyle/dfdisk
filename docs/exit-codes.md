@@ -7,7 +7,7 @@ codes; the text and JSON reports carry the same code (`exit_code` in
 | Code | Name | Meaning |
 |-----:|------|---------|
 | 0 | Verified | The whole source was acquired without read errors, and the digests recomputed from the written image match the digests computed while reading the source. |
-| 1 | Internal error | A bug or an unexpected internal failure. Please report it. |
+| 1 | Internal error | A bug or an unexpected internal failure (including a panic, which is reported as "Error (INTERNAL ERROR): …" rather than with Rust's exit code 101). Please report it. |
 | 2 | Usage error | Invalid arguments or inconsistent options. Nothing was written and nothing was sent to the device. |
 | 3 | Refused | A safety or preflight rule refused the run (see below). Nothing was acquired. |
 | 4 | Failed | The run could not be carried out (for example a required tool is missing), or the verification could not run or complete (outcome VERIFICATION FAILED). |
