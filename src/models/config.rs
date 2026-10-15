@@ -274,6 +274,9 @@ pub const DEFAULT_PIECE_SIZE: u64 = 1 << 30;
 pub const MIN_PIECE_SIZE: u64 = 1 << 20;
 /// Highest retry count passed to ewfacquire / ddrescue.
 pub const MAX_RETRIES: u32 = 255;
+/// `--on-read-error zero-fill` (RAW): consecutive unreadable sectors after
+/// which the source counts as lost (§13).
+pub const SOURCE_LOSS_SECTORS: u64 = 4096;
 
 fn default_piece_size() -> Option<u64> {
     Some(DEFAULT_PIECE_SIZE)
@@ -503,6 +506,10 @@ pub struct RawSettings {
     /// How the source was read, filled in by the engine ("O_DIRECT",
     /// "buffered with POSIX_FADV_DONTNEED")
     pub source_io: Option<String>,
+    /// `--on-read-error zero-fill`: consecutive unreadable sectors after
+    /// which the source counts as lost and the acquisition ends
+    #[serde(default)]
+    pub source_loss_sectors: Option<u64>,
 }
 
 /// ddrescue settings that were applied.
@@ -584,6 +591,8 @@ impl EffectiveConfig {
                     on_read_error: config.on_read_error,
                     piece_size: config.piece_size,
                     source_io: None,
+                    source_loss_sectors: (config.on_read_error == OnReadError::ZeroFill)
+                        .then_some(SOURCE_LOSS_SECTORS),
                 }),
             ),
             EngineKind::Rescue => (
@@ -658,6 +667,12 @@ impl EffectiveConfig {
                         None => "off".into(),
                     },
                 ));
+                if let Some(n) = r.source_loss_sectors {
+                    rows.push((
+                        "Source Lost After".into(),
+                        format!("{n} consecutive unreadable sectors"),
+                    ));
+                }
                 if let Some(io) = &r.source_io {
                     rows.push(("Source I/O".into(), io.clone()));
                 }

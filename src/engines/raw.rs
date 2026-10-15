@@ -57,7 +57,7 @@ pub const RAW_ZERO_FILL_HANDLING: &str =
 
 /// Consecutive unreadable sectors after which a zero-filling acquisition
 /// treats the source as lost (§13).
-pub const SOURCE_LOSS_SECTORS: u64 = 4096;
+pub use crate::models::config::SOURCE_LOSS_SECTORS;
 
 /// `ReadErrorTable::source` of RAW acquisitions.
 pub const RAW_TABLE_SOURCE: &str = "raw engine (sector reads)";
@@ -794,6 +794,8 @@ pub(crate) fn run_copy(
             format_iec(job.plan.chunk_size as u64),
             job.plan.sector()
         )),
+        source_loss_sectors: (policy == OnReadError::ZeroFill)
+            .then_some(job.plan.loss_threshold_sectors.max(1)),
     }));
     out
 }
@@ -1514,6 +1516,8 @@ mod tests {
         };
         assert_eq!(s.on_read_error, OnReadError::ZeroFill);
         assert_eq!(s.piece_size, Some(1 << 20));
+        assert_eq!(s.source_loss_sectors, Some(SOURCE_LOSS_SECTORS));
+        assert!(RAW_ZERO_FILL_HANDLING.contains(&format!("{SOURCE_LOSS_SECTORS} consecutive")));
         let io = s.source_io.as_deref().unwrap();
         assert!(io.starts_with("fake device reads; positioned reads of 1 MiB through the source descriptor held by the session; after a failed read each 4096-byte sector"), "{io}");
         assert!(out.notes.iter().any(|n| n == RAW_ZERO_FILL_HANDLING));
@@ -1640,6 +1644,7 @@ mod tests {
             panic!()
         };
         assert_eq!(s.piece_size, None);
+        assert_eq!(s.source_loss_sectors, None, "stop policy: no loss limit");
         assert!(!ctx.output_path(".pieces.tsv").exists());
 
         // A pieces file that cannot be created: the image is still acquired
