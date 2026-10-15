@@ -512,7 +512,7 @@ impl ConvField {
             ConvField::Source => "image.raw / image.001 / image.E01",
             ConvField::Destination => "directory for the converted image",
             ConvField::CaseNumber | ConvField::EvidenceNumber | ConvField::Examiner => {
-                "required (pre-filled from the source report)"
+                "required (taken from the source's report when it has one)"
             }
             ConvField::Description | ConvField::Notes => "optional",
             _ => "",
@@ -594,6 +594,49 @@ pub struct ConvForm {
     pub facts: Option<SourceFacts>,
     /// Extra notes (e.g. the read-error summary of a rescue)
     pub notes: Vec<String>,
+    /// Case fields taken from a source's report, as taken
+    pub prefilled: Option<Prefill>,
+}
+
+/// Case fields of the converter form that a source's report filled in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prefill {
+    /// The report the values came from
+    pub report: PathBuf,
+    /// Each field taken and the value it got
+    pub fields: Vec<(ConvField, String)>,
+}
+
+/// The case fields with an input on the converter form that a report can
+/// fill. The report's other case values (seal, seizure, authority, location)
+/// have no input here: the converter takes them from the report itself.
+pub const PREFILL_FIELDS: [ConvField; 4] = [
+    ConvField::CaseNumber,
+    ConvField::EvidenceNumber,
+    ConvField::Examiner,
+    ConvField::Description,
+];
+
+/// A case value by converter field (empty for fields that are not case
+/// values).
+pub fn conv_case_value(case: &CaseMetadata, field: ConvField) -> &str {
+    match field {
+        ConvField::CaseNumber => &case.case_number,
+        ConvField::EvidenceNumber => &case.evidence_number,
+        ConvField::Examiner => &case.examiner,
+        ConvField::Description => &case.description,
+        ConvField::Notes => &case.notes,
+        _ => "",
+    }
+}
+
+/// "case number, evidence number" (lower-case labels of the fields).
+pub fn field_labels(fields: &[ConvField]) -> String {
+    fields
+        .iter()
+        .map(|f| f.label().to_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl Default for ConvForm {
@@ -609,11 +652,64 @@ impl Default for ConvForm {
             cursor: 0,
             facts: None,
             notes: Vec::new(),
+            prefilled: None,
         }
     }
 }
 
 impl ConvForm {
+    /// The source changed: empty the case fields a report filled in that the
+    /// examiner left as they were (they belong to the previous image).
+    /// Returns the report and the fields cleared.
+    pub fn clear_prefill(&mut self) -> Option<(PathBuf, Vec<ConvField>)> {
+        let p = self.prefilled.take()?;
+        let mut cleared = Vec::new();
+        for (field, value) in p.fields {
+            if let Some(t) = self.text_mut(field) {
+                if *t == value {
+                    t.clear();
+                    cleared.push(field);
+                }
+            }
+        }
+        Some((p.report, cleared))
+    }
+
+    /// Fill the empty case fields of [`PREFILL_FIELDS`] from `case` (the
+    /// report at `report`) and remember them. Returns the fields filled and
+    /// the fields whose (examiner's) value differs from the report's.
+    pub fn prefill_from(
+        &mut self,
+        report: &Path,
+        case: &CaseMetadata,
+    ) -> (Vec<ConvField>, Vec<ConvField>) {
+        let mut taken = Vec::new();
+        let mut differing = Vec::new();
+        for field in PREFILL_FIELDS {
+            let value = conv_case_value(case, field).trim().to_string();
+            if value.is_empty() {
+                continue;
+            }
+            let Some(t) = self.text_mut(field) else {
+                continue;
+            };
+            if t.trim().is_empty() {
+                *t = value.clone();
+                taken.push((field, value));
+            } else if t.trim() != value {
+                differing.push(field);
+            }
+        }
+        let fields: Vec<ConvField> = taken.iter().map(|(f, _)| *f).collect();
+        if !taken.is_empty() {
+            self.prefilled = Some(Prefill {
+                report: report.to_path_buf(),
+                fields: taken,
+            });
+        }
+        (fields, differing)
+    }
+
     pub fn text(&self, field: ConvField) -> Option<&String> {
         Some(match field {
             ConvField::Source => &self.source,

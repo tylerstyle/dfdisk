@@ -1975,7 +1975,7 @@ fn help_lines(app: &App) -> Vec<String> {
         ],
         Screen::Converter => &[
             "RAW (.raw/.dd/.img/.001) converts to E01, EWF (.E01...) to RAW.",
-            "Case fields are pre-filled from the source's .info.json when one is found next to it.",
+            "Empty case, evidence, examiner and description fields are filled from the source's .info.json when one is found next to it; its other case values are taken over by the converter.",
             "F5 opens the confirmation sheet.",
         ],
         Screen::Verify => &[

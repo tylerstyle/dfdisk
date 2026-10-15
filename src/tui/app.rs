@@ -34,8 +34,8 @@ use crate::tui::devices::{
     invalidation_notice, reconcile, source_rows, Badge, Reconciled, SelectionKey, SourceRow,
 };
 use crate::tui::form::{
-    case_text, case_text_mut, report_candidate, AcqForm, ConvField, ConvForm, Field, SourceFacts,
-    SourceReport, VerField, VerifyForm,
+    case_text, case_text_mut, field_labels, report_candidate, AcqForm, ConvField, ConvForm, Field,
+    SourceFacts, SourceReport, VerField, VerifyForm,
 };
 use crate::tui::profile::{self, CaseProfile};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1879,11 +1879,13 @@ impl App {
             source: image,
             target: ConversionTarget::E01,
             destination: dir,
-            case,
             field: ConvField::Destination,
             notes,
             ..ConvForm::default()
         };
+        // The fields the form shows, from the rescue's report; the converter
+        // reads that report itself for the rest
+        self.conv.prefill_from(&report_json, &case);
         self.conv.cursor = self.conv.destination.len();
         self.conv_due = Some(Instant::now());
         self.screen = Screen::Converter;
@@ -1949,9 +1951,7 @@ impl App {
                     let changed = *t != before;
                     self.conv.cursor = cursor;
                     if changed && field == ConvField::Source {
-                        self.conv.detect_target();
-                        self.conv.facts = None;
-                        self.conv_due = Some(Instant::now() + PROBE_DEBOUNCE);
+                        self.conv_source_changed();
                     }
                 }
             }
@@ -1959,6 +1959,54 @@ impl App {
             KeyCode::Char(' ') | KeyCode::Right => self.conv.toggle(field, true),
             KeyCode::Left => self.conv.toggle(field, false),
             _ => {}
+        }
+    }
+
+    /// The converter's source text changed: target guess, probe after the
+    /// debounce, and the case values the previous image's report filled in
+    /// (and the examiner left untouched) are emptied: they are not the new
+    /// image's.
+    fn conv_source_changed(&mut self) {
+        self.conv.detect_target();
+        self.conv.facts = None;
+        self.conv_due = Some(Instant::now() + PROBE_DEBOUNCE);
+        if let Some((report, cleared)) = self.conv.clear_prefill() {
+            if !cleared.is_empty() {
+                self.notify(
+                    Level::Info,
+                    format!(
+                        "The source changed: {} taken from {} were emptied.",
+                        field_labels(&cleared),
+                        report.display()
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Fill the converter's empty case fields from the report of its source
+    /// and say exactly which were taken, and which differ from the report.
+    fn prefill_conversion(&mut self, report: &SourceReport) {
+        let (taken, differing) = self.conv.prefill_from(&report.path, &report.case);
+        if !taken.is_empty() {
+            self.notify(
+                Level::Info,
+                format!(
+                    "Pre-filled from {}: {}",
+                    report.path.display(),
+                    field_labels(&taken)
+                ),
+            );
+        }
+        if !differing.is_empty() {
+            self.notify(
+                Level::Warning,
+                format!(
+                    "{} records other values for {}; the form's values are recorded for the conversion (the report's are noted in it).",
+                    report.path.display(),
+                    field_labels(&differing)
+                ),
+            );
         }
     }
 
@@ -2365,11 +2413,7 @@ impl App {
                 self.form.resume = false;
                 self.dest_due = due;
             }
-            Input::Conv(ConvField::Source) => {
-                self.conv.detect_target();
-                self.conv.facts = None;
-                self.conv_due = due;
-            }
+            Input::Conv(ConvField::Source) => self.conv_source_changed(),
             Input::Verify(VerField::Image) => self.verify_due = due,
             Input::Verify(VerField::Report) => self.verify.report_auto = false,
             _ => {}
@@ -2709,32 +2753,17 @@ impl App {
                 if facts.is_ewf {
                     self.conv.target = ConversionTarget::Raw;
                 }
+                // Pre-fill the case fields the form shows from what the
+                // report recorded (the examiner sees and may edit each before
+                // it is recorded again); its other case values have no input
+                // here and are taken over by the converter from the report
+                // itself. Values of an earlier source's report were emptied
+                // when the source changed.
                 if let Some(report) = &facts.report {
-                    // Pre-fill what the report recorded; the examiner sees and
-                    // may edit every value before it is recorded again
-                    let case = &mut self.conv.case;
-                    let from = &report.case;
-                    for (dst, src) in [
-                        (&mut case.case_number, &from.case_number),
-                        (&mut case.evidence_number, &from.evidence_number),
-                        (&mut case.location_ea, &from.location_ea),
-                        (&mut case.authority, &from.authority),
-                        (&mut case.description, &from.description),
-                        (&mut case.seal_number, &from.seal_number),
-                        (&mut case.seizure_time, &from.seizure_time),
-                        (&mut case.seizure_location, &from.seizure_location),
-                    ] {
-                        if dst.trim().is_empty() {
-                            *dst = src.clone();
-                        }
+                    if self.conv.prefilled.as_ref().map(|p| &p.report) != Some(&report.path) {
+                        self.conv.clear_prefill();
                     }
-                    if case.examiner.trim().is_empty() {
-                        case.examiner = from.examiner.clone();
-                    }
-                    self.notify(
-                        Level::Info,
-                        format!("Case fields pre-filled from {}", report.path.display()),
-                    );
+                    self.prefill_conversion(report);
                 }
                 self.conv.facts = Some(facts);
             }

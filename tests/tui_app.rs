@@ -1137,6 +1137,146 @@ async fn conversion_goes_through_the_confirmation_sheet() {
     );
 }
 
+/// An image `<stem>.raw` with its acquisition report `<stem>.info.json`.
+fn image_with_report(dir: &Path, stem: &str, case: &str, ev: &str, seal: &str) -> PathBuf {
+    let image = dir.join(format!("{stem}.raw"));
+    std::fs::write(&image, vec![0u8; 4096]).unwrap();
+    let mut dev = disk("sdx", Some(&format!("SER{stem}")), 1, 16);
+    dev.size_bytes = 4096;
+    let meta = dfdisk::models::case::CaseMetadata {
+        case_number: case.into(),
+        evidence_number: ev.into(),
+        examiner: "Acq Examiner".into(),
+        seal_number: seal.into(),
+        ..Default::default()
+    };
+    let id = identity_of(&dev);
+    let cfg = dfdisk::models::config::AcquisitionConfig::for_engine(EngineKind::Raw, dir);
+    let r = ForensicInfoReport::new(
+        EngineKind::Raw,
+        &meta,
+        id.clone(),
+        EffectiveConfig::build(&cfg, Some(&id)),
+    );
+    std::fs::write(dir.join(format!("{stem}.info.json")), r.to_json()).unwrap();
+    image
+}
+
+#[tokio::test]
+async fn the_converter_never_keeps_the_previous_images_case_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = image_with_report(dir.path(), "imgA", "CASE-A", "EV-A", "SEAL-A");
+    let b = image_with_report(dir.path(), "imgB", "CASE-B", "EV-B", "SEAL-B");
+    let fake = Fake::new(vec![]);
+    let mut app = app_with(&fake);
+    app.handle_key(key(KeyCode::Char('c')));
+    typ(&mut app, &a.display().to_string());
+    pump(&mut app, "report of A", |app| {
+        app.conv.facts.as_ref().is_some_and(|f| f.path == a)
+    })
+    .await;
+    assert_eq!(app.conv.case.case_number, "CASE-A");
+    assert_eq!(app.conv.case.evidence_number, "EV-A");
+    assert_eq!(app.conv.case.examiner, "Acq Examiner");
+    // Fields without an input on the form are not filled (and so not sent
+    // as "given"): the converter takes them from the report itself
+    assert_eq!(app.conv.case.seal_number, "");
+    assert!(app
+        .notices
+        .iter()
+        .any(|n| n.text.contains("Pre-filled from")
+            && n.text.contains("case number, evidence no., examiner")));
+
+    // The examiner changes the source to image B
+    app.notices.clear();
+    app.handle_key(ctrl('u'));
+    typ(&mut app, &b.display().to_string());
+    pump(&mut app, "report of B", |app| {
+        app.conv.facts.as_ref().is_some_and(|f| f.path == b)
+    })
+    .await;
+    assert_eq!(app.conv.case.case_number, "CASE-B");
+    assert_eq!(app.conv.case.evidence_number, "EV-B");
+    let texts: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("were emptied")),
+        "{texts:?}"
+    );
+
+    // A value the examiner typed is theirs: kept, and the difference named
+    app.conv.case.case_number = "MANUAL-1".into();
+    app.notices.clear();
+    app.handle_key(ctrl('u'));
+    typ(&mut app, &a.display().to_string());
+    pump(&mut app, "report of A again", |app| {
+        app.conv.facts.as_ref().is_some_and(|f| f.path == a)
+    })
+    .await;
+    assert_eq!(app.conv.case.case_number, "MANUAL-1");
+    assert_eq!(app.conv.case.evidence_number, "EV-A");
+    let texts: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("records other values for case number")),
+        "{texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with("Pre-filled from") && !t.contains("case number")),
+        "only the fields taken are named: {texts:?}"
+    );
+
+    // What is sent: the form's values and B's... no: A's report
+    app.conv.destination = dir.path().join("out").display().to_string();
+    app.handle_key(key(KeyCode::F(5)));
+    pump(&mut app, "sheet", |app| {
+        app.confirm.as_ref().is_some_and(|c| !c.pending)
+    })
+    .await;
+    // The serial of A's acquired device confirms
+    typ(&mut app, "imga");
+    app.handle_key(key(KeyCode::Enter));
+    pump(&mut app, "conversion result", |app| {
+        app.screen == Screen::Result
+    })
+    .await;
+    let req = fake.s().conversions[0].clone();
+    assert_eq!(req.source, a);
+    assert_eq!(
+        req.source_report.as_deref(),
+        Some(dir.path().join("imgA.info.json").as_path())
+    );
+    let case = req.case.unwrap();
+    assert_eq!(case.case_number, "MANUAL-1");
+    assert_eq!(case.evidence_number, "EV-A");
+    assert_eq!(case.seal_number, "", "not given: taken from the report");
+}
+
+#[tokio::test]
+async fn converting_a_rescue_fills_only_the_fields_the_form_shows() {
+    let fake = Fake::new(vec![evidence()]);
+    let mut app = app_with(&fake);
+    to_case_setup(&mut app, "/mnt/case");
+    app.form.engine = EngineKind::Rescue;
+    app.case.seal_number = "SEAL-1".into();
+    to_confirm(&mut app).await;
+    typ(&mut app, "kd7y");
+    app.handle_key(key(KeyCode::Enter));
+    pump(&mut app, "result", |a| a.screen == Screen::Result).await;
+    app.handle_key(key(KeyCode::Char('c')));
+    assert_eq!(app.screen, Screen::Converter);
+    assert_eq!(app.conv.case.case_number, "2026-0042");
+    assert_eq!(app.conv.case.evidence_number, "HDD01");
+    assert_eq!(app.conv.case.examiner, "J. Doe");
+    // No input on the form: not "given"; the converter reads the report
+    assert_eq!(app.conv.case.seal_number, "");
+    let p = app.conv.prefilled.as_ref().expect("recorded as pre-filled");
+    assert!(p.report.to_string_lossy().ends_with(".info.json"), "{p:?}");
+    assert_eq!(p.fields.len(), 3);
+}
+
 #[test]
 fn offline_app_never_touches_the_host() {
     let mut app = App::with_devices(vec![evidence()]);
