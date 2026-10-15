@@ -39,7 +39,7 @@
 use crate::discovery::writeprotect;
 use crate::engines::audit;
 use crate::engines::error::{AcquisitionError, ErrorKind};
-use crate::engines::ewf;
+use crate::engines::ewf::{self, RunBlock};
 use crate::engines::preflight::{self, DestinationFacts, DestinationRules};
 use crate::engines::process::{self, ProcessEvent, ProcessOutcome, ProcessSpec, StreamTag};
 use crate::engines::progress::ProgressSink;
@@ -83,6 +83,9 @@ const HASH_BUFFER: usize = 4 << 20;
 const MAX_KEPT_LINES: usize = 20_000;
 /// libewf's smallest segment size.
 const MIN_SEGMENT_BYTES: u64 = 1 << 20;
+/// ewfexport's list of the sectors it could not read (libewf 20140816 and
+/// 20231119), followed by "total number:" and "at sector(s):" lines.
+const EXPORT_ERRORS_TITLE: &str = "Read errors during export";
 /// Values libewf's tools write into an E01 header when none was given; they
 /// are placeholders, never case values.
 const LIBEWF_PLACEHOLDERS: &[&str] = &[
@@ -722,6 +725,9 @@ pub struct EwfInfo {
     pub read_error_total: Option<u64>,
     /// "at sector(s):" lines that could not be parsed
     pub unparsed_errors: Vec<String>,
+    /// "Is corrupted: yes" (EWF information): segments are missing, or the
+    /// image was never finalized (an aborted acquisition)
+    pub corrupted: bool,
 }
 
 impl EwfInfo {
@@ -812,6 +818,7 @@ pub fn parse_ewfinfo(text: &str) -> EwfInfo {
             _ => {}
         }
     }
+    info.corrupted = ewf::parse_ewfinfo_media(text).corrupted;
     info
 }
 
@@ -1920,6 +1927,18 @@ fn finished_details(report: &ConversionReport) -> Map<String, Value> {
             "unread_sectors": t.unread_sectors(),
         }),
     );
+    if !report.conversion_errors.is_empty() {
+        let c = &report.conversion_errors;
+        put(
+            "conversion_errors",
+            json!({
+                "source": c.source,
+                "ranges": c.ranges.len(),
+                "substituted_bytes": c.substituted_bytes(),
+                "substituted_sectors": c.substituted_sectors(),
+            }),
+        );
+    }
     put("source_hashes", json!(report.source_hashes));
     put("output_hashes", json!(report.output_hashes));
     put("verification", json!(report.verification));
@@ -1958,6 +1977,9 @@ struct ToolRun {
     last_done: Option<u64>,
     /// "<tool>: SUCCESS" printed
     success_line: bool,
+    /// "Read errors during export:" (ewfexport): sectors it could not read
+    /// from the EWF image and wrote as zeros
+    export_errors: Option<RunBlock>,
 }
 
 impl ToolRun {
@@ -2016,6 +2038,7 @@ async fn run_tool(
     let mut calculated = HashResults::default();
     let mut last_done = None;
     let mut success_line = false;
+    let mut export_errors = ExportErrors::default();
     let started = Instant::now();
     let outcome = process::run(spec, &stop.stop_control(), Some(recorder), |ev| {
         let ProcessEvent::Line { stream, text, .. } = ev else {
@@ -2028,6 +2051,7 @@ async fn run_tool(
         if line == success_marker {
             success_line = true;
         }
+        export_errors.feed(line);
         if let Some((DigestOrigin::Calculated, alg, v)) = parse_digest_line(line) {
             set_digest(&mut calculated, alg, v);
         }
@@ -2081,7 +2105,31 @@ async fn run_tool(
         calculated,
         last_done,
         success_line,
+        export_errors: export_errors.block,
     })
+}
+
+/// Collects ewfexport's "Read errors during export:" block from its output
+/// lines (indentation already removed).
+#[derive(Debug, Default)]
+struct ExportErrors {
+    block: Option<RunBlock>,
+    inside: bool,
+}
+
+impl ExportErrors {
+    fn feed(&mut self, line: &str) {
+        if self.inside {
+            self.inside = self
+                .block
+                .get_or_insert_with(RunBlock::default)
+                .feed_trimmed(line);
+        }
+        if line.trim().trim_end_matches(':') == EXPORT_ERRORS_TITLE {
+            self.inside = true;
+            self.block.get_or_insert_with(RunBlock::default);
+        }
+    }
 }
 
 /// The ewfacquire command of a RAW to E01 conversion.
@@ -2163,6 +2211,9 @@ struct Measured {
     verification: Option<VerificationResult>,
     verification_method: String,
     notes: Vec<String>,
+    /// Sectors the tool could not read from the source image (zeros in the
+    /// output)
+    conversion_errors: ReadErrorTable,
 }
 
 /// Hash `paths` on a blocking thread, with the bytes done in `counter`.
@@ -2333,6 +2384,10 @@ async fn raw_to_e01(
             m.bytes_converted = info.media_size.unwrap_or(0);
             if info.media_size.is_none() {
                 failure = Some("ewfinfo did not report the media size of the E01".to_string());
+            } else if info.corrupted {
+                failure = Some(
+                    "ewfinfo reports the written E01 as corrupted (\"Is corrupted: yes\")".into(),
+                );
             }
         }
         Err(e) if e.kind == ErrorKind::Aborted => {
@@ -2447,6 +2502,66 @@ fn flush(m: &Measured, plan: &Plan, sink: &ProgressSink) {
     }
 }
 
+/// Why an E01 to RAW output is not the whole source image, and the sectors
+/// ewfexport wrote as zeros because it could not read them (C-1): ewfinfo's
+/// "Is corrupted: yes" (segments missing, or never finalized) and
+/// ewfexport's "Read errors during export".
+fn export_problems(plan: &Plan, tool: &ToolRun, out_len: u64) -> (Vec<String>, ReadErrorTable) {
+    let src = source_name(&plan.source);
+    let mut problems = Vec::new();
+    if plan.ewf_source.as_ref().is_some_and(|i| i.corrupted) {
+        problems.push(format!(
+            "ewfinfo reports {src} as corrupted (\"Is corrupted: yes\"): segments of it are missing or it was never finalized (an interrupted acquisition), so it does not hold the whole source image"
+        ));
+    }
+    let mut table = ReadErrorTable::new(
+        plan.settings.bytes_per_sector,
+        format!("ewfexport (read errors during export of {src})"),
+    );
+    if let Some(block) = &tool.export_errors {
+        for r in &block.runs {
+            table.push_sectors(r.first, r.count, RangeKind::Substituted);
+        }
+        table.normalise();
+        let what = table
+            .summary(RangeKind::Substituted)
+            .unwrap_or_else(|| "sectors".into());
+        let mut p = format!(
+            "ewfexport could not read {what} of {src} and wrote zeros there instead (listed under the read errors of this conversion)"
+        );
+        if block.incomplete() {
+            p.push_str(&format!(
+                "; it reported {} whose positions could not all be determined{}",
+                block
+                    .total
+                    .map(|n| crate::models::text::plural(n, "read error", "read errors"))
+                    .unwrap_or_else(|| "read errors".into()),
+                if block.unparsed.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (not understood: {})", block.unparsed.join(" | "))
+                }
+            ));
+        }
+        if out_len < table.ranges.last().map(|r| r.end()).unwrap_or(0) {
+            p.push_str(&format!(
+                "; the output file ends at byte {out_len}, before the last of them"
+            ));
+        }
+        problems.push(p);
+    }
+    (problems, table)
+}
+
+/// Bytes of `table` that lie inside an output of `len` bytes.
+fn zeros_within(table: &ReadErrorTable, len: u64) -> u64 {
+    table
+        .ranges
+        .iter()
+        .map(|r| r.end().min(len).saturating_sub(r.offset.min(len)))
+        .sum()
+}
+
 /// E01 to RAW: ewfexport, then dfdisk hashes the written RAW file and
 /// compares with the digests stored in the E01 (and the report's).
 async fn e01_to_raw(
@@ -2498,10 +2613,18 @@ async fn e01_to_raw(
             AcquisitionError::failed(tool.failure("ewfexport"))
         });
     }
-    m.bytes_converted = fs::metadata(&raw).map(|md| md.len()).unwrap_or(0);
+    let out_len = fs::metadata(&raw).map(|md| md.len()).unwrap_or(0);
+    m.bytes_converted = out_len;
+    // C-1: what the E01 lacks. libewf 20140816 exports a corrupted E01
+    // (missing segments, never finalized) with zeros where it cannot read
+    // and ends with SUCCESS; the output then is not the whole source image
+    let (problems, errors) = export_problems(plan, &tool, out_len);
+    m.bytes_converted = out_len.saturating_sub(zeros_within(&errors, out_len));
+    m.conversion_errors = errors;
     if !tool.completed() || m.output_files.is_empty() {
+        let mut reasons = problems;
         if !m.aborted {
-            m.stop_reason = Some(if m.output_files.is_empty() {
+            reasons.push(if m.output_files.is_empty() {
                 format!(
                     "ewfexport wrote no RAW file {}: {}",
                     raw.display(),
@@ -2511,11 +2634,15 @@ async fn e01_to_raw(
                 tool.failure("ewfexport")
             });
         }
+        m.stop_reason = (!reasons.is_empty()).then(|| reasons.join("; "));
         m.verification = Some(VerificationResult::NotPossible {
             reason: "the conversion did not complete".into(),
         });
         flush(&m, plan, sink);
         return Ok(m);
+    }
+    if !problems.is_empty() {
+        m.stop_reason = Some(problems.join("; "));
     }
     flush(&m, plan, sink);
 
@@ -2524,14 +2651,7 @@ async fn e01_to_raw(
         "Hashing the written RAW file (after fsync and page-cache eviction)",
     );
     let mut failure = None;
-    let output = match hash_with_gauge(
-        vec![raw.clone()],
-        plan.selection,
-        stop,
-        sink,
-        m.bytes_converted,
-    )
-    .await
+    let output = match hash_with_gauge(vec![raw.clone()], plan.selection, stop, sink, out_len).await
     {
         Ok(h) => h,
         Err(HashError::Aborted) => {
@@ -2570,6 +2690,11 @@ async fn e01_to_raw(
                 .map(|(l, _)| *l)
                 .collect::<Vec<_>>()
                 .join(", ")
+        ));
+    } else if plan.ewf_source.as_ref().is_some_and(|i| i.corrupted) {
+        m.notes.push(format!(
+            "no digest stored in {} could be read: an E01 stores its digests in its last segment, which is missing or was never written (ewfinfo: corrupted)",
+            source_name(&plan.source)
         ));
     } else {
         m.notes.push(format!(
@@ -2762,6 +2887,7 @@ async fn build_report(
     report.bytes_converted = m.bytes_converted;
     report.aborted = m.aborted;
     report.read_errors = plan.inherited_errors.clone();
+    report.conversion_errors = m.conversion_errors;
     report.stop_reason = match (m.stop_reason, plan.inherited_stop.clone()) {
         (Some(a), Some(b)) => Some(format!("{a}; {b}")),
         (a, b) => a.or(b),
@@ -2870,6 +2996,61 @@ mod tests {
 
     /// ewfacquire 20140816 status block (sentences end with a period).
     const EWFACQUIRE_LEGACY_STATUS: &str = "Status: at 30%.\n        acquired 61 MiB (64749568 bytes) of total 200 MiB (209715200 bytes).\n        completion in 9 second(s) with 15 MiB/s (16131938 bytes/second).\n";
+
+    /// ewfinfo of an E01 whose last segment is missing (libewf 20231119;
+    /// 20140816 prints the same lines without the colons after the titles).
+    const EWFINFO_CORRUPTED: &str = "ewfinfo 20231119\n\nAcquiry information:\n\tCase number:\t\tc\n\nEWF information:\n\tFile format:\t\tEnCase 6\n\tSectors per chunk:\t64\n\tError granularity:\t64\n\tCompression method:\tdeflate\n\tCompression level:\tno compression\n\tIs corrupted:\t\tyes\n\nMedia information:\n\tMedia type:\t\tfixed disk\n\tIs physical:\t\tyes\n\tBytes per sector:\t512\n\tNumber of sectors:\t6144\n\tMedia size:\t\t3.0 MiB (3145728 bytes)\n\n";
+
+    /// ewfexport 20140816 on that E01: zeros for what it cannot read, then
+    /// SUCCESS (standard error, then standard output), captured.
+    const EWFEXPORT_LEGACY_ERRORS: &str = "ewfexport 20140816\n\n\nExport started at: Oct 15, 2026 08:07:33\nThis could take a while.\n\nExport completed at: Oct 15, 2026 08:07:33\n\nWritten: 3.0 MiB (3145728 bytes) in 0 second(s).\nMD5 hash calculated over data:\t\t6e17beab9ec6f8bbe2610f26664b87ad\nRead errors during export:\n\ttotal number: 1\n\tat sector(s): 5952 - 6143 (number: 192) in segment file(s):\n\newfexport: SUCCESS\n";
+
+    #[test]
+    fn a_corrupted_e01_and_ewfexports_read_errors_are_recognised() {
+        let info = parse_ewfinfo(EWFINFO_CORRUPTED);
+        assert!(info.corrupted);
+        assert_eq!(info.media_size, Some(3_145_728));
+        assert!(info.stored.is_empty());
+        let legacy = EWFINFO_CORRUPTED
+            .replace("information:", "information")
+            .replace("ewfinfo 20231119", "ewfinfo 20140816");
+        assert!(parse_ewfinfo(&legacy).corrupted);
+        assert!(!parse_ewfinfo(EWFINFO_WITH_ERRORS).corrupted);
+
+        let mut e = ExportErrors::default();
+        for line in EWFEXPORT_LEGACY_ERRORS.lines() {
+            let t = line.trim();
+            if !t.is_empty() {
+                e.feed(t);
+            }
+        }
+        let block = e.block.unwrap();
+        assert_eq!(block.total, Some(1));
+        assert_eq!(block.runs.len(), 1);
+        assert_eq!((block.runs[0].first, block.runs[0].count), (5952, 192));
+        assert!(!block.incomplete());
+        // A count without positions fails closed
+        let mut e = ExportErrors::default();
+        for t in [
+            "Read errors during export:",
+            "total number: 2",
+            "at sector(s): somewhere",
+            "ewfexport: SUCCESS",
+        ] {
+            e.feed(t);
+        }
+        assert!(e.block.unwrap().incomplete());
+        // No block: nothing
+        let mut e = ExportErrors::default();
+        e.feed("ewfexport: SUCCESS");
+        assert!(e.block.is_none());
+
+        let mut t = ReadErrorTable::new(512, "x");
+        t.push_sectors(5952, 192, RangeKind::Substituted);
+        assert_eq!(zeros_within(&t, 3 << 20), 192 * 512);
+        assert_eq!(zeros_within(&t, 5952 * 512 + 512), 512);
+        assert_eq!(zeros_within(&t, 1000), 0);
+    }
 
     #[test]
     fn both_libewf_lines_parse_the_same() {

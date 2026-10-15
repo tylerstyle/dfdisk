@@ -307,6 +307,11 @@ pub struct ConversionReport {
     /// medium, inherited from its acquisition (the source report, and for an
     /// E01 source the error list stored in the E01)
     pub read_errors: ReadErrorTable,
+    /// Sectors of the source image the conversion tool could not read and
+    /// wrote as zeros into the output (ewfexport's "Read errors during
+    /// export"); empty when it read every sector
+    #[serde(default)]
+    pub conversion_errors: ReadErrorTable,
     pub comparisons: Vec<DigestComparison>,
     /// How the output was verified, one line
     pub verification_method: String,
@@ -399,6 +404,7 @@ impl ConversionReport {
             stop_reason: None,
             aborted: false,
             read_errors: ReadErrorTable::default(),
+            conversion_errors: ReadErrorTable::default(),
             comparisons: Vec::new(),
             verification_method: String::new(),
             auxiliary_files: Vec::new(),
@@ -447,10 +453,7 @@ impl ConversionReport {
     pub fn key_numbers(&self) -> Vec<String> {
         let mut out = Vec::new();
         let pct = if self.expected_bytes > 0 {
-            format!(
-                "{:.1}%, ",
-                self.bytes_converted as f64 * 100.0 / self.expected_bytes as f64
-            )
+            format!("{}%, ", percent(self.bytes_converted, self.expected_bytes))
         } else {
             String::new()
         };
@@ -469,6 +472,11 @@ impl ConversionReport {
         if let Some(s) = self.read_errors.summary(RangeKind::Unread) {
             out.push(format!(
                 "{s} of the source medium were never read by its acquisition and are not in the image."
+            ));
+        }
+        if let Some(s) = self.conversion_errors.summary(RangeKind::Substituted) {
+            out.push(format!(
+                "{s} of the source image could not be read by the conversion and are zeros in the output, not data of the image."
             ));
         }
         if let Some(stop) = &self.stop_reason {
@@ -539,6 +547,7 @@ impl ConversionReport {
 
         self.render_time(&mut out);
         self.render_read_errors(&mut out);
+        self.render_conversion_errors(&mut out);
         self.render_verification(&mut out);
         self.render_files(&mut out);
         self.render_provenance(&mut out);
@@ -722,30 +731,56 @@ impl ConversionReport {
                     row(out, kind.label(), s);
                 }
             }
+            self.render_ranges(out, t);
+        }
+        if !t.source.is_empty() {
+            row(out, "Error List Source", &t.source);
+        }
+        out.push('\n');
+    }
+
+    /// The table of `t`'s ranges (the first [`TEXT_RANGE_LIMIT`]).
+    fn render_ranges(&self, out: &mut String, t: &ReadErrorTable) {
+        out.push_str(&format!(
+            "  {:>5}  {:>20}  {:>16}  {:>12}  {}\n",
+            "#", "offset (bytes)", "length (bytes)", "sectors", "status"
+        ));
+        let sector = t.effective_sector_size();
+        for (i, r) in t.ranges.iter().take(TEXT_RANGE_LIMIT).enumerate() {
             out.push_str(&format!(
                 "  {:>5}  {:>20}  {:>16}  {:>12}  {}\n",
-                "#", "offset (bytes)", "length (bytes)", "sectors", "status"
+                i + 1,
+                r.offset,
+                r.length,
+                r.sectors(sector),
+                r.kind.label()
             ));
-            let sector = t.effective_sector_size();
-            for (i, r) in t.ranges.iter().take(TEXT_RANGE_LIMIT).enumerate() {
-                out.push_str(&format!(
-                    "  {:>5}  {:>20}  {:>16}  {:>12}  {}\n",
-                    i + 1,
-                    r.offset,
-                    r.length,
-                    r.sectors(sector),
-                    r.kind.label()
-                ));
-            }
-            if t.ranges.len() > TEXT_RANGE_LIMIT {
-                out.push_str(&format!(
-                    "  ... {} more ranges not listed here; see {}{} for the complete list\n",
-                    t.ranges.len() - TEXT_RANGE_LIMIT,
-                    self.base_name,
-                    CONVERSION_INFO_JSON_SUFFIX
-                ));
-            }
         }
+        if t.ranges.len() > TEXT_RANGE_LIMIT {
+            out.push_str(&format!(
+                "  ... {} more ranges not listed here; see {}{} for the complete list\n",
+                t.ranges.len() - TEXT_RANGE_LIMIT,
+                self.base_name,
+                CONVERSION_INFO_JSON_SUFFIX
+            ));
+        }
+    }
+
+    /// Sectors the conversion itself could not read (only when there are).
+    fn render_conversion_errors(&self, out: &mut String) {
+        let t = &self.conversion_errors;
+        if t.is_empty() {
+            return;
+        }
+        out.push_str("[READ ERRORS OF THIS CONVERSION]\n");
+        if let Some(s) = t.summary(RangeKind::Substituted) {
+            row(
+                out,
+                "Zeros in the Output",
+                format!("{s}: the source image could not be read there"),
+            );
+        }
+        self.render_ranges(out, t);
         if !t.source.is_empty() {
             row(out, "Error List Source", &t.source);
         }
@@ -922,6 +957,16 @@ impl ConversionReport {
         self.report_json_sha256 = Some(files.json_sha256.clone());
         Ok(files)
     }
+}
+
+/// `done` of `total` as a percentage with one decimal, rounded down: "100.0"
+/// only when everything is done.
+fn percent(done: u64, total: u64) -> String {
+    if total == 0 || done >= total {
+        return "100.0".into();
+    }
+    let tenths = (u128::from(done) * 1000 / u128::from(total)) as u64;
+    format!("{}.{}", tenths / 10, tenths % 10)
 }
 
 /// A comparison's result without repeating what was compared: "matched

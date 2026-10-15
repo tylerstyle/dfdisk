@@ -830,6 +830,128 @@ async fn abort_stops_ewfacquire_and_reports_aborted() {
     }
 }
 
+/// libewf 20140816 (the Debian/Ubuntu ewf-tools line) is the one on PATH.
+fn legacy_libewf() -> bool {
+    std::process::Command::new("ewfexport")
+        .arg("-V")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("20140816"))
+}
+
+/// What every conversion of a corrupted E01 must state (C-1), on both
+/// libewf lines: 20231119's ewfexport fails, 20140816's writes zeros for
+/// what it cannot read and ends with SUCCESS.
+fn assert_corrupted_e01_conversion(r: &ConversionReport, out_raw: &Path) {
+    let text = r.render_text();
+    assert_eq!(r.outcome, Outcome::Incomplete, "{text}");
+    assert_eq!(r.exit_code, exit_code::INCOMPLETE);
+    let stop = r.stop_reason.clone().unwrap_or_default();
+    assert!(stop.contains("\"Is corrupted: yes\""), "{stop}");
+    assert!(
+        !text.contains("The whole source image was converted"),
+        "{text}"
+    );
+    assert!(r.bytes_converted < r.expected_bytes, "{text}");
+    assert!(!text.contains("100.0%"), "{text}");
+    assert!(
+        !text.contains("stores no digest of its media data"),
+        "{text}"
+    );
+    if legacy_libewf() {
+        // Zeros for the unreadable part, listed with their positions
+        assert!(r.conversion_errors.substituted_bytes() > 0, "{text}");
+        assert!(stop.contains("ewfexport could not read"), "{stop}");
+        assert!(text.contains("[READ ERRORS OF THIS CONVERSION]"), "{text}");
+        assert_eq!(
+            r.bytes_converted + r.conversion_errors.substituted_bytes(),
+            r.expected_bytes,
+            "{text}"
+        );
+        let out = std::fs::read(out_raw).unwrap();
+        for range in &r.conversion_errors.ranges {
+            let (a, b) = (range.offset as usize, range.end() as usize);
+            assert!(out[a..b.min(out.len())].iter().all(|x| *x == 0));
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_e01_missing_its_last_segment_is_never_converted_whole() {
+    if !have_libewf() {
+        return;
+    }
+    let f = fixture();
+    let content = data(3 << 20, 21);
+    let raw = f.src.join("x.raw");
+    std::fs::write(&raw, &content).unwrap();
+    let mut req = request(&raw, ConversionTarget::E01, &f.root.join("e01"));
+    req.case = Some(case());
+    req.split_size = SplitSize::Custom(1 << 20);
+    req.compression = CompressionLevel::None;
+    let made = run(&f.env, req, StopFlags::new()).await.unwrap();
+    let segments = made.output_files.len();
+    assert!(segments >= 4, "{:?}", made.output_files);
+    // The family without its last segment, and without its reports
+    let copy = f.root.join("copy");
+    std::fs::create_dir_all(&copy).unwrap();
+    for seg in &made.output_files[..segments - 1] {
+        std::fs::copy(seg, copy.join(seg.file_name().unwrap())).unwrap();
+    }
+    let mut req = request(&copy.join("x.E01"), ConversionTarget::Raw, &f.out);
+    req.case = Some(case());
+    let r = run(&f.env, req, StopFlags::new()).await.unwrap();
+    assert_eq!(r.source_files.len(), segments - 1);
+    assert_corrupted_e01_conversion(&r, &f.out.join("x.raw"));
+    if legacy_libewf() {
+        // Not "stores no digest": the digests are in the missing segment
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("which is missing or was never written")),
+            "{:?}",
+            r.notes
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_aborted_e01_is_never_converted_whole() {
+    if !have_libewf() {
+        return;
+    }
+    let f = fixture();
+    // Incompressible data with best compression: long enough to abort
+    let raw = f.src.join("x.raw");
+    std::fs::write(&raw, data(96 << 20, 22)).unwrap();
+    let mut req = request(&raw, ConversionTarget::E01, &f.root.join("e01"));
+    req.case = Some(case());
+    req.compression = CompressionLevel::Best;
+    let stop = StopFlags::new();
+    let flag = stop.clone();
+    // Abort once ewfacquire has written a few MiB
+    let first = f.root.join("e01").join("x.E01");
+    tokio::spawn(async move {
+        for _ in 0..600 {
+            if std::fs::metadata(&first).is_ok_and(|m| m.len() > 4 << 20) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        flag.abort.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let made = run(&f.env, req, stop).await.unwrap();
+    assert_eq!(made.outcome, Outcome::Aborted, "{}", made.render_text());
+    // The unfinalized E01 alone, away from its report
+    let alone = f.root.join("alone");
+    std::fs::create_dir_all(&alone).unwrap();
+    std::fs::copy(&made.output_files[0], alone.join("x.E01")).unwrap();
+    assert!(ewfinfo(&alone.join("x.E01")).contains("Is corrupted:\t\tyes"));
+    let mut req = request(&alone.join("x.E01"), ConversionTarget::Raw, &f.out);
+    req.case = Some(case());
+    let r = run(&f.env, req, StopFlags::new()).await.unwrap();
+    assert_corrupted_e01_conversion(&r, &f.out.join("x.raw"));
+}
+
 #[tokio::test]
 async fn abort_escalates_when_the_tool_ignores_sigint() {
     use std::os::unix::fs::PermissionsExt;

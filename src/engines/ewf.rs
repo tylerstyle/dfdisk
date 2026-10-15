@@ -245,6 +245,26 @@ impl RunBlock {
         true
     }
 
+    /// Feed one line of the block with its indentation already removed (as
+    /// the converter keeps tool output): `false` when the line is neither
+    /// the total nor a run, i.e. the block has ended.
+    pub fn feed_trimmed(&mut self, line: &str) -> bool {
+        let t = line.trim();
+        if let Some(n) = number_after(t, "total number:") {
+            self.total = Some(n);
+        } else if let Some(run) = parse_sector_run(t) {
+            self.runs.push(run);
+        } else if t.starts_with("at sector(s):") {
+            // A run in a form this parser does not know: fails closed
+            if self.unparsed.len() < MAX_UNPARSED {
+                self.unparsed.push(t.to_string());
+            }
+        } else {
+            return false;
+        }
+        true
+    }
+
     /// Positions are missing: a count was reported but fewer runs parsed,
     /// or lines of the block could not be parsed.
     pub fn incomplete(&self) -> bool {
