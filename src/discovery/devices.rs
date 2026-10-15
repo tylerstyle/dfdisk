@@ -687,6 +687,9 @@ impl ScannedNode {
             maj_min: d.maj_min.clone(),
             kind: Some(self.lsblk_type.clone()),
             start_sector: d.start_sector,
+            tree_mounts: d.mountpoints.clone(),
+            holders: d.holders.clone(),
+            parent_disks: self.identity.parent_disks.clone(),
         }
     }
 }

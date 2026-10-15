@@ -52,6 +52,18 @@ pub struct Partition {
     /// First sector on the parent disk, 512-byte units
     #[serde(default)]
     pub start_sector: Option<u64>,
+    /// Mount points of this node and of everything stacked on it (a mapping
+    /// mounted on a LUKS partition counts for the partition); `mountpoint` is
+    /// the node's own
+    #[serde(default)]
+    pub tree_mounts: Vec<String>,
+    /// Devices stacked on this node (dm, md, LVM, loop), by kernel name
+    #[serde(default)]
+    pub holders: Vec<String>,
+    /// Disks the node is stored on (a partition: its disk; md/LVM across
+    /// disks: every one); empty when unknown
+    #[serde(default)]
+    pub parent_disks: Vec<String>,
 }
 
 /// Overall SMART verdict. `Unknown` whenever SMART could not be read; never
