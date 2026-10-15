@@ -2434,8 +2434,17 @@ mod tests {
         );
         let ctx = context(tmp.path(), 4 * MIB, false);
         let abort = ctx.abort.clone();
+        // Abort once the fake has written its map (a fixed delay raced with
+        // a slow start of the script under load)
+        let map = ctx.output_path(".map");
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            for _ in 0..200 {
+                if std::fs::metadata(&map).is_ok_and(|m| m.len() > 0) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
             abort.store(true, Ordering::SeqCst);
         });
         let t0 = Instant::now();
