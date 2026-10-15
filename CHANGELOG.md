@@ -72,7 +72,8 @@ and when something was not done the report says so.
   internal error (a panic) is shown as FAILED (INTERNAL ERROR), exit code 4.
   After an internal error of the UI itself, a job still running is aborted
   and writes its report and audit record, and an unmount still running ends,
-  before dfdisk exits.
+  before dfdisk exits (within 6 minutes; otherwise dfdisk says so and exits
+  without them).
 - **TUI keys.** Esc never aborts; aborting needs a y/N confirmation; Tab and
   Shift-Tab always move between fields and path completion has its own key.
 - **Packaging.** The .deb depends on `$auto, ewf-tools, gddrescue, smartmontools,
