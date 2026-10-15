@@ -466,7 +466,8 @@ pub fn resume_may_exist(base_name: &str, file_name: &str) -> bool {
         return true;
     }
     if let Some(n) = suffix.strip_prefix(".info.session-") {
-        return numbered(n);
+        // the kept report and its JSON twin (engines::rescue)
+        return numbered(n) || n.strip_suffix(".json").is_some_and(numbered);
     }
     for kind in [".smart-before-", ".smart-after-"] {
         if let Some(n) = suffix

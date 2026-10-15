@@ -36,6 +36,7 @@ pub const OUTPUT_SUFFIXES: &[&str] = &[
     ".info.json.tmp",
     ".info.reserve",
     ".info.session-999",
+    ".info.session-999.json",
     ".pieces.tsv",
     ".pieces.tsv.tmp",
     ".identity.json",
