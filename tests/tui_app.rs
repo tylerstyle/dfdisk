@@ -165,6 +165,8 @@ enum Acquire {
     Refused,
     /// Runs until the abort flag is set, then reports Aborted
     UntilAborted,
+    /// A bug in the session: the job panics
+    Panic,
 }
 
 struct Script {
@@ -180,6 +182,8 @@ struct Script {
     unmount_delay: Duration,
     /// Unmounts that ran to the end (their audit record written)
     unmounts_finished: Vec<String>,
+    /// A bug in the unmount: it panics
+    unmount_panics: bool,
     conversions: Vec<ConversionRequest>,
     audit_log: Option<PathBuf>,
 }
@@ -204,6 +208,7 @@ impl Fake {
             unmounts: Vec::new(),
             unmount_delay: Duration::ZERO,
             unmounts_finished: Vec::new(),
+            unmount_panics: false,
             conversions: Vec::new(),
             audit_log: None,
         })))
@@ -228,12 +233,15 @@ impl TuiBackend for Fake {
     }
 
     fn unmount(&self, device: &BlockDevice) -> Result<UnmountResult, AcquisitionError> {
-        let delay = {
+        let (delay, panics) = {
             let mut s = self.s();
             s.unmounts.push(device.path.clone());
-            s.unmount_delay
+            (s.unmount_delay, s.unmount_panics)
         };
         std::thread::sleep(delay);
+        if panics {
+            panic!("simulated bug in the unmount");
+        }
         self.s().unmounts_finished.push(device.path.clone());
         Ok(UnmountResult {
             unmounted: device.mountpoints.clone(),
@@ -271,6 +279,7 @@ impl TuiBackend for Fake {
                 Acquire::Verified => Ok(report_for(&request, false, false)),
                 Acquire::Mismatch => Ok(report_for(&request, false, true)),
                 Acquire::Refused => Err(AcquisitionError::refused("in use: mounted elsewhere")),
+                Acquire::Panic => panic!("simulated bug in the session"),
                 Acquire::UntilAborted => {
                     for _ in 0..1000 {
                         if stop.is_aborted() {
@@ -787,6 +796,62 @@ async fn sighup_continues_headless_and_quits_after_the_report() {
     let mut idle = app_with(&Fake::new(vec![evidence()]));
     idle.on_signal(SignalKind::Hangup, SignalAction::Headless);
     assert!(idle.should_quit);
+}
+
+#[tokio::test]
+async fn a_panic_in_a_job_is_a_failed_result_not_a_hang() {
+    for quit in [false, true] {
+        let fake = Fake::new(vec![evidence()]);
+        fake.s().acquire = Acquire::Panic;
+        let mut app = app_with(&fake);
+        to_case_setup(&mut app, "/mnt/case");
+        to_confirm(&mut app).await;
+        typ(&mut app, "kd7y");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Running);
+        if quit {
+            // The examiner asked to quit: dfdisk does, after the result
+            app.handle_key(ctrl('c'));
+            app.handle_key(key(KeyCode::Char('y')));
+            pump(&mut app, "quit", |a| a.should_quit).await;
+        } else {
+            pump(&mut app, "result", |a| a.screen == Screen::Result).await;
+        }
+        assert!(app.job.is_none(), "the job is over");
+        let r = app.result.as_ref().unwrap();
+        assert_eq!(r.label(), "FAILED (INTERNAL ERROR)");
+        assert_eq!(r.exit_code(), 4);
+        let lines = r.lines();
+        assert!(
+            lines[0].contains("simulated bug in the session"),
+            "{lines:?}"
+        );
+        // Nothing is claimed about what was or was not written
+        assert!(!lines.iter().any(|l| l.contains("No image")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("Check the destination")));
+        if quit {
+            assert_eq!(app.exit_code(), 4);
+            assert!(app
+                .exit_summary()
+                .unwrap()
+                .contains("FAILED (INTERNAL ERROR)"));
+        }
+    }
+
+    // A panic in an unmount ends the unmount, with an error; quitting works
+    let fake = Fake::new(vec![mounted(), evidence()]);
+    fake.s().unmount_panics = true;
+    let mut app = app_with(&fake);
+    select(&mut app, "sdy");
+    app.handle_key(key(KeyCode::Char('u')));
+    app.handle_key(key(KeyCode::Char('y')));
+    pump(&mut app, "unmount over", |a| a.unmounting.is_none()).await;
+    assert!(app
+        .notices
+        .iter()
+        .any(|n| n.level == Level::Error && n.text.contains("simulated bug in the unmount")));
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit);
 }
 
 #[tokio::test]

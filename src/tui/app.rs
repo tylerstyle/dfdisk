@@ -39,6 +39,7 @@ use crate::tui::form::{
 };
 use crate::tui::profile::{self, CaseProfile};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use futures::FutureExt;
 use ratatui::widgets::TableState;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -277,6 +278,9 @@ pub enum RunResult {
         kind: JobKind,
         error: AcquisitionError,
     },
+    /// The run stopped on an internal error of dfdisk (a panic): FAILED. What
+    /// it had written by then is unknown to the TUI
+    Panicked { kind: JobKind, message: String },
 }
 
 impl RunResult {
@@ -285,7 +289,7 @@ impl RunResult {
             RunResult::Acquisition { .. } => JobKind::Acquisition,
             RunResult::Conversion { .. } => JobKind::Conversion,
             RunResult::Verification { .. } => JobKind::Verification,
-            RunResult::Error { kind, .. } => *kind,
+            RunResult::Error { kind, .. } | RunResult::Panicked { kind, .. } => *kind,
         }
     }
 
@@ -295,6 +299,7 @@ impl RunResult {
             RunResult::Conversion { report, .. } => report.exit_code(),
             RunResult::Verification { result, .. } => result.exit_code,
             RunResult::Error { error, .. } => error.exit_code(),
+            RunResult::Panicked { .. } => crate::models::outcome::exit_code::FAILED,
         }
     }
 
@@ -317,6 +322,7 @@ impl RunResult {
                 ErrorKind::Failed => "FAILED".into(),
                 ErrorKind::Aborted => "ABORTED".into(),
             },
+            RunResult::Panicked { .. } => "FAILED (INTERNAL ERROR)".into(),
         }
     }
 
@@ -339,6 +345,7 @@ impl RunResult {
                 ErrorKind::Aborted => Tone::Aborted,
                 _ => Tone::Bad,
             },
+            RunResult::Panicked { .. } => Tone::Bad,
         }
     }
 
@@ -367,6 +374,7 @@ impl RunResult {
                 }
                 l
             }
+            RunResult::Panicked { kind, message } => panic_lines(*kind, message),
         };
         if let Some(problem) = self.audit_problem() {
             lines.push(problem);
@@ -431,7 +439,7 @@ impl RunResult {
                     out.push(("Addendum".into(), a.display().to_string()));
                 }
             }
-            RunResult::Error { .. } => {}
+            RunResult::Error { .. } | RunResult::Panicked { .. } => {}
         }
         out.into_iter()
             .map(|(l, p)| (l, sanitize_line(&p)))
@@ -450,8 +458,34 @@ impl RunResult {
                 error.exit_code(),
                 error.message
             ),
+            RunResult::Panicked { kind, message } => format!(
+                "{}\n\n{}\n",
+                self.title(),
+                panic_lines(*kind, message).join("\n")
+            ),
         }
     }
+}
+
+/// What the result screen says about a run that stopped on a panic: what
+/// happened, and what is not known.
+fn panic_lines(kind: JobKind, message: &str) -> Vec<String> {
+    vec![
+        format!(
+            "dfdisk stopped the {} on an internal error: {message}",
+            kind.label()
+        ),
+        "Files written so far are left as they are and may be incomplete; the run may have stopped before writing its report and audit record. Check the destination and the audit log.".into(),
+    ]
+}
+
+/// The text of a panic payload.
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic without a message".into())
 }
 
 /// Results of background work.
@@ -500,6 +534,18 @@ enum BgEvent {
         report: Option<PathBuf>,
     },
     Acquired(Box<Result<ForensicInfoReport, AcquisitionError>>),
+    /// A job's work panicked (dfdisk bug): FAILED, never a hang
+    JobPanicked {
+        kind: JobKind,
+        message: String,
+    },
+    /// Other background work panicked
+    Internal {
+        /// Token of the sheet or completion it belonged to
+        token: Option<u64>,
+        what: &'static str,
+        message: String,
+    },
     Converted(Box<Result<(ConversionReport, String), AcquisitionError>>),
     Verified(Box<Result<ImageVerification, AcquisitionError>>),
     ProfileSaved(Result<(), String>),
@@ -816,15 +862,23 @@ impl App {
     // Background work
     // ------------------------------------------------------------------
 
-    fn spawn<F>(&mut self, fut: F) -> bool
+    /// Run `fut` on the runtime; its event comes back through [`tick`](Self::tick).
+    /// A panic in it becomes the event `on_panic` makes of its message, so
+    /// the UI never waits for a result that cannot come.
+    fn spawn<F, P>(&mut self, fut: F, on_panic: P) -> bool
     where
         F: Future<Output = BgEvent> + Send + 'static,
+        P: FnOnce(String) -> BgEvent + Send + 'static,
     {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 let tx = self.bg_tx.clone();
                 handle.spawn(async move {
-                    let _ = tx.send(fut.await);
+                    let ev = match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+                        Ok(ev) => ev,
+                        Err(payload) => on_panic(panic_message(payload.as_ref())),
+                    };
+                    let _ = tx.send(ev);
                 });
                 true
             }
@@ -838,15 +892,22 @@ impl App {
         }
     }
 
-    fn spawn_blocking<F>(&mut self, f: F) -> bool
+    /// [`spawn`](Self::spawn) for blocking work (a thread of the blocking
+    /// pool).
+    fn spawn_blocking<F, P>(&mut self, f: F, on_panic: P) -> bool
     where
         F: FnOnce() -> BgEvent + Send + 'static,
+        P: FnOnce(String) -> BgEvent + Send + 'static,
     {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 let tx = self.bg_tx.clone();
                 handle.spawn_blocking(move || {
-                    let _ = tx.send(f());
+                    let ev = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                        Ok(ev) => ev,
+                        Err(payload) => on_panic(panic_message(payload.as_ref())),
+                    };
+                    let _ = tx.send(ev);
                 });
                 true
             }
@@ -944,10 +1005,16 @@ impl App {
         let generation = self.scan_generation;
         let backend = self.backend.clone();
         self.scan_manual = manual;
-        if self.spawn_blocking(move || BgEvent::Scan {
-            generation,
-            result: backend.scan(),
-        }) {
+        if self.spawn_blocking(
+            move || BgEvent::Scan {
+                generation,
+                result: backend.scan(),
+            },
+            move |m| BgEvent::Scan {
+                generation,
+                result: Err(format!("internal error: {m}")),
+            },
+        ) {
             self.scanning = true;
         }
     }
@@ -1358,12 +1425,23 @@ impl App {
         let backend = self.backend.clone();
         let path = device.path.clone();
         self.unmounting = Some(path.clone());
-        if !self.spawn_blocking(move || BgEvent::Unmount {
-            result: backend.unmount(&device),
-            key,
-            path,
-            then_setup,
-        }) {
+        let (key2, path2) = (key.clone(), path.clone());
+        if !self.spawn_blocking(
+            move || BgEvent::Unmount {
+                result: backend.unmount(&device),
+                key,
+                path,
+                then_setup,
+            },
+            move |m| BgEvent::Unmount {
+                result: Err(AcquisitionError::failed(format!(
+                    "internal error during the unmount ({m}); check the mounts and the audit log"
+                ))),
+                key: key2,
+                path: path2,
+                then_setup: false,
+            },
+        ) {
             self.unmounting = None;
         }
     }
@@ -1389,13 +1467,21 @@ impl App {
             ),
         );
         let name = disk.name.clone();
-        if self.spawn(async move {
-            BgEvent::Capacity {
-                disk: name,
-                key,
-                result: fut.await,
-            }
-        }) {
+        let (name2, key2) = (name.clone(), key.clone());
+        if self.spawn(
+            async move {
+                BgEvent::Capacity {
+                    disk: name,
+                    key,
+                    result: fut.await,
+                }
+            },
+            move |m| BgEvent::Capacity {
+                disk: name2,
+                key: key2,
+                result: Err(format!("internal error: {m}")),
+            },
+        ) {
             self.capacity_probing = Some(disk.name);
         }
     }
@@ -1598,34 +1684,42 @@ impl App {
         let offer_resume = request.engine() == EngineKind::Rescue && !request.config.resume;
         let dir = request.config.output_dir.clone();
         let backend = self.backend.clone();
-        self.spawn(async move {
-            if offer_resume {
-                let (d, b) = (dir.clone(), base_name.clone());
-                let map = tokio::task::spawn_blocking(move || find_rescue_map(&d, &b))
-                    .await
-                    .ok()
-                    .flatten();
-                if map.is_some() {
-                    return BgEvent::Prepared {
-                        token,
-                        resume_map: map,
-                        check: None,
-                        destination: None,
-                    };
+        let on_panic = move |message| BgEvent::Internal {
+            token: Some(token),
+            what: "the pre-flight checks",
+            message,
+        };
+        self.spawn(
+            async move {
+                if offer_resume {
+                    let (d, b) = (dir.clone(), base_name.clone());
+                    let map = tokio::task::spawn_blocking(move || find_rescue_map(&d, &b))
+                        .await
+                        .ok()
+                        .flatten();
+                    if map.is_some() {
+                        return BgEvent::Prepared {
+                            token,
+                            resume_map: map,
+                            check: None,
+                            destination: None,
+                        };
+                    }
                 }
-            }
-            let b2 = backend.clone();
-            let destination = tokio::task::spawn_blocking(move || b2.destination(&dir))
-                .await
-                .unwrap_or_else(|e| Err(format!("destination probe stopped: {e}")));
-            let check = backend.check(check_request).await;
-            BgEvent::Prepared {
-                token,
-                resume_map: None,
-                check: Some(Box::new(check)),
-                destination: Some(destination),
-            }
-        });
+                let b2 = backend.clone();
+                let destination = tokio::task::spawn_blocking(move || b2.destination(&dir))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("destination probe stopped: {e}")));
+                let check = backend.check(check_request).await;
+                BgEvent::Prepared {
+                    token,
+                    resume_map: None,
+                    check: Some(Box::new(check)),
+                    destination: Some(destination),
+                }
+            },
+            on_panic,
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1812,7 +1906,13 @@ impl App {
         self.confirm = None;
         self.screen = Screen::Running;
         self.save_profile();
-        self.spawn(async move { BgEvent::Acquired(Box::new(fut.await)) });
+        self.spawn(
+            async move { BgEvent::Acquired(Box::new(fut.await)) },
+            |message| BgEvent::JobPanicked {
+                kind: JobKind::Acquisition,
+                message,
+            },
+        );
     }
 
     fn save_profile(&mut self) {
@@ -1825,13 +1925,16 @@ impl App {
             return;
         };
         let profile = self.profile.clone();
-        self.spawn_blocking(move || {
-            BgEvent::ProfileSaved(
-                profile
-                    .save(&path)
-                    .map_err(|e| format!("case profile {} not saved: {e}", path.display())),
-            )
-        });
+        self.spawn_blocking(
+            move || {
+                BgEvent::ProfileSaved(
+                    profile
+                        .save(&path)
+                        .map_err(|e| format!("case profile {} not saved: {e}", path.display())),
+                )
+            },
+            |m| BgEvent::ProfileSaved(Err(format!("case profile not saved: internal error: {m}"))),
+        );
     }
 
     fn key_running(&mut self, key: KeyEvent) {
@@ -2159,11 +2262,18 @@ impl App {
         });
         self.screen = Screen::Confirm;
         let backend = self.backend.clone();
-        self.spawn_blocking(move || BgEvent::ConvPrepared {
-            token,
-            facts: probe_source(&source_path),
-            destination: backend.destination(&dir),
-        });
+        self.spawn_blocking(
+            move || BgEvent::ConvPrepared {
+                token,
+                facts: probe_source(&source_path),
+                destination: backend.destination(&dir),
+            },
+            move |message| BgEvent::Internal {
+                token: Some(token),
+                what: "the look at the source image",
+                message,
+            },
+        );
     }
 
     fn start_conversion_job(&mut self, request: ConversionRequest, facts: Option<SourceFacts>) {
@@ -2205,23 +2315,29 @@ impl App {
         });
         self.confirm = None;
         self.screen = Screen::Running;
-        self.spawn(async move {
-            let result = match fut.await {
-                Ok(report) => {
-                    let text = tokio::fs::read_to_string(&report.report_file)
-                        .await
-                        .unwrap_or_else(|e| {
-                            format!(
-                                "(the report {} could not be read: {e})",
-                                report.report_file.display()
-                            )
-                        });
-                    Ok((report, text))
-                }
-                Err(e) => Err(e),
-            };
-            BgEvent::Converted(Box::new(result))
-        });
+        self.spawn(
+            async move {
+                let result = match fut.await {
+                    Ok(report) => {
+                        let text = tokio::fs::read_to_string(&report.report_file)
+                            .await
+                            .unwrap_or_else(|e| {
+                                format!(
+                                    "(the report {} could not be read: {e})",
+                                    report.report_file.display()
+                                )
+                            });
+                        Ok((report, text))
+                    }
+                    Err(e) => Err(e),
+                };
+                BgEvent::Converted(Box::new(result))
+            },
+            |message| BgEvent::JobPanicked {
+                kind: JobKind::Conversion,
+                message,
+            },
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2337,25 +2453,31 @@ impl App {
             force_requested: false,
         });
         self.screen = Screen::Running;
-        self.spawn(async move {
-            let expected = match report {
-                None => Ok(ExpectedHashes::default()),
-                Some(p) => {
-                    tokio::task::spawn_blocking(move || ExpectedHashes::from_report_json(&p))
-                        .await
-                        .unwrap_or_else(|e| {
-                            Err(AcquisitionError::failed(format!(
-                                "reading the report stopped: {e}"
-                            )))
-                        })
-                }
-            };
-            let result = match expected {
-                Ok(expected) => backend.verify(image, expected, stop, events_tx).await,
-                Err(e) => Err(e),
-            };
-            BgEvent::Verified(Box::new(result))
-        });
+        self.spawn(
+            async move {
+                let expected = match report {
+                    None => Ok(ExpectedHashes::default()),
+                    Some(p) => {
+                        tokio::task::spawn_blocking(move || ExpectedHashes::from_report_json(&p))
+                            .await
+                            .unwrap_or_else(|e| {
+                                Err(AcquisitionError::failed(format!(
+                                    "reading the report stopped: {e}"
+                                )))
+                            })
+                    }
+                };
+                let result = match expected {
+                    Ok(expected) => backend.verify(image, expected, stop, events_tx).await,
+                    Err(e) => Err(e),
+                };
+                BgEvent::Verified(Box::new(result))
+            },
+            |message| BgEvent::JobPanicked {
+                kind: JobKind::Verification,
+                message,
+            },
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2436,11 +2558,18 @@ impl App {
             pending: true,
         });
         let p = prefix.clone();
-        self.spawn_blocking(move || BgEvent::Completion {
-            token,
-            candidates: find_path_completions(&p, dirs_only),
-            prefix,
-        });
+        self.spawn_blocking(
+            move || BgEvent::Completion {
+                token,
+                candidates: find_path_completions(&p, dirs_only),
+                prefix,
+            },
+            move |message| BgEvent::Internal {
+                token: Some(token),
+                what: "path completion",
+                message,
+            },
+        );
     }
 
     fn apply_completion(&mut self, token: u64, prefix: String, candidates: Vec<String>) {
@@ -2630,21 +2759,35 @@ impl App {
             self.conv_due = None;
             let path = self.conv.source.trim().to_string();
             if !path.is_empty() {
-                self.spawn_blocking(move || BgEvent::SourceProbe {
-                    facts: probe_source(&expand_tilde(Path::new(&path))),
-                    path,
-                });
+                self.spawn_blocking(
+                    move || BgEvent::SourceProbe {
+                        facts: probe_source(&expand_tilde(Path::new(&path))),
+                        path,
+                    },
+                    |message| BgEvent::Internal {
+                        token: None,
+                        what: "the look at the source image",
+                        message,
+                    },
+                );
             }
         }
         if self.verify_due.is_some_and(|t| now >= t) {
             self.verify_due = None;
             let image = self.verify.image.trim().to_string();
             if !image.is_empty() && (self.verify.report.is_empty() || self.verify.report_auto) {
-                self.spawn_blocking(move || BgEvent::VerifyReport {
-                    report: report_candidate(&expand_tilde(Path::new(&image)))
-                        .filter(|p| p.is_file()),
-                    image,
-                });
+                self.spawn_blocking(
+                    move || BgEvent::VerifyReport {
+                        report: report_candidate(&expand_tilde(Path::new(&image)))
+                            .filter(|p| p.is_file()),
+                        image,
+                    },
+                    |message| BgEvent::Internal {
+                        token: None,
+                        what: "the search for the image's report",
+                        message,
+                    },
+                );
             }
         }
     }
@@ -2656,10 +2799,17 @@ impl App {
         }
         let dir = self.form.output_dir();
         let backend = self.backend.clone();
-        self.spawn_blocking(move || BgEvent::Destination {
-            result: backend.destination(&dir),
-            dir,
-        });
+        let dir2 = dir.clone();
+        self.spawn_blocking(
+            move || BgEvent::Destination {
+                result: backend.destination(&dir),
+                dir,
+            },
+            move |m| BgEvent::Destination {
+                result: Err(format!("internal error: {m}")),
+                dir: dir2,
+            },
+        );
     }
 
     fn on_bg(&mut self, ev: BgEvent) {
@@ -2950,6 +3100,30 @@ impl App {
                         error,
                     }),
                 }
+            }
+            BgEvent::JobPanicked { kind, message } => {
+                self.job = None;
+                self.show_result(RunResult::Panicked { kind, message });
+                if kind == JobKind::Acquisition && self.auto_refresh {
+                    self.start_scan(false);
+                }
+            }
+            BgEvent::Internal {
+                token,
+                what,
+                message,
+            } => {
+                let text = format!("Internal error in {what}: {message}");
+                if let Some(t) = token {
+                    if let Some(c) = self.confirm.as_mut().filter(|c| c.token == t) {
+                        c.pending = false;
+                        c.error = Some(text.clone());
+                    }
+                    if self.completion.as_ref().is_some_and(|c| c.token == t) {
+                        self.completion = None;
+                    }
+                }
+                self.notify(Level::Error, text);
             }
             BgEvent::ProfileSaved(Err(e)) => self.notify(Level::Warning, e),
             BgEvent::ProfileSaved(Ok(())) => {}
