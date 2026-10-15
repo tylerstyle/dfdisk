@@ -1702,6 +1702,89 @@ async fn the_conversion_sheet_shows_the_case_that_will_be_recorded() {
     );
 }
 
+/// Every labelled row of a confirmation sheet keeps at least one space
+/// between its label and its value; returns the labels seen.
+fn assert_labels_apart(app: &App) -> Vec<String> {
+    let mut labels = Vec::new();
+    for line in dfdisk::tui::ui::sheet_lines(app) {
+        let [label, value, ..] = line.spans.as_slice() else {
+            continue;
+        };
+        if label.content.trim().is_empty() {
+            continue;
+        }
+        assert!(
+            label.content.ends_with(' '),
+            "label {:?} runs into its value {:?}",
+            label.content,
+            value.content
+        );
+        labels.push(label.content.trim().to_string());
+    }
+    labels
+}
+
+/// I-R3-1: labels of 14 characters and more ("Evidence Number", "Authority /
+/// Agency", "Second Source Read", ...) ran into their values on both sheets
+/// ("Evidence NumberHDD01").
+#[tokio::test]
+async fn sheet_labels_never_run_into_their_values() {
+    let case_labels: Vec<&str> = dfdisk::models::case::CaseMetadata::default()
+        .report_rows()
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    // The acquisition sheet
+    let fake = Fake::new(vec![evidence()]);
+    let mut app = app_with(&fake);
+    to_case_setup(&mut app, "/mnt/case");
+    to_confirm(&mut app).await;
+    let labels = assert_labels_apart(&app);
+    for label in case_labels
+        .iter()
+        .chain(&["Second Source Read", "Write Protection"])
+    {
+        assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+    }
+    let sheet = sheet_string(&app);
+    assert!(
+        sheet
+            .lines()
+            .any(|l| l.trim_start().starts_with("Evidence Number ")
+                && l.trim_end().ends_with(" HDD01")),
+        "{sheet}"
+    );
+
+    // The conversion sheet
+    let dir = tempfile::tempdir().unwrap();
+    let a = image_with_report(dir.path(), "imgA", "CASE-A", "EV-A", "SEAL-A");
+    let fake = Fake::new(vec![]);
+    let mut app = app_with(&fake);
+    app.handle_key(key(KeyCode::Char('c')));
+    typ(&mut app, &a.display().to_string());
+    pump(&mut app, "report of A", |app| {
+        app.conv.facts.as_ref().is_some_and(|f| f.path == a)
+    })
+    .await;
+    app.conv.destination = dir.path().join("out").display().to_string();
+    app.handle_key(key(KeyCode::F(5)));
+    pump(&mut app, "sheet", |app| {
+        app.confirm.as_ref().is_some_and(|c| !c.pending)
+    })
+    .await;
+    let labels = assert_labels_apart(&app);
+    for label in &case_labels {
+        assert!(labels.iter().any(|l| l == label), "{label} in {labels:?}");
+    }
+    let sheet = sheet_string(&app);
+    assert!(
+        sheet
+            .lines()
+            .any(|l| l.trim_start().starts_with("Evidence Number ") && l.contains(" EV-A")),
+        "{sheet}"
+    );
+}
+
 #[tokio::test]
 async fn converting_a_rescue_fills_only_the_fields_the_form_shows() {
     let fake = Fake::new(vec![evidence()]);
