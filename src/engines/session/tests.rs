@@ -512,11 +512,11 @@ async fn verified_raw_acquisition_end_to_end_with_the_real_engine() {
     let wp = report.write_protection.as_ref().unwrap();
     assert!(wp.set_by_dfdisk && wp.exclusive_open);
     assert_eq!(report.capacity.as_ref().unwrap().method, "fake");
-    // The RAW engine states what it applied: no pieces, stop on error
+    // The RAW engine states what it applied: a piece size only with pieces
     let EngineSettings::Raw(raw) = &report.effective_config.settings else {
         panic!()
     };
-    assert_eq!(raw.piece_size, None);
+    assert_eq!(raw.piece_size.is_some(), report.piecewise.is_some());
     assert!(report
         .notes
         .iter()
@@ -542,17 +542,19 @@ async fn verified_raw_acquisition_end_to_end_with_the_real_engine() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(
-        names,
-        [
-            "audit-testboot.head".to_string(),
-            "audit-testboot.jsonl".to_string(),
-            format!("{BASE}.info"),
-            format!("{BASE}.info.json"),
-            format!("{BASE}.raw"),
-            format!("{BASE}.smart-before.json"),
-        ]
-    );
+    let mut expected = vec![
+        "audit-testboot.head".to_string(),
+        "audit-testboot.jsonl".to_string(),
+        format!("{BASE}.info"),
+        format!("{BASE}.info.json"),
+        format!("{BASE}.raw"),
+        format!("{BASE}.smart-before.json"),
+    ];
+    if report.piecewise.is_some() {
+        expected.push(format!("{BASE}.pieces.tsv"));
+        expected.sort();
+    }
+    assert_eq!(names, expected);
 
     // Audit trail: started (the report's anchor) and finished (the report's digests)
     let recs = fake.records();
