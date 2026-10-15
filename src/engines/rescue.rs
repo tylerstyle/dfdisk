@@ -9,8 +9,11 @@
 //!   ddrescue run dfdisk writes zeros over the bad-sector areas inside the
 //!   image (and fsyncs it), so the statement holds. The sectors that held
 //!   anything else are first copied to `<base>.zeroed-N.bin` with their
-//!   places in `<base>.zeroed-N.tsv` (N: the rescue session; never
-//!   overwritten), so nothing a session read is destroyed;
+//!   places in `<base>.zeroed-N.tsv` (N: the rescue session, or one past
+//!   the highest such file an earlier session left without its report;
+//!   never overwritten), so nothing a session read is destroyed. When the
+//!   zeros cannot be written, those areas are `Unread`: the image may hold
+//!   other data there;
 //! - `?` non-tried, `*` non-trimmed, `/` non-scraped: `Unread`; the rescue is
 //!   incomplete until it is run again (resumed).
 //!
@@ -85,7 +88,8 @@ pub const IDENTITY_SUFFIX: &str = ".identity.json";
 pub const SESSION_SUFFIX: &str = ".info.session-";
 /// Bytes dfdisk found in bad-sector areas before it wrote zeros over them
 /// (S-N3): `<base>.zeroed-N.bin` (the sector bytes, concatenated) and
-/// `<base>.zeroed-N.tsv` (where each run of them was), N the rescue session.
+/// `<base>.zeroed-N.tsv` (where each run of them was), N the rescue session
+/// (see [`zeroed_number`]).
 pub const ZEROED_SUFFIX: &str = ".zeroed-";
 /// SIGINT → SIGTERM delay on abort: ddrescue saves its map on SIGINT.
 pub const DDRESCUE_GRACE: Duration = Duration::from_secs(30);
@@ -285,7 +289,14 @@ pub async fn acquire_with(
         .last()
         .map(|(n, _, _)| n + 1)
         .unwrap_or(1);
-    let zeroed_files = ZeroSidecar::new(&ctx.output_dir, &ctx.base_name, session);
+    // E-R3-1: never the number of a sidecar that exists already (left by a
+    // session that ended without its report, so its number was not kept)
+    let zeroed_n = preflight::existing_outputs(&ctx.output_dir, &ctx.base_name)
+        .iter()
+        .filter_map(|p| zeroed_number(&ctx.base_name, &p.file_name()?.to_string_lossy()))
+        .max()
+        .map_or(session, |highest| session.max(highest.saturating_add(1)));
+    let zeroed_files = ZeroSidecar::new(&ctx.output_dir, &ctx.base_name, zeroed_n);
     let fin = finalize(&map, &image, expected, sector_size, &zeroed_files);
     notes.extend(fin.notes);
     let mut stop_reason = fin.stop_reason;
@@ -448,6 +459,8 @@ fn finalize(
     // map recorded it would stay. dfdisk writes the zeros itself
     let mut stop_reason = None;
     let mut auxiliary_files = Vec::new();
+    // E-R3-1: the end of the image part whose bad-sector areas may not be zeros
+    let mut not_zeroed: Option<u64> = None;
     let zeroed = match image_len {
         Some(l) => match zero_bad_sectors(image_path, &map, l, sector_size, zeroed_files) {
             Ok(z) => z.map(|z| {
@@ -457,8 +470,9 @@ fn finalize(
                 z.statement(zeroed_files)
             }),
             Err(e) => {
+                not_zeroed = Some(l);
                 stop_reason = Some(format!(
-                    "dfdisk could not write zeros over the bad-sector areas of the map in the image ({}); the image may hold other data there than the zeros this report states",
+                    "dfdisk could not write zeros over the bad-sector areas of the map in the image ({}); the image may hold other data there than zeros, so those areas count as not acquired",
                     e.message
                 ));
                 if e.kept {
@@ -497,9 +511,31 @@ fn finalize(
             "the image file is {len} bytes long, longer than the source ({expected} bytes); its digests cover the whole file"
         ));
     }
-    let a = map.assess(expected, len, sector_size);
+    let mut a = map.assess(expected, len, sector_size);
     notes.push(map_summary(&map, map_path, &a.counts));
     notes.extend(zeroed);
+    if let Some(limit) = not_zeroed {
+        // Not zeros: bad sectors whose content in the image is unknown are
+        // not acquired (beyond `limit`, the extension made them zeros)
+        let unknown: Vec<(u64, u64)> = a
+            .read_errors
+            .ranges
+            .iter()
+            .filter(|r| r.kind == RangeKind::Substituted && r.offset < limit)
+            .map(|r| (r.offset, r.end().min(limit) - r.offset))
+            .collect();
+        let bytes: u64 = unknown.iter().map(|(_, n)| n).sum();
+        for (offset, n) in unknown {
+            a.read_errors.push(offset, n, RangeKind::Unread);
+        }
+        a.bytes_acquired = a.bytes_acquired.saturating_sub(bytes);
+        if bytes > 0 {
+            notes.push(format!(
+                "the bad-sector areas of the map inside the image ({}) count as not acquired, not as zeros: dfdisk could not write zeros over them, so the image may hold other data there",
+                plural(bytes, "byte", "bytes")
+            ));
+        }
+    }
     notes.extend(a.notes.iter().cloned());
     Finalized {
         bad_sectors: map.bad_sectors(sector_size),
@@ -1434,6 +1470,20 @@ fn session_number(base: &str, file_name: &str) -> Option<(u32, bool)> {
         return None;
     }
     digits.parse().ok().map(|n| (n, json))
+}
+
+/// The number N of a zero sidecar file `<base>.zeroed-N.bin` or
+/// `<base>.zeroed-N.tsv` (case-insensitive, as the outputs are matched).
+fn zeroed_number(base: &str, file_name: &str) -> Option<u32> {
+    let lower = file_name.to_lowercase();
+    let rest = lower.strip_prefix(&format!("{}{ZEROED_SUFFIX}", base.to_lowercase()))?;
+    let digits = rest
+        .strip_suffix(".bin")
+        .or_else(|| rest.strip_suffix(".tsv"))?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// A kept session: number, text report, JSON report.
@@ -2403,6 +2453,10 @@ mod tests {
             stop.contains("could not write zeros over the bad-sector areas"),
             "{stop}"
         );
+        // E-R3-1: the bad-sector areas are not called zeros anywhere
+        assert_eq!(fin.read_errors.substituted_bytes(), 0);
+        assert_eq!(fin.read_errors.unread_bytes(), 0x600);
+        assert_eq!(fin.bytes_acquired, MIB - 0x600);
     }
 
     #[test]
@@ -2430,6 +2484,17 @@ mod tests {
             assert!(std::fs::read(&image).unwrap().iter().all(|b| *b == 7));
             assert!(fin.auxiliary_files.is_empty());
             assert!(!fin.notes.iter().any(|n| n.contains("dfdisk wrote zeros")));
+            // E-R3-1: they are not acquired, not zeros
+            assert_eq!(fin.read_errors.substituted_bytes(), 0);
+            assert_eq!(fin.read_errors.unread_bytes(), 0x600);
+            assert_eq!(fin.bytes_acquired, MIB - 0x600);
+            assert!(
+                fin.notes
+                    .iter()
+                    .any(|n| n.contains("count as not acquired, not as zeros")),
+                "{:?}",
+                fin.notes
+            );
             std::fs::remove_file(existing).unwrap();
         };
         refused(&kept.bin, &kept.tsv);
@@ -2993,6 +3058,57 @@ mod tests {
             .any(|n| n.contains("none of their sectors held other data before")));
         // The first session's files stay as they were
         assert_eq!(std::fs::read(&kept.bin).unwrap(), vec![b'R'; 0x600]);
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_an_earlier_session_left_is_never_a_collision() {
+        // E-R3-1: b.zeroed-1.bin exists, but no kept report (its session
+        // ended before its report, e.g. during the image hash), so this
+        // session is number 1 again. Its sidecar takes the next number, the
+        // zeros are written, and the report's "zeros" is true
+        let tmp = tempfile::tempdir().unwrap();
+        let killed = fake_ddrescue(
+            tmp.path(),
+            &format!(
+                "head -c {MIB} /dev/zero | tr '\\0' 'R' > \"$IMG\"\nprintf '%s' '{BAD_MIDDLE}' > \"$MAP\"\nkill -KILL $$\n"
+            ),
+        );
+        let ctx = context(tmp.path(), MIB, false);
+        let earlier = ZeroSidecar::new(&ctx.output_dir, "b", 1);
+        std::fs::write(&earlier.bin, "earlier\n").unwrap();
+        let out = acquire_with(&ctx, killed.as_os_str()).await.unwrap();
+        let stop = out.stop_reason.clone().unwrap_or_default();
+        assert!(stop.contains("ended by signal 9"), "{stop}");
+        assert!(!stop.contains("could not write zeros"), "{stop}");
+        assert_eq!(out.read_errors.substituted_bytes(), 0x600);
+        let image = std::fs::read(ctx.output_path(".raw")).unwrap();
+        assert!(image[0x10000..0x10400].iter().all(|b| *b == 0));
+        let kept = ZeroSidecar::new(&ctx.output_dir, "b", 2);
+        assert_eq!(std::fs::read(&kept.bin).unwrap(), vec![b'R'; 0x600]);
+        assert!(out.auxiliary_files.contains(&kept.bin));
+        assert!(!out.auxiliary_files.contains(&earlier.bin));
+        assert_eq!(std::fs::read(&earlier.bin).unwrap(), b"earlier\n");
+        assert!(
+            out.notes
+                .join("\n")
+                .contains("their bytes are kept in b.zeroed-2.bin"),
+            "{:?}",
+            out.notes
+        );
+    }
+
+    #[test]
+    fn zero_sidecar_numbers() {
+        assert_eq!(zeroed_number("b", "b.zeroed-3.bin"), Some(3));
+        assert_eq!(zeroed_number("b", "B.ZEROED-12.TSV"), Some(12));
+        for name in [
+            "b.zeroed-.bin",
+            "b.zeroed-2.txt",
+            "b.zeroed-x.bin",
+            "c.zeroed-2.bin",
+        ] {
+            assert_eq!(zeroed_number("b", name), None, "{name}");
+        }
     }
 
     #[tokio::test]

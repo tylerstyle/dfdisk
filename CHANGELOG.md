@@ -143,9 +143,11 @@ and when something was not done the report says so.
   also after an interrupted session was resumed; sectors there that held data
   (left by a session killed before ddrescue saved its map, also sectors a retry
   pass read) are first copied to `<base>.zeroed-N.bin`, with their image
-  offsets and SHA-256 in `<base>.zeroed-N.tsv` (N: the rescue session; created
-  new and fsynced before the first zero, never overwritten), and both are
-  listed with the report's files. The verdict explanation
+  offsets and SHA-256 in `<base>.zeroed-N.tsv` (N: the rescue session, or one
+  past the highest such file a session that ended without its report left;
+  created new and fsynced before the first zero, never overwritten), and both
+  are listed with the report's files. When the zeros cannot be written, those
+  areas count as not acquired (`unread`), not as zeros. The verdict explanation
   follows what happened: a rescue is INCOMPLETE "because the map lists
   unfinished areas" only when it does and nothing else stopped it, a VERIFIED
   rescue names the second read of the source it was compared with, and a second
