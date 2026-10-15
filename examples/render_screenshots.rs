@@ -48,6 +48,15 @@ fn color_to_string(color: Color) -> String {
     }
 }
 
+/// Text colour: the terminal's default foreground for `Reset` (as a
+/// terminal draws it), not the background colour.
+fn fg_to_string(color: Color) -> String {
+    match color {
+        Color::Reset => "#CDD6F4".to_string(),
+        other => color_to_string(other),
+    }
+}
+
 fn is_box_drawing(sym: &str) -> bool {
     matches!(
         sym,
@@ -129,7 +138,7 @@ fn buffer_to_svg(buffer: &Buffer, width_cells: u16, height_cells: u16) -> String
                 continue;
             }
 
-            let fg_hex = color_to_string(cell.fg);
+            let fg_hex = fg_to_string(cell.fg);
             let cx = pad_x + x as f64 * cell_w;
 
             if is_box_drawing(sym) {
@@ -300,7 +309,7 @@ fn buffer_to_svg(buffer: &Buffer, width_cells: u16, height_cells: u16) -> String
                     span_cx,
                     cy + 12.0,
                     bold_attr,
-                    color_to_string(cur_fg),
+                    fg_to_string(cur_fg),
                     span_w,
                     escaped
                 ));

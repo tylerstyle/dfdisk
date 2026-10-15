@@ -13,6 +13,7 @@ use crate::cli::resolve::{resolve_argument, select_device, ResolvedSource};
 use crate::cli::size::{describe_bytes, PieceSize};
 use crate::discovery::{identity, safety, writeprotect, DeviceScanner};
 use crate::engines::converter;
+pub use crate::engines::converter::rescue_notes;
 use crate::engines::session::{self, AcquisitionRequest, HostSystem, SessionHost};
 use crate::engines::AcquisitionError;
 use crate::models::case::CaseMetadata;
@@ -24,7 +25,7 @@ use crate::models::conversion::{ConversionReport, ConversionRequest, ConversionT
 use crate::models::device::BlockDevice;
 use crate::models::identity::SourceKind;
 use crate::models::info_report::{ForensicInfoReport, INFO_JSON_SUFFIX, INFO_SUFFIX};
-use crate::models::outcome::{exit_code, Outcome, RangeKind};
+use crate::models::outcome::{exit_code, Outcome};
 use crate::models::text::sanitize_line;
 use crate::signals::{AbortController, SignalAction, SignalListener};
 use serde_json::json;
@@ -33,10 +34,6 @@ use tokio::sync::mpsc;
 
 /// Capacity of the progress channel between an operation and the printer.
 const PROGRESS_CHANNEL: usize = 256;
-
-/// Most read-error ranges listed in the E01 notes of `--rescue-to-e01` (the
-/// rescue report lists all of them).
-const MAX_NOTE_RANGES: usize = 20;
 
 /// Exit codes from most to least severe: what a run with two verdicts
 /// (`--rescue-to-e01`, `verify --pieces`) exits with.
@@ -539,54 +536,6 @@ pub fn plan_conversion(
         allow_low_space: e01.allow_low_space,
         ..ConversionRequest::new(image, ConversionTarget::E01, dir)
     })
-}
-
-/// E01 notes of a converted rescue beyond what the converter states itself
-/// (where the image came from, the rescue report's verdict and its
-/// read-error summary): the zero-filled sector ranges of the ddrescue map
-/// (the first ones; the rescue report lists all). Empty without bad sectors.
-pub fn rescue_notes(report: &ForensicInfoReport, report_json: &Path) -> Vec<String> {
-    let name = |p: &Path| {
-        p.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| p.display().to_string())
-    };
-    let table = &report.read_errors;
-    let sector = u64::from(table.effective_sector_size());
-    let ranges: Vec<String> = table
-        .ranges
-        .iter()
-        .filter(|r| r.kind == RangeKind::Substituted)
-        .map(|r| {
-            format!(
-                "{}-{}",
-                r.offset / sector,
-                (r.end().saturating_sub(1)) / sector
-            )
-        })
-        .collect();
-    if ranges.is_empty() {
-        return Vec::new();
-    }
-    let shown = ranges.len().min(MAX_NOTE_RANGES);
-    let mut line = format!(
-        "Zero-filled sectors of the rescue ({}, {} bytes each): {}",
-        if table.source.is_empty() {
-            "ddrescue mapfile"
-        } else {
-            table.source.as_str()
-        },
-        sector,
-        ranges[..shown].join(", ")
-    );
-    if ranges.len() > shown {
-        line.push_str(&format!(
-            " and {} more ranges (see {})",
-            ranges.len() - shown,
-            name(report_json)
-        ));
-    }
-    vec![line]
 }
 
 fn print_conversion_step(

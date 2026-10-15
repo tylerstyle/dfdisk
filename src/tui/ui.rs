@@ -245,9 +245,14 @@ pub(crate) fn footer_hints(app: &App) -> String {
         Screen::Running => {
             "A abort (asks y/N) · Ctrl+C abort & quit (asks) · Esc does NOT abort · F1 help"
         }
-        Screen::Result => {
-            "Enter/Esc acknowledge · ↑↓ PgUp PgDn scroll · V re-verify · C convert rescue to E01"
-        }
+        Screen::Result => match &app.result {
+            Some(crate::tui::app::RunResult::Acquisition { report, .. })
+                if report.engine == EngineKind::Rescue =>
+            {
+                "Enter/Esc acknowledge · ↑↓ PgUp PgDn scroll · V re-verify · C convert rescue to E01"
+            }
+            _ => "Enter/Esc acknowledge · ↑↓ PgUp PgDn scroll · V re-verify",
+        },
         Screen::Converter => {
             "Tab/Shift+Tab fields · ←→/Space change · F4 complete path · F5 review & start · Esc back"
         }
@@ -1081,7 +1086,8 @@ pub fn sheet_lines(app: &App) -> Vec<Line<'static>> {
             out.push(sheet_row("Engine", engine_choice(request.engine()), strong));
             match check.as_ref().and_then(|c| c.effective_config.as_ref()) {
                 Some(eff) => {
-                    for (k, v) in eff.rows() {
+                    // The engine is the row above
+                    for (k, v) in eff.rows().into_iter().filter(|(k, _)| k != "Engine") {
                         out.push(sheet_row(&k, &v, white));
                     }
                 }
@@ -2077,6 +2083,35 @@ mod tests {
         assert_eq!(tail_to_width("/a/b/file.E01", 8), "…ile.E01");
         assert_eq!(tail_to_width("short", 8), "short");
         assert_eq!(str_width(&tail_to_width("/x/ケース/データ", 7)), 7);
+    }
+
+    #[test]
+    fn result_offers_the_conversion_only_for_a_rescue() {
+        use crate::models::case::CaseMetadata;
+        use crate::models::config::{AcquisitionConfig, EffectiveConfig};
+        use crate::models::identity::SourceIdentity;
+        use crate::models::info_report::ForensicInfoReport;
+        use crate::tui::app::RunResult;
+        let mut app = App::with_devices(Vec::new());
+        app.screen = Screen::Result;
+        for (engine, offered) in [(EngineKind::Rescue, true), (EngineKind::Ewf, false)] {
+            let config = AcquisitionConfig::for_engine(engine, "/cases/x");
+            let report = ForensicInfoReport::new(
+                engine,
+                &CaseMetadata::default(),
+                SourceIdentity::default(),
+                EffectiveConfig::build(&config, None),
+            );
+            app.result = Some(RunResult::Acquisition {
+                report: Box::new(report),
+                text: String::new(),
+            });
+            assert_eq!(
+                footer_hints(&app).contains("convert rescue to E01"),
+                offered,
+                "{engine:?}"
+            );
+        }
     }
 
     #[test]

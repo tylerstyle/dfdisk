@@ -206,6 +206,61 @@ pub async fn convert_with(
 }
 
 // ---------------------------------------------------------------------------
+// Notes of a converted rescue (CLI --rescue-to-e01, TUI)
+
+/// Most zero-filled ranges [`rescue_notes`] lists (the rescue report lists
+/// all of them).
+pub const MAX_RESCUE_NOTE_RANGES: usize = 20;
+
+/// E01 notes of a converted rescue beyond what the converter states itself
+/// (where the image came from, the rescue report's verdict and its
+/// read-error summary): the zero-filled sector ranges of the ddrescue map
+/// (the first ones; the rescue report lists all). Empty without bad sectors.
+pub fn rescue_notes(report: &ForensicInfoReport, report_json: &Path) -> Vec<String> {
+    let name = |p: &Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string())
+    };
+    let table = &report.read_errors;
+    let sector = u64::from(table.effective_sector_size());
+    let ranges: Vec<String> = table
+        .ranges
+        .iter()
+        .filter(|r| r.kind == RangeKind::Substituted)
+        .map(|r| {
+            format!(
+                "{}-{}",
+                r.offset / sector,
+                (r.end().saturating_sub(1)) / sector
+            )
+        })
+        .collect();
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    let shown = ranges.len().min(MAX_RESCUE_NOTE_RANGES);
+    let mut line = format!(
+        "Zero-filled sectors of the rescue ({}, {} bytes each): {}",
+        if table.source.is_empty() {
+            "ddrescue mapfile"
+        } else {
+            table.source.as_str()
+        },
+        sector,
+        ranges[..shown].join(", ")
+    );
+    if ranges.len() > shown {
+        line.push_str(&format!(
+            " and {} more ranges (see {})",
+            ranges.len() - shown,
+            name(report_json)
+        ));
+    }
+    vec![line]
+}
+
+// ---------------------------------------------------------------------------
 // Source files and names
 
 /// The base name of a conversion's outputs: the source file name without its

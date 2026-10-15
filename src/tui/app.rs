@@ -23,7 +23,7 @@ use crate::models::config::{EngineKind, SmartPolicy};
 use crate::models::conversion::{ConversionReport, ConversionRequest, ConversionTarget};
 use crate::models::device::BlockDevice;
 use crate::models::info_report::{AuditStatus, ForensicInfoReport, INFO_JSON_SUFFIX, INFO_SUFFIX};
-use crate::models::outcome::{Outcome, RangeKind, VerificationResult};
+use crate::models::outcome::{Outcome, VerificationResult};
 use crate::models::telemetry::{AcquisitionStatus, PhaseProgress, ProgressTelemetry};
 use crate::models::text::{format_iec, sanitize_line};
 use crate::signals::{AbortController, SignalAction, SignalKind};
@@ -1864,16 +1864,14 @@ impl App {
         let Some(image) = report.image_files.first().cloned() else {
             return;
         };
-        let mut notes = vec![format!(
-            "Converted from the rescue image {} (outcome {}).",
-            image,
-            report.outcome.label()
-        )];
-        for kind in [RangeKind::Substituted, RangeKind::Unread] {
-            if let Some(s) = report.read_errors.summary(kind) {
-                notes.push(format!("Rescue read errors ({}): {s}", kind.label()));
-            }
-        }
+        // The converter states the rescue report, its verdict and its
+        // read-error summary itself; the notes add the zero-filled ranges
+        let report_json = Path::new(&report.output_dir).join(format!(
+            "{}{}",
+            report.base_name,
+            crate::models::info_report::INFO_JSON_SUFFIX
+        ));
+        let notes = crate::engines::converter::rescue_notes(report, &report_json);
         let case = report.case_metadata.clone();
         let dir = report.output_dir.clone();
         self.result_acknowledged = true;
