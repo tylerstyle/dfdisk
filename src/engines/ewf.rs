@@ -633,8 +633,12 @@ pub fn check_source_size(size_bytes: u64) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "the source is {size_bytes} bytes, {rest} bytes more than {} whole 512-byte sectors; an E01 image stores whole sectors only, and ewfacquire would leave the last {rest} bytes out of the image while including them in its digests. Acquire this source with the RAW engine instead",
-        size_bytes / EWF_SECTOR_BYTES
+        "the source is {size_bytes} bytes, {rest} bytes more than {}; an E01 image stores whole sectors only, and ewfacquire would leave the last {rest} bytes out of the image while including them in its digests. Acquire this source with the RAW engine instead",
+        crate::models::text::plural(
+            size_bytes / EWF_SECTOR_BYTES,
+            "whole 512-byte sector",
+            "whole 512-byte sectors"
+        )
     ))
 }
 
@@ -2641,6 +2645,11 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("RAW engine"), "{err}");
+        let err = check_source_size(1000).unwrap_err();
+        assert!(
+            err.contains("488 bytes more than 1 whole 512-byte sector;"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
