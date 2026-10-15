@@ -1148,6 +1148,7 @@ pub fn sheet_lines(app: &App) -> Vec<Line<'static>> {
             request,
             facts,
             destination,
+            case,
         } => {
             out.push(Line::raw(""));
             out.push(section("SOURCE IMAGE"));
@@ -1173,9 +1174,13 @@ pub fn sheet_lines(app: &App) -> Vec<Line<'static>> {
                     }
                     None => out.push(sheet_row(
                         "Report",
-                        "none found next to the image",
+                        "none found next to the image that lists it",
                         Style::default().fg(Color::Yellow),
                     )),
+                }
+                // Reports next to the image the conversion does not use
+                for n in &f.report_notes {
+                    out.push(sheet_row("Note", n, Style::default().fg(Color::Yellow)));
                 }
             }
             out.push(Line::raw(""));
@@ -1215,11 +1220,41 @@ pub fn sheet_lines(app: &App) -> Vec<Line<'static>> {
                 ));
             }
             out.push(Line::raw(""));
-            out.push(section("CASE"));
-            if let Some(case) = &request.case {
-                for (k, v) in case.report_rows() {
-                    out.push(sheet_row(k, &v, white));
+            // I-N1: what the conversion will record (E01 header < source
+            // report < the form), each value with where it comes from
+            out.push(section("CASE (as recorded)"));
+            match case {
+                Some(Ok(preview)) => {
+                    for (k, v, origin) in preview.rows() {
+                        let text = match origin {
+                            Some(from) => format!("{v}  [{from}]"),
+                            None => v,
+                        };
+                        out.push(sheet_row(k, &text, white));
+                    }
+                    for n in &preview.notes {
+                        out.push(sheet_row("Note", n, Style::default().fg(Color::Yellow)));
+                    }
                 }
+                Some(Err(e)) => {
+                    out.push(sheet_row(
+                        "Case",
+                        &format!(
+                            "the values the conversion records could not be determined ({e}); the form's values follow, the conversion may add values from the image's report or E01 header"
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                    if let Some(given) = &request.case {
+                        for (k, v) in given.report_rows() {
+                            out.push(sheet_row(k, &v, white));
+                        }
+                    }
+                }
+                None => out.push(sheet_row(
+                    "Case",
+                    "determining the values the conversion records...",
+                    white,
+                )),
             }
             for n in &request.notes {
                 out.push(sheet_row("Note", n, Style::default().fg(Color::Yellow)));

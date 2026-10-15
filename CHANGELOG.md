@@ -193,7 +193,11 @@ and when something was not done the report says so.
   scrolling device table that keeps the serial visible, abort with confirmation.
   The confirmation sheet shows the settings the run uses and says "refused"
   only for a refusal (a missing tool is named); nothing starts while a run or
-  an unmount is in progress.
+  an unmount is in progress. A conversion's sheet shows the case values the
+  conversion records (E01 header < source report < form), each with where it
+  comes from; the TUI takes an image's report by the converter's rule (it must
+  list the image), so a report of another image pre-fills nothing and never
+  chooses the typed confirmation.
 - **H9** Exit codes: see Breaking changes; errors are printed once; a panic
   exits 1 (internal error) with a message instead of Rust's 101; a tool the
   engine runs that is not installed fails the run (exit 4) before anything is

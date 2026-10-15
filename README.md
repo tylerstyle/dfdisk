@@ -253,10 +253,15 @@ examiner, authority, the last destination and the last case and evidence
 numbers (offered as suggestions for the next case) in
 `$XDG_CONFIG_HOME/dfdisk/profile.toml`. The converter fills its empty case
 number, evidence number, examiner and description fields from the image's
-`.info.json` and names the fields it took; when the source changes, the values
-taken from the earlier image's report that were not edited are emptied. Case
-values the converter form has no field for (EA, authority, seal number, seizure
-time and place) come from the report the converter uses. Notices are wrapped
+report (the one the conversion uses: `<base>.info.json` or
+`<base>.conversion.info.json` next to the image, only when it lists the image)
+and names the fields it took; when the source changes, the values taken from
+the earlier image's report that were not edited are emptied. Case values the
+converter form has no field for (EA, authority, seal number, seizure time and
+place) come from that report. The conversion's confirmation sheet shows the
+case values the conversion records (E01 header < report < form), each with
+where it comes from, and names a report next to the image that describes
+another image and is not used. Notices are wrapped
 rather than cut, the ones that do not fit are counted, and Ctrl+X dismisses only
 the notices shown.
 

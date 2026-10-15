@@ -1079,10 +1079,20 @@ const CASE_FIELDS: &[(&str, FieldRef, FieldMut)] = &[
     ),
 ];
 
+/// The merged case values ([`merge_case`]).
+struct MergedCase {
+    case: CaseMetadata,
+    /// The layers that contributed
+    used: Vec<String>,
+    notes: Vec<String>,
+    /// Per field of [`CASE_FIELDS`]: the layer its value comes from
+    origins: Vec<Option<String>>,
+}
+
 /// Merge case values, lowest priority first: every non-empty field of a
 /// later layer replaces the earlier value; a replaced different value is
-/// noted. Returns the merged values, the layers that contributed, notes.
-fn merge_case(layers: &[(CaseMetadata, String)]) -> (CaseMetadata, Vec<String>, Vec<String>) {
+/// noted.
+fn merge_case(layers: &[(CaseMetadata, String)]) -> MergedCase {
     let mut merged = CaseMetadata::default();
     let mut origin: Vec<Option<&str>> = vec![None; CASE_FIELDS.len()];
     let mut used = Vec::new();
@@ -1110,7 +1120,201 @@ fn merge_case(layers: &[(CaseMetadata, String)]) -> (CaseMetadata, Vec<String>, 
             used.push(source.clone());
         }
     }
-    (merged, used, notes)
+    MergedCase {
+        case: merged,
+        used,
+        notes,
+        origins: origin.into_iter().map(|o| o.map(str::to_string)).collect(),
+    }
+}
+
+/// The case layers of a conversion, lowest priority first: the E01 header,
+/// the source report, the values given for this conversion.
+fn case_layers(
+    source: &Path,
+    header: Option<CaseMetadata>,
+    report: Option<&LoadedReport>,
+    given: Option<&CaseMetadata>,
+) -> Vec<(CaseMetadata, String)> {
+    let mut layers = Vec::new();
+    if let Some(h) = header {
+        layers.push((h, format!("E01 header of {}", source_name(source))));
+    }
+    if let Some(r) = report {
+        layers.push((
+            r.case.clone(),
+            format!(
+                "{} report {}",
+                r.reference.kind,
+                source_name(&r.reference.path)
+            ),
+        ));
+    }
+    if let Some(given) = given {
+        layers.push((given.clone(), "given for this conversion".to_string()));
+    }
+    layers
+}
+
+// ---------------------------------------------------------------------------
+// What a conversion will use, before it runs (TUI, I-N1 / I-N2)
+
+/// The report of an image as a conversion finds it (`<base>.info.json` or
+/// `<base>.conversion.info.json` next to it, only when it lists the image).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageReport {
+    pub path: PathBuf,
+    /// "acquisition" or "conversion"
+    pub kind: String,
+    pub case: CaseMetadata,
+    pub outcome: Outcome,
+}
+
+/// The report a conversion of `image` uses when none is given (the rule of
+/// [`convert`]), with notes on the reports found next to it that it does not
+/// use (they describe another image, or cannot be read).
+pub fn find_image_report(image: &Path) -> (Option<ImageReport>, Vec<String>) {
+    let mut notes = Vec::new();
+    let Some(base) = conversion_base_name(image) else {
+        return (None, notes);
+    };
+    let req = ConversionRequest {
+        source: image.to_path_buf(),
+        ..Default::default()
+    };
+    let found = find_report(&req, image, &base, &mut notes)
+        .ok()
+        .flatten()
+        .map(|r| ImageReport {
+            path: r.reference.path.clone(),
+            kind: r.reference.kind.clone(),
+            case: r.case.clone(),
+            outcome: r.reference.outcome,
+        });
+    (found, notes)
+}
+
+/// The case values a conversion records, as [`convert`] merges them (E01
+/// header < source report < given), each field with where it comes from:
+/// what the TUI's confirmation sheet shows before the run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CasePreview {
+    pub case: CaseMetadata,
+    /// (label of [`CASE_FIELDS`], where its value comes from) for every
+    /// field with a value
+    pub origins: Vec<(&'static str, String)>,
+    /// The source report the conversion uses
+    pub report: Option<PathBuf>,
+    /// Values one layer replaced in another, unused reports, E01 header
+    /// placeholders
+    pub notes: Vec<String>,
+}
+
+/// The rows of [`CaseMetadata::report_rows`] and the case field each shows.
+const REPORT_ROW_FIELDS: [(&str, &str); 10] = [
+    ("Case Number", "case number"),
+    ("Location / EA", "EA / location"),
+    ("Evidence Number", "evidence number"),
+    ("Examiner", "examiner"),
+    ("Authority / Agency", "authority"),
+    ("Description", "description"),
+    ("Seal Number", "seal number"),
+    ("Seized At (time)", "seizure time"),
+    ("Seized At (place)", "seizure location"),
+    ("Examiner Notes", "notes"),
+];
+
+impl CasePreview {
+    /// The case rows the conversion report will show, each with the source
+    /// of its value (`None`: not provided; the EA's default is named).
+    pub fn rows(&self) -> Vec<(&'static str, String, Option<String>)> {
+        self.case
+            .report_rows()
+            .into_iter()
+            .map(|(label, value)| {
+                let field = REPORT_ROW_FIELDS
+                    .iter()
+                    .find(|(row, _)| *row == label)
+                    .map(|(_, f)| *f);
+                let origin = field
+                    .and_then(|f| self.origins.iter().find(|(o, _)| *o == f))
+                    .map(|(_, from)| from.clone())
+                    .or_else(|| {
+                        (field == Some("EA / location")).then(|| "dfdisk's default".to_string())
+                    });
+                (label, value, origin)
+            })
+            .collect()
+    }
+}
+
+/// ewfinfo's output for an image (the host runs `ewfinfo`; tests inject
+/// their own).
+pub type EwfInfoReader<'a> = dyn Fn(&Path) -> Result<String, String> + 'a;
+
+/// `ewfinfo <image>` on this host (reads the image only), with a timeout.
+pub fn host_ewfinfo(image: &Path) -> Result<String, String> {
+    let spec = ProcessSpec::new("ewfinfo")
+        .arg(image)
+        .timeout(INFO_TIMEOUT)
+        .grace(Duration::from_secs(2));
+    let out = process::run_blocking(&spec, None)
+        .map_err(|e| format!("cannot run ewfinfo (is libewf installed?): {e}"))?;
+    if !out.outcome.success() {
+        return Err(format!(
+            "ewfinfo cannot read {} ({})",
+            image.display(),
+            out.outcome.record.status_text()
+        ));
+    }
+    Ok(out.stdout.join("\n"))
+}
+
+/// [`CasePreview`] of `req` on this host ([`host_ewfinfo`] for an E01
+/// source). Writes nothing.
+pub fn preview_case(req: &ConversionRequest) -> Result<CasePreview, AcquisitionError> {
+    preview_case_with(req, &host_ewfinfo)
+}
+
+/// [`CasePreview`] of `req`, reading an E01 source's header with `ewfinfo`:
+/// the same source files, report and layers as [`convert`]. Writes nothing.
+pub fn preview_case_with(
+    req: &ConversionRequest,
+    ewfinfo: &EwfInfoReader<'_>,
+) -> Result<CasePreview, AcquisitionError> {
+    let source_files = match req.target {
+        ConversionTarget::E01 => split_raw_segments(&req.source)?,
+        ConversionTarget::Raw => ewf_segments(&req.source)?,
+    };
+    let source = source_files[0].path.clone();
+    let base = conversion_base_name(&source).ok_or_else(|| {
+        usage(format!(
+            "{} has no usable base name for the outputs (UTF-8 name required)",
+            source.display()
+        ))
+    })?;
+    let mut notes = Vec::new();
+    let report = find_report(req, &source, &base, &mut notes)?;
+    let header = match req.target {
+        ConversionTarget::Raw => {
+            let text = ewfinfo(&source).map_err(AcquisitionError::failed)?;
+            Some(header_case(&parse_ewfinfo(&text), &mut notes))
+        }
+        ConversionTarget::E01 => None,
+    };
+    let layers = case_layers(&source, header, report.as_ref(), req.case.as_ref());
+    let merged = merge_case(&layers);
+    notes.extend(merged.notes);
+    Ok(CasePreview {
+        origins: CASE_FIELDS
+            .iter()
+            .zip(merged.origins)
+            .filter_map(|((label, _, _), o)| o.map(|o| (*label, o)))
+            .collect(),
+        case: merged.case,
+        report: report.map(|r| r.reference.path),
+        notes,
+    })
 }
 
 /// Case values an E01 header holds (libewf placeholders dropped, noted).
@@ -1510,27 +1714,16 @@ async fn plan(
     }
 
     // Case values: E01 header < source report < given
-    let mut layers = Vec::new();
-    if let Some(info) = &ewf_source {
-        layers.push((
-            header_case(info, &mut notes),
-            format!("E01 header of {}", source_name(&source)),
-        ));
-    }
-    if let Some(r) = &report {
-        layers.push((
-            r.case.clone(),
-            format!(
-                "{} report {}",
-                r.reference.kind,
-                source_name(&r.reference.path)
-            ),
-        ));
-    }
-    if let Some(given) = &req.case {
-        layers.push((given.clone(), "given for this conversion".to_string()));
-    }
-    let (case, case_sources, case_notes) = merge_case(&layers);
+    let header = ewf_source
+        .as_ref()
+        .map(|info| header_case(info, &mut notes));
+    let layers = case_layers(&source, header, report.as_ref(), req.case.as_ref());
+    let MergedCase {
+        case,
+        used: case_sources,
+        notes: case_notes,
+        ..
+    } = merge_case(&layers);
     notes.extend(case_notes);
     let missing: Vec<&str> = [
         (case.effective_case(), "case number (--case)"),
@@ -3233,6 +3426,75 @@ mod tests {
     const EWFEXPORT_LEGACY_ERRORS: &str = "ewfexport 20140816\n\n\nExport started at: Oct 15, 2026 08:07:33\nThis could take a while.\n\nExport completed at: Oct 15, 2026 08:07:33\n\nWritten: 3.0 MiB (3145728 bytes) in 0 second(s).\nMD5 hash calculated over data:\t\t6e17beab9ec6f8bbe2610f26664b87ad\nRead errors during export:\n\ttotal number: 1\n\tat sector(s): 5952 - 6143 (number: 192) in segment file(s):\n\newfexport: SUCCESS\n";
 
     #[test]
+    fn the_case_preview_is_the_merge_the_conversion_records() {
+        // I-N1: E01 header < source report < given, each field with its
+        // origin, the same report and layers as the conversion itself
+        let dir = tempfile::tempdir().unwrap();
+        let e01 = dir.path().join("x.E01");
+        std::fs::write(&e01, b"EVF\x09\x0d\x0a\xff\x00").unwrap();
+        let report = json!({
+            "schema_version": 2,
+            "image_files": [e01.display().to_string()],
+        });
+        // A report the converter cannot load as schema 2 is not used (noted)
+        std::fs::write(dir.path().join("x.info.json"), report.to_string()).unwrap();
+        let req = ConversionRequest {
+            source: e01.clone(),
+            target: ConversionTarget::Raw,
+            case: Some(CaseMetadata {
+                case_number: "C-GIVEN".into(),
+                evidence_number: "EV-1".into(),
+                examiner: "Given Examiner".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let p = preview_case_with(&req, &|path| {
+            assert_eq!(path, e01.as_path());
+            Ok(EWFINFO_WITH_ERRORS.replace("\tDescription:\t\td", "\tDescription:\t\tlaptop"))
+        })
+        .unwrap();
+        assert_eq!(p.case.case_number, "C-GIVEN");
+        assert_eq!(p.case.description, "laptop");
+        assert_eq!(p.report, None);
+        let rows = p.rows();
+        let row = |label: &str| rows.iter().find(|r| r.0 == label).unwrap().clone();
+        assert_eq!(
+            row("Description"),
+            (
+                "Description",
+                "laptop".to_string(),
+                Some("E01 header of x.E01".to_string())
+            )
+        );
+        assert_eq!(
+            row("Case Number").2.as_deref(),
+            Some("given for this conversion")
+        );
+        assert_eq!(row("Seal Number").2, None);
+        assert_eq!(row("Location / EA").2.as_deref(), Some("dfdisk's default"));
+        // The header's other values were replaced by the given ones: noted
+        assert!(
+            p.notes
+                .iter()
+                .any(|n| n.starts_with("case number: E01 header of x.E01 records \"CASE\"")),
+            "{:?}",
+            p.notes
+        );
+        assert!(
+            p.notes
+                .iter()
+                .any(|n| n.contains("x.info.json was not used")),
+            "{:?}",
+            p.notes
+        );
+        // ewfinfo failing: the preview says so instead of guessing
+        let err =
+            preview_case_with(&req, &|_| Err("ewfinfo cannot read x.E01".into())).unwrap_err();
+        assert!(err.message.contains("ewfinfo cannot read"), "{err}");
+    }
+
+    #[test]
     fn a_corrupted_e01_and_ewfexports_read_errors_are_recognised() {
         let info = parse_ewfinfo(EWFINFO_CORRUPTED);
         assert!(info.corrupted);
@@ -3594,7 +3856,12 @@ mod tests {
             seal_number: "S9".into(),
             ..Default::default()
         };
-        let (merged, used, notes) = merge_case(&[
+        let MergedCase {
+            case: merged,
+            used,
+            notes,
+            origins,
+        } = merge_case(&[
             (report, "acquisition report x.info.json".into()),
             (given, "given for this conversion".into()),
         ]);
@@ -3605,10 +3872,29 @@ mod tests {
         assert_eq!(used.len(), 2);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("\"Alice\""), "{notes:?}");
+        let origin = |label: &str| {
+            CASE_FIELDS
+                .iter()
+                .position(|(l, _, _)| *l == label)
+                .and_then(|i| origins[i].clone())
+        };
+        assert_eq!(
+            origin("examiner").as_deref(),
+            Some("given for this conversion")
+        );
+        assert_eq!(
+            origin("description").as_deref(),
+            Some("acquisition report x.info.json")
+        );
+        assert_eq!(
+            origin("seal number").as_deref(),
+            Some("given for this conversion")
+        );
+        assert_eq!(origin("seizure time"), None);
         // Nothing given at all
-        let (merged, used, _) = merge_case(&[]);
-        assert!(merged.validate_required().is_err());
-        assert!(used.is_empty());
+        let empty = merge_case(&[]);
+        assert!(empty.case.validate_required().is_err());
+        assert!(empty.used.is_empty());
     }
 
     fn h(md5: &str, sha256: Option<&str>) -> HashResults {

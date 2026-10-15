@@ -13,6 +13,7 @@
 //! confirmation sheet (converter), the progress and the result screens.
 
 use crate::discovery::safety::UnmountResult;
+use crate::engines::converter;
 use crate::engines::preflight::{self, DestinationFacts, MIN_FREE_BYTES};
 use crate::engines::session::{AcquisitionRequest, CheckReport};
 use crate::engines::verify::{ExpectedHashes, ImageVerification, VerifyEvent};
@@ -233,6 +234,9 @@ pub enum ConfirmSubject {
         request: Box<ConversionRequest>,
         facts: Option<Box<SourceFacts>>,
         destination: Option<Result<DestinationFacts, String>>,
+        /// The case values the conversion will record, with their sources
+        /// (I-N1); None while it is determined
+        case: Option<Result<Box<converter::CasePreview>, String>>,
     },
 }
 
@@ -615,6 +619,7 @@ enum BgEvent {
         token: u64,
         facts: SourceFacts,
         destination: Result<DestinationFacts, String>,
+        case: Result<Box<converter::CasePreview>, String>,
     },
     Completion {
         token: u64,
@@ -676,32 +681,42 @@ fn find_rescue_map(dir: &Path, base: &str) -> Option<PathBuf> {
         .filter(|p| std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false))
 }
 
-/// Facts about a converter source: existence, size, its dfdisk report.
+/// Facts about a converter source: existence, size, its dfdisk report. The
+/// report is the one a conversion uses (I-N2: `converter::find_image_report`,
+/// next to the image and listing it), so the form is never pre-filled, and
+/// the confirmation never asks for a serial, from a report the conversion
+/// ignores.
 pub fn probe_source(path: &Path) -> SourceFacts {
     let meta = std::fs::metadata(path).ok().filter(|m| m.is_file());
-    let report = report_candidate(path)
-        .filter(|p| p.is_file())
-        .and_then(|p| {
-            let text = std::fs::read_to_string(&p).ok()?;
-            let r = ForensicInfoReport::from_json(&text).ok()?;
-            Some(SourceReport {
-                device: format!(
+    let (found, report_notes) = converter::find_image_report(path);
+    let report = found.map(|r| {
+        // The acquired device: only an acquisition report names one
+        let acquired = (r.kind == "acquisition")
+            .then(|| std::fs::read_to_string(&r.path).ok())
+            .flatten()
+            .and_then(|text| ForensicInfoReport::from_json(&text).ok());
+        SourceReport {
+            device: match &acquired {
+                Some(a) => format!(
                     "{} ({})",
-                    r.source.display_name(),
-                    r.source.serial_with_provenance()
+                    a.source.display_name(),
+                    a.source.serial_with_provenance()
                 ),
-                serial: r.source.serial.clone(),
-                case: r.case_metadata.clone(),
-                outcome: r.outcome.label().to_string(),
-                path: p,
-            })
-        });
+                None => format!("(a {} report names no device)", r.kind),
+            },
+            serial: acquired.and_then(|a| a.source.serial),
+            case: r.case,
+            outcome: r.outcome.label().to_string(),
+            path: r.path,
+        }
+    });
     SourceFacts {
         path: path.to_path_buf(),
         is_ewf: meta.is_some() && crate::engines::verify::is_ewf_image_file(path),
         exists: meta.is_some(),
         size: meta.map(|m| m.len()),
         report,
+        report_notes,
     }
 }
 
@@ -2418,11 +2433,13 @@ impl App {
         };
         self.token += 1;
         let token = self.token;
+        let preview_request = request.clone();
         self.confirm = Some(ConfirmState {
             subject: ConfirmSubject::Conversion {
                 request: Box::new(request),
                 facts: None,
                 destination: None,
+                case: None,
             },
             token,
             pending: true,
@@ -2439,6 +2456,7 @@ impl App {
                 token,
                 facts: probe_source(&source_path),
                 destination: backend.destination(&dir),
+                case: backend.conversion_case(&preview_request).map(Box::new),
             },
             move |message| BgEvent::Internal {
                 token: Some(token),
@@ -3145,6 +3163,7 @@ impl App {
                 token,
                 facts,
                 destination,
+                case,
             } => {
                 let Some(c) = &mut self.confirm else {
                     return;
@@ -3157,17 +3176,23 @@ impl App {
                     request,
                     facts: slot,
                     destination: dslot,
+                    case: cslot,
                 } = &mut c.subject
                 {
                     let serial = facts.report.as_ref().and_then(|r| r.serial.clone());
-                    let evidence = request
-                        .case
-                        .as_ref()
-                        .map(|cm| cm.evidence_number.clone())
-                        .unwrap_or_default();
+                    // The evidence number the conversion records
+                    let evidence = match &case {
+                        Ok(p) => p.case.evidence_number.clone(),
+                        Err(_) => request
+                            .case
+                            .as_ref()
+                            .map(|cm| cm.evidence_number.clone())
+                            .unwrap_or_default(),
+                    };
                     c.target = Some(ConfirmTarget::new(serial.as_deref(), &evidence));
                     *slot = Some(Box::new(facts));
                     *dslot = Some(destination);
+                    *cslot = Some(case);
                 }
             }
             BgEvent::Completion {
