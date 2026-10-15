@@ -55,7 +55,7 @@ registry and writes to the hash-chained dfnix audit log.
 |--------|---------------|--------|---------|--------------------|
 | E01 | `--format e01` (default) | `<base>.E01`, `.E02`, … written by `ewfacquire` (compression and segment size selectable) | MD5 always, SHA-1 and SHA-256 selectable; verified with `ewfverify` | ewfacquire replaces them with zeros; dfdisk takes the exact ranges from the error list stored in the image (`ewfinfo -e`) and from ewfacquire's output. A source that ends before its size while ewfacquire waits for it (60 s without progress, and the source is gone or smaller) is stopped by dfdisk: INCOMPLETE, "source lost at offset X" |
 | RAW | `--format raw` | `<base>.raw`, one file | MD5, SHA-1, SHA-256 computed by dfdisk while reading, plus a piecewise SHA-256 per `--piece-size` (default 1 GiB); the image is re-read and hashed again | `--on-read-error stop` (default): stop at the first unreadable sector, report its exact offset, verdict INCOMPLETE; `--on-read-error zero-fill`: replace each unreadable sector by zeros, record every range, continue |
-| Rescue | `--rescue` | `<base>.raw` and the ddrescue mapfile `<base>.map` | computed from the image after the rescue; `--verify-source` reads the source a second time and compares | taken from the ddrescue map: bad sectors are zeros in the image (after every ddrescue run dfdisk writes the zeros itself, so data an interrupted session left there does not stay; such data is first kept in `<base>.zeroed-N.bin` with its offsets and SHA-256 in `<base>.zeroed-N.tsv`), untried or unfinished areas make the run INCOMPLETE; a rescue can be resumed on the same device |
+| Rescue | `--rescue` | `<base>.raw` and the ddrescue mapfile `<base>.map` | computed from the image after the rescue; `--verify-source` reads the source a second time and compares | taken from the ddrescue map: bad sectors are zeros in the image (after every ddrescue run dfdisk writes the zeros itself, so data an interrupted session left there does not stay; such data is first kept in `<base>.zeroed-N.bin` with its offsets and SHA-256 in `<base>.zeroed-N.tsv`; when the zeros cannot be written, those areas count as not acquired), untried or unfinished areas make the run INCOMPLETE; a rescue can be resumed on the same device |
 
 `--rescue-to-e01` converts a finished rescue image into an E01 next to it. The
 read-error summary of the rescue goes into the E01 notes, with its zero-filled
@@ -452,9 +452,15 @@ identify-class queries that the report records.
   the source or one of its partitions, or its disk or another device below it
   with a byte range that includes the source; mounts of such a loop device, and
   of its partitions that lie on the source, count as mounts of the source): a holder keeps the device open, so it has to be closed
-  first (there is no override). Unmounting is a separate, explicit, audited
-  action (`dfdisk unmount`, `--auto-unmount`) that refuses system mounts and
-  protected devices and never forces or lazily unmounts.
+  first (there is no override). A device-mapper or md device stacked on such a
+  loop device that covers more than the source (kpartx over
+  `losetup /dev/sdb` for a source `sdb2`) may or may not map the source, as
+  dfdisk does not read its mapping: its mounts refuse the acquisition as well,
+  but they are not called mounts of the source. Unmounting is a separate,
+  explicit, audited action (`dfdisk unmount`, `--auto-unmount`) that refuses
+  system mounts, protected devices and the mounts of such a device ("cannot
+  tell whether ... belongs to ..."; unmount them yourself) and never forces or
+  lazily unmounts.
 - **Exclusive open.** The source is opened with `O_EXCL` and held for the whole
   run, so the kernel refuses to mount it or to assemble device-mapper, LVM or md
   devices on it meanwhile (setting up a loop device needs no exclusive claim and

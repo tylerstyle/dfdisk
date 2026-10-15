@@ -227,11 +227,85 @@ fn dependent_tree(sys: &SysRoot, root: &str) -> BTreeSet<String> {
 /// it), and the loop devices set up over a device BELOW the source whose
 /// byte range overlaps the source's data there ([`loops_over_lower_nodes`]),
 /// by kernel name: the nodes whose mounts (and active swap, R8) are "in the
-/// source tree".
+/// source tree". It includes the nodes that may or may not map the source
+/// ([`maybe_source_nodes`]): an acquisition counts them (fail closed).
 pub fn source_tree(sys: &SysRoot, identity: &SourceIdentity) -> BTreeSet<String> {
     let mut tree = dependent_tree(sys, &identity.kernel_name);
-    tree.extend(loops_over_lower_nodes(sys, &identity.kernel_name));
+    let loops = loops_over_lower_nodes(sys, &identity.kernel_name);
+    tree.extend(loops.nodes);
+    tree.extend(loops.maybe.into_iter().map(|m| m.node));
     tree
+}
+
+/// A node of [`source_tree`] that may or may not map the source's data
+/// (S-N4): a device stacked on a loop device over a node below the source
+/// (dm or md on the loop device, a partition of it without a known range)
+/// when only part of the loop device is the source's data. `losetup
+/// /dev/loop0 /dev/sdb; kpartx -a /dev/loop0` makes a dm device for every
+/// partition of sdb, and dfdisk does not read their mapping tables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaybeSourceNode {
+    /// Kernel name (`dm-5`)
+    pub node: String,
+    /// Its device path (`/dev/mapper/loop0p1`, `/dev/loop0p1`)
+    pub path: String,
+    /// The loop device it is stacked on (`loop0`)
+    pub on_loop: String,
+    /// The node below the source the loop device is set up over (`sdb`)
+    pub over: String,
+}
+
+impl MaybeSourceNode {
+    /// "/dev/mapper/loop0p1 (stacked on loop0, a loop device over /dev/sdb,
+    /// which holds the source)"
+    pub fn describe(&self) -> String {
+        format!(
+            "{} (stacked on {}, a loop device over /dev/{}, which holds the source)",
+            self.path, self.on_loop, self.over
+        )
+    }
+}
+
+/// The nodes of [`source_tree`] that may or may not map the source's data
+/// and are not shown to by another way (S-N4).
+pub fn maybe_source_nodes(sys: &SysRoot, identity: &SourceIdentity) -> Vec<MaybeSourceNode> {
+    let mut known = dependent_tree(sys, &identity.kernel_name);
+    let loops = loops_over_lower_nodes(sys, &identity.kernel_name);
+    known.extend(loops.nodes);
+    let mut seen = BTreeSet::new();
+    loops
+        .maybe
+        .into_iter()
+        .filter(|m| !known.contains(&m.node) && seen.insert(m.node.clone()))
+        .collect()
+}
+
+/// Mount points of [`maybe_source_nodes`] that are not also mounts of a
+/// node shown to hold the source's data, each with its node.
+pub fn maybe_source_mounts(
+    sys: &SysRoot,
+    identity: &SourceIdentity,
+    mountinfo: &str,
+) -> Vec<(MaybeSourceNode, Vec<String>)> {
+    let maybe = maybe_source_nodes(sys, identity);
+    if maybe.is_empty() {
+        return Vec::new();
+    }
+    let known: BTreeSet<String> = source_tree(sys, identity)
+        .into_iter()
+        .filter(|n| !maybe.iter().any(|m| m.node == *n))
+        .collect();
+    let known_mounts = mounts_of(sys, &known, mountinfo);
+    maybe
+        .into_iter()
+        .filter_map(|m| {
+            let points: Vec<String> = mounts_of(sys, &BTreeSet::from([m.node.clone()]), mountinfo)
+                .into_iter()
+                .filter(|p| !known_mounts.contains(p))
+                .collect();
+            (!points.is_empty()).then_some((m, points))
+        })
+        .collect()
 }
 
 /// A byte range `[start, end)` on a device; `end` [`u64::MAX`]: to its end.
@@ -290,6 +364,16 @@ fn lower_nodes_with_ranges(sys: &SysRoot, kname: &str) -> Vec<(String, ByteRange
     out
 }
 
+/// What [`loops_over_lower_nodes`] found.
+#[derive(Debug, Default)]
+struct LoopsOver {
+    /// The loop devices and what is shown to depend on the source's data
+    /// through them
+    nodes: BTreeSet<String>,
+    /// What is stacked on them and may or may not map the source's data
+    maybe: Vec<MaybeSourceNode>,
+}
+
 /// Loop devices set up over a node BELOW the source (its disk, the partition
 /// under a dm source, an intermediate dm or md device) whose byte range
 /// (`loop/offset`, `loop/sizelimit`; 0: to the end) overlaps the source's
@@ -298,10 +382,12 @@ fn lower_nodes_with_ranges(sys: &SysRoot, kname: &str) -> Vec<(String, ByteRange
 /// through loop0 or a filesystem mounted from loop0p2 land on sdb2. Such a
 /// loop device is a holder of the source and the mounts on it are mounts of
 /// the source. A partition of the loop device outside the source's range
-/// (loop0p1, the image of sdb1) is not; dm or md devices stacked on the
-/// whole loop device are counted (their mapping is not read).
-fn loops_over_lower_nodes(sys: &SysRoot, kname: &str) -> BTreeSet<String> {
-    let mut found = BTreeSet::new();
+/// (loop0p1, the image of sdb1) is not. dm or md devices stacked on the loop
+/// device (their mapping is not read) and its partitions without a known
+/// range are shown to map the source only when the whole loop device is the
+/// source's data; otherwise they may or may not (S-N4, `maybe`).
+fn loops_over_lower_nodes(sys: &SysRoot, kname: &str) -> LoopsOver {
+    let mut found = LoopsOver::default();
     let mut targets = lower_nodes_with_ranges(sys, kname);
     if targets.is_empty() {
         return found;
@@ -313,7 +399,7 @@ fn loops_over_lower_nodes(sys: &SysRoot, kname: &str) -> BTreeSet<String> {
             continue;
         };
         for (lo, _) in loops.iter().filter(|(_, d)| *d == dev) {
-            if found.len() >= MAX_TREE_NODES || lo == kname {
+            if found.nodes.len() + found.maybe.len() >= MAX_TREE_NODES || lo == kname {
                 continue;
             }
             let offset: u64 = sys
@@ -340,14 +426,43 @@ fn loops_over_lower_nodes(sys: &SysRoot, kname: &str) -> BTreeSet<String> {
             if !seen.insert(format!("{lo}:{}:{}", on_loop.0, on_loop.1)) {
                 continue;
             }
-            found.insert(lo.clone());
+            found.nodes.insert(lo.clone());
+            // Is all of the loop device the source's data?
+            let all_source = on_loop.0 == 0
+                && sys
+                    .attr(lo, "size")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .and_then(|sectors| sectors.checked_mul(512))
+                    .is_some_and(|bytes| on_loop.1 >= bytes);
+            let mut maybe_roots = Vec::new();
             for p in sys.partitions(lo) {
-                if partition_range(sys, &p).is_none_or(|r| overlaps(r, on_loop)) {
-                    found.extend(dependent_tree(sys, &p));
+                match partition_range(sys, &p) {
+                    Some(r) if overlaps(r, on_loop) => found.nodes.extend(dependent_tree(sys, &p)),
+                    Some(_) => {}
+                    None if all_source => found.nodes.extend(dependent_tree(sys, &p)),
+                    None => maybe_roots.push(p),
                 }
             }
             for h in sys.holders(lo) {
-                found.extend(dependent_tree(sys, &h));
+                if all_source {
+                    found.nodes.extend(dependent_tree(sys, &h));
+                } else {
+                    maybe_roots.push(h);
+                }
+            }
+            for root in maybe_roots {
+                for n in dependent_tree(sys, &root) {
+                    let path = match sys.attr(&n, "dm/name") {
+                        Some(name) => format!("/dev/mapper/{name}"),
+                        None => format!("/dev/{n}"),
+                    };
+                    found.maybe.push(MaybeSourceNode {
+                        node: n,
+                        path,
+                        on_loop: lo.clone(),
+                        over: node.clone(),
+                    });
+                }
             }
             // Loop devices over this loop device, again by range
             targets.push((lo.clone(), on_loop));

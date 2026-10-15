@@ -40,7 +40,7 @@ case-insensitively (exFAT, NTFS and FAT destinations).
 | `<base>.map` | rescue engine | GNU ddrescue mapfile |
 | `<base>.identity.json` | rescue engine | identity of the source at the first start; a resume requires the same device |
 | `<base>.info.session-N`, `<base>.info.session-N.json` | rescue engine | the reports of an earlier session, kept when a rescue is resumed |
-| `<base>.zeroed-N.bin`, `<base>.zeroed-N.tsv` | rescue engine, session N, only when needed | the bytes that sectors of bad-sector (`-`) areas held before dfdisk wrote zeros over them (data a session killed before ddrescue saved its map left there, also sectors a retry pass read): `.bin` holds them concatenated, `.tsv` one line per run of sectors with the tab-separated header `image_offset`, `length`, `bin_offset`, `sha256` (byte offset in the image, length in bytes, byte offset in the `.bin` file, SHA-256 of those bytes). Created new, fsynced with the directory before the first zero is written, never overwritten; listed as auxiliary files with their SHA-256 and named in the notes. Nothing is written when no bad-sector area held data |
+| `<base>.zeroed-N.bin`, `<base>.zeroed-N.tsv` | rescue engine, session N (or one past the highest such file a session that ended without its report left), only when needed | the bytes that sectors of bad-sector (`-`) areas held before dfdisk wrote zeros over them (data a session killed before ddrescue saved its map left there, also sectors a retry pass read): `.bin` holds them concatenated, `.tsv` one line per run of sectors with the tab-separated header `image_offset`, `length`, `bin_offset`, `sha256` (byte offset in the image, length in bytes, byte offset in the `.bin` file, SHA-256 of those bytes). Created new, fsynced with the directory before the first zero is written, never overwritten; listed as auxiliary files with their SHA-256 and named in the notes. Nothing is written when no bad-sector area held data. When the zeros cannot be written, the bad-sector areas inside the image are listed as `unread`, not `substituted` |
 | `<base>.smart-before.json` | acquisitions with `--smart basic` or `full` | raw `smartctl -j` output before the acquisition |
 | `<base>.smart-after.json` | rescue | raw `smartctl -j` output after the rescue |
 | `<base>.smart-before-N.json`, `<base>.smart-after-N.json` | resumed rescue | later SMART snapshots never overwrite earlier ones |
@@ -180,8 +180,9 @@ byte, sorted, non-overlapping, with adjacent ranges of the same kind merged:
 - `"substituted"`: unreadable; the image holds zeros there and has its full
   length. Any such range makes the verdict at best COMPLETED WITH READ ERRORS.
 - `"unread"`: not read or not in the image (untried or unfinished ddrescue
-  areas, the rest of the source after an early stop). Any such range makes the
-  verdict INCOMPLETE.
+  areas, the rest of the source after an early stop, bad-sector areas of a
+  rescue over which dfdisk could not write zeros, so that the image may hold
+  other data there). Any such range makes the verdict INCOMPLETE.
 
 `read_errors.source` names where the list comes from, for example `ewfinfo -e`
 (the error list stored in the E01 itself), `ddrescue mapfile` or `raw engine`.
@@ -190,10 +191,9 @@ byte, sorted, non-overlapping, with adjacent ranges of the same kind merged:
 ### Verification result
 
 `verification.result` (the verification as a whole), `verification.image` (the
-written image alone, before the second read was taken into account; missing in
-reports of earlier versions) and `verification.source_reread` (the second read
-of the source with `--verify-source`; null when there was none) are tagged
-objects:
+written image alone, before the second read was taken into account) and
+`verification.source_reread` (the second read of the source with
+`--verify-source`; null when there was none) are tagged objects:
 
 ```json
 {"status": "matched", "method": "ewfverify -d md5"}
@@ -223,12 +223,14 @@ areas and nothing else stopped the run (otherwise the explanation names the
 stop or the identity change); a VERIFIED rescue says that its image digests
 equal a second, independent read of the source; an ABORTED or INCOMPLETE run
 says "its digests cover only what was acquired" only when digests exist; an
-INCOMPLETE run that has every byte of the source in its image and no unread
-area, but did not end cleanly (ddrescue's exit status, an image that could not
-be fsynced, …), says "every byte of the source is in the image, but the run did
-not end cleanly (the reason follows), so it is not counted as complete" (with
-bad sectors: "the image covers the whole source (its unreadable sectors are
-zeros in it)") instead of calling the image partial.
+INCOMPLETE run whose image has the full length of the source and no known
+unread area, but that did not end cleanly (ddrescue's exit status, an image that
+could not be fsynced, E01 read errors whose positions could not be determined,
+…), says "the image has the full length of the source, but the run did not end
+cleanly (the reason follows), so it is not counted as complete" (with bad
+sectors: "the image has the full length of the source (its unreadable sectors
+are zeros in it)") instead of calling the image partial; it does not claim that
+every byte of the source is in the image, which the problem may contradict.
 
 ## Other JSON output (`--json`)
 

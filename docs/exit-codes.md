@@ -12,7 +12,7 @@ codes; the text and JSON reports carry the same code (`exit_code` in
 | 3 | Refused | A safety or preflight rule refused the run (see below). Nothing was acquired. |
 | 4 | Failed | The run could not be carried out (for example a required tool is missing: ewfacquire, ewfinfo and ewfverify for E01 and `--rescue-to-e01`, ddrescue for a rescue; this is found after the refusal checks and before anything is written, sent to the device or recorded as started), or the verification could not run or complete (outcome VERIFICATION FAILED). |
 | 5 | Mismatch | A digest recomputed from the image, or from a second read of the source, differs from the digest computed during acquisition (for a rescue: the second read differs from the image). The report says which digests were compared. |
-| 6 | Incomplete | Not all of the source was acquired: the run stopped early, areas were never read, the source was lost or changed, or the destination filled up. Also a run that has every byte of the source in its image but did not end cleanly (for example ddrescue ending with an error status after a complete run, or an image that could not be fsynced); its explanation says so instead of calling the image partial. |
+| 6 | Incomplete | Not all of the source was acquired: the run stopped early, areas were never read, the source was lost or changed, or the destination filled up. Also a run whose image has the full length of the source but that did not end cleanly (for example ddrescue ending with an error status after a complete run, an image that could not be fsynced, or E01 read errors whose positions could not be determined); its explanation says so instead of calling the image partial. |
 | 7 | Completed with read errors | The full length was written, but unreadable sectors were replaced by zeros. The digests describe the image including the substituted sectors, not the original medium. |
 | 8 | Aborted | Stopped by the examiner or by a signal (SIGINT, SIGTERM, SIGQUIT). |
 | 9 | Complete, not verified | The whole source was acquired without read errors, but no independent comparison was possible (for example a rescue without `--verify-source`). |
@@ -56,7 +56,11 @@ source device, when for example:
 - the device is a system disk, is mounted (in dfdisk's mount namespace, also
   through a loop device set up over it or its partitions, or over its disk or a
   device below it with a byte range that includes the source, such as
-  `losetup -P /dev/sdb` for a partition source `sdb2`), holds active swap, or
+  `losetup -P /dev/sdb` for a partition source `sdb2`), or a device-mapper or
+  md device stacked on such a loop device that covers more than the source is
+  mounted (it may map the source; dfdisk does not read its mapping, so it
+  counts, but the refusal does not call it a mount of the source), holds
+  active swap, or
   has holders (device-mapper, LVM, md, LUKS, or such a loop device): a holder
   keeps the device open or writes to it, so it has to be closed first (there is
   no override);
@@ -81,9 +85,9 @@ source device, when for example:
 | `check` | 0 ready; otherwise the code of the first problem found: 2 usage, 3 refused, 4 a check could not run or a tool the engine runs is not installed; 8 interrupted. Writes nothing. |
 | `verify` | 0 every digest compared matches (expected digests, the digests an E01 stores, every piece of `--pieces`); 5 a digest or a piece differs; 4 the verification could not run or a requested digest was not computed (never reported as a pass); 9 nothing to compare against (no expected digest given, none in the report, none stored in the image, no `--pieces`); 2 the image or pieces file does not exist, an expected digest is not exactly 32 (MD5), 40 (SHA-1) or 64 (SHA-256) hex digits (also in a `--report`), or arguments are invalid; 8 aborted. |
 | `convert` | The conversion's verdict (0, 4–9; 7 when the source image holds zero-filled sectors of its acquisition); 2 for example a RAW size that is not a multiple of 512 bytes or missing case fields; 3 an output already exists or a destination check refused; 4 a tool could not run; 8 aborted before anything was written. |
-| `unmount` | 0 everything was unmounted and nothing remains mounted (or nothing was mounted); 2 usage (for example a regular file); 3 refused (system mount, protected device, active swap, unidentifiable device); 4 an unmount failed or a mount remained. |
+| `unmount` | 0 everything was unmounted and nothing remains mounted (or nothing was mounted); 2 usage (for example a regular file); 3 refused (system mount, protected device, active swap, unidentifiable device, a mount of a device that may or may not map the source); 4 an unmount failed or a mount remained. |
 | `list` | 0, or 4 when the device scan failed. |
-| `tui` (default) | 0 on a normal exit; the result's exit code when the TUI ends before the examiner acknowledged a result on screen (a run that finished after SIGHUP, or a quit by signal); 1 on a terminal failure or an internal error of the UI itself (a job still running then is aborted and has written its report and audit record, and an unmount still running has ended, before dfdisk exits); 4 when the signal handlers cannot be installed. A run that stops on an internal error of dfdisk (a panic inside the acquisition, conversion or verification) is shown as FAILED (INTERNAL ERROR), exit code 4. |
+| `tui` (default) | 0 on a normal exit; the result's exit code when the TUI ends before the examiner acknowledged a result on screen (a run that finished after SIGHUP, or a quit by signal); 1 on a terminal failure or an internal error of the UI itself (a job still running then is aborted and has written its report and audit record, and an unmount still running has ended, before dfdisk exits, if they end within 6 minutes; otherwise dfdisk says so and exits without waiting for them, and the job's report and audit record may be missing); 4 when the signal handlers cannot be installed. A run that stops on an internal error of dfdisk (a panic inside the acquisition, conversion or verification) is shown as FAILED (INTERNAL ERROR), exit code 4. |
 
 Command-line parsing errors (unknown option, missing value, missing required
 `--case`/`--evidence`/`--examiner`) exit 2. `--help` and `--version` exit 0.

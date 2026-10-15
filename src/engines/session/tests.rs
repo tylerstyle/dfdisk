@@ -959,6 +959,64 @@ async fn swap_mount_holder_and_busy_refusals() {
     assert_refused_before_writing(&fake, config, ErrorKind::Refused, "in use").await;
 }
 
+#[test]
+fn a_mount_that_may_map_the_source_refuses_without_calling_it_the_sources() {
+    // S-N4: losetup /dev/loop0 /dev/sdx; kpartx -a /dev/loop0. dm-5 is
+    // stacked on loop0, which covers sdx1 and more; its mapping is not read
+    let mut fake = Fake::new();
+    fake.sys.add_loop("loop0", (7, 0), 4096, "/dev/sdx");
+    fake.sys.add_virtual("dm-5", (254, 5), 1024);
+    fake.sys.set("dm-5", "dm/name", "loop0p9");
+    fake.sys.stack("dm-5", "loop0");
+    fake.mountinfo
+        .push_str("60 22 254:5 / /mnt/kp rw - ext4 /dev/mapper/loop0p9 rw\n");
+    let part = SourceIdentity {
+        path: "/dev/sdx1".into(),
+        canonical_path: "/dev/sdx1".into(),
+        kernel_name: "sdx1".into(),
+        maj_min: Some("8:17".into()),
+        kind: SourceKind::Partition,
+        parent_disks: vec!["/dev/sdx".into()],
+        ..disk_identity(64 * 512)
+    };
+    let request = fake.request(fake.raw());
+    let messages = |fake: &Fake| -> Vec<String> {
+        source_safety(fake, &request, &part)
+            .errors
+            .into_iter()
+            .map(|e| e.message)
+            .collect()
+    };
+    let errors = messages(&fake);
+    // Counted (fail closed), but not called a mount of the source
+    assert!(
+        errors.iter().any(|e| e.starts_with(
+            "/mnt/kp is mounted from /dev/mapper/loop0p9 (stacked on loop0, a loop device over /dev/sdx, which holds the source); that device may map the source"
+        )),
+        "{errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|e| e.contains("the source is mounted")),
+        "{errors:?}"
+    );
+    // A mount of the source itself is still called one, without /mnt/kp
+    fake.mountinfo
+        .push_str("61 22 8:17 / /mnt/ev rw - ext4 /dev/sdx1 rw\n");
+    let errors = messages(&fake);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.starts_with("the source is mounted (/mnt/ev);")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.starts_with("/mnt/kp is mounted from")),
+        "{errors:?}"
+    );
+}
+
 #[tokio::test]
 async fn destination_refusals() {
     let mut fake = Fake::new();

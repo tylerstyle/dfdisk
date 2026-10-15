@@ -513,12 +513,15 @@ impl ForensicInfoReport {
                     && self.bytes_acquired >= self.expected_bytes
                     && self.read_errors.unread_bytes() == 0
                 {
-                    // N1: everything was acquired, but the run ended with a
-                    // problem (ddrescue's exit status, a failed fsync, ...)
+                    // N1: the image has the full length, but the run ended
+                    // with a problem (ddrescue's exit status, a failed fsync,
+                    // read errors whose positions are unknown, ...). T-N3:
+                    // that is all that is known; whether every byte of the
+                    // source is in it is not (the problem may be the cause)
                     let covered = if self.read_errors.substituted_bytes() > 0 {
-                        "The image covers the whole source (its unreadable sectors are zeros in it)"
+                        "The image has the full length of the source (its unreadable sectors are zeros in it)"
                     } else {
-                        "Every byte of the source is in the image"
+                        "The image has the full length of the source"
                     };
                     format!(
                         "{covered}, but the run did not end cleanly (the reason follows), so it is not counted as complete."
@@ -1841,12 +1844,12 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Incomplete);
         let e = r.explanation();
         assert!(!e.contains(MAP_TEXT), "{e}");
-        // N1: every byte is in the image; the run is incomplete only because
+        // N1: the image has the full length; the run is incomplete only because
         // it did not end cleanly, and the image is not called partial
         assert_eq!(r.bytes_acquired, r.expected_bytes);
         assert_eq!(
             e,
-            "Every byte of the source is in the image, but the run did not end cleanly (the reason follows), so it is not counted as complete."
+            "The image has the full length of the source, but the run did not end cleanly (the reason follows), so it is not counted as complete."
         );
         // ... with bad sectors: the image covers the source, with zeros
         let r = rescue_report(|r| {
@@ -1856,7 +1859,7 @@ mod tests {
         assert_eq!(r.outcome, Outcome::Incomplete);
         let e = r.explanation();
         assert!(
-            e.starts_with("The image covers the whole source (its unreadable sectors are zeros in it), but the run did not end cleanly"),
+            e.starts_with("The image has the full length of the source (its unreadable sectors are zeros in it), but the run did not end cleanly"),
             "{e}"
         );
         assert!(!e.contains("partial"), "{e}");
@@ -1866,8 +1869,24 @@ mod tests {
         r.apply_classification();
         assert_eq!(r.outcome, Outcome::Incomplete);
         assert!(r.explanation().starts_with(
-            "Every byte of the source is in the image, but the run did not end cleanly"
+            "The image has the full length of the source, but the run did not end cleanly"
         ));
+        // T-N3: E01 read errors whose positions are unknown leave the
+        // read-error table empty; the image has the full length, but that
+        // every byte of the source is in it is not known
+        let mut r = verified();
+        r.stop_reason = Some(
+            "ewfacquire reported read errors whose positions could not be determined from ewfacquire's output or from the image; the read-error table may be incomplete".into(),
+        );
+        r.apply_classification();
+        assert_eq!(r.outcome, Outcome::Incomplete);
+        let e = r.explanation();
+        assert!(
+            e.starts_with("The image has the full length of the source, but"),
+            "{e}"
+        );
+        assert!(!e.contains("Every byte"), "{e}");
+        assert!(!e.contains("partial"), "{e}");
         // A stop before the end: partial
         r.bytes_acquired = 512;
         r.apply_classification();

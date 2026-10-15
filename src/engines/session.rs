@@ -570,14 +570,18 @@ fn source_safety(
         }
     }
 
+    let mut maybe_mounted = Vec::new();
     let write_protection = match host.mountinfo() {
-        Ok(mountinfo) => writeprotect::capture_in(
-            &sys,
-            identity,
-            &mountinfo,
-            presence.clone(),
-            config.write_protect,
-        ),
+        Ok(mountinfo) => {
+            maybe_mounted = writeprotect::maybe_source_mounts(&sys, identity, &mountinfo);
+            writeprotect::capture_in(
+                &sys,
+                identity,
+                &mountinfo,
+                presence.clone(),
+                config.write_protect,
+            )
+        }
         Err(e) => {
             errors.push(AcquisitionError::refused(format!(
                 "cannot read the mount table to check the source for mounts: {e}"
@@ -589,10 +593,25 @@ fn source_safety(
             }
         }
     };
-    if !write_protection.mounts_before.is_empty() {
+    // S-N4: mounts of a device that may or may not map the source count
+    // (fail closed), but are not called mounts of the source
+    let mounted: Vec<&str> = write_protection
+        .mounts_before
+        .iter()
+        .filter(|m| !maybe_mounted.iter().any(|(_, points)| points.contains(m)))
+        .map(String::as_str)
+        .collect();
+    if !mounted.is_empty() {
         errors.push(AcquisitionError::refused(format!(
             "the source is mounted ({}); unmount it first (dfdisk unmount, audited). dfdisk never acquires a mounted source",
-            write_protection.mounts_before.join(", ")
+            mounted.join(", ")
+        )));
+    }
+    for (node, points) in &maybe_mounted {
+        errors.push(AcquisitionError::refused(format!(
+            "{} is mounted from {}; that device may map the source (dfdisk does not read its mapping), so dfdisk does not acquire while it is mounted. Unmount it yourself (dfdisk unmount cannot tell whether it belongs to the source) and retry",
+            points.join(", "),
+            node.describe()
         )));
     }
     // A holder keeps the source open and may write to it: dm, LVM, md,

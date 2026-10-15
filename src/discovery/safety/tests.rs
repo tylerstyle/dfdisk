@@ -504,3 +504,51 @@ fn a_loop_over_the_source_is_a_holder_and_its_mounts_are_unmounted() {
         res.notes
     );
 }
+
+/// sdb with `losetup /dev/loop0 /dev/sdb; kpartx -a /dev/loop0`: dm-5
+/// (loop0p1) maps sdb1's range, dm-6 (loop0p2) sdb2's; dfdisk does not read
+/// their mapping tables. /mnt/kp1 is mounted from dm-5.
+fn kpartx_over_a_whole_disk_loop() -> Fake {
+    let f = Fake::new();
+    f.sys.add_loop("loop0", (7, 0), 10_000, "/dev/sdb");
+    f.sys.add_virtual("dm-5", (254, 5), 4000);
+    f.sys.set("dm-5", "dm/name", "loop0p1");
+    f.sys.stack("dm-5", "loop0");
+    f.sys.add_virtual("dm-6", (254, 6), 3000);
+    f.sys.set("dm-6", "dm/name", "loop0p2");
+    f.sys.stack("dm-6", "loop0");
+    *f.mountinfo.borrow_mut() = "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+        60 22 254:5 / /mnt/kp1 rw - ext4 /dev/mapper/loop0p1 rw\n"
+        .into();
+    f
+}
+
+#[test]
+fn a_mount_that_may_not_be_the_sources_is_refused_not_unmounted() {
+    // S-N4: unmounting sdb2 unmounted /mnt/kp1, sdb1's filesystem
+    let mut f = kpartx_over_a_whole_disk_loop();
+    f.node = Some((8, 18));
+    let mut part = id("sdb2", "8:18", SourceKind::Partition);
+    part.parent_disks = vec!["/dev/sdb".into()];
+    let e = unmount_source_tree_with(&f, &part).unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Refused);
+    assert!(
+        e.message.contains(
+            "cannot tell whether /mnt/kp1 belongs to /dev/sdb2: it is mounted from /dev/mapper/loop0p1 (stacked on loop0, a loop device over /dev/sdb, which holds the source)"
+        ),
+        "{e}"
+    );
+    assert!(e.message.contains("unmount it yourself"), "{e}");
+    assert!(f.calls.borrow().is_empty(), "{:?}", f.calls.borrow());
+    assert!(f.mountinfo.borrow().contains("/mnt/kp1"));
+    let recs = f.records();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(recs[0]["outcome"], "refused");
+
+    // The whole disk: everything on loop0 is sdb's data, dm-5 included
+    let mut f = kpartx_over_a_whole_disk_loop();
+    f.node = Some((8, 16));
+    let res = unmount_source_tree_with(&f, &sdb()).unwrap();
+    assert_eq!(res.unmounted, ["/mnt/kp1"]);
+    assert!(!f.mountinfo.borrow().contains("/mnt/kp1"));
+}

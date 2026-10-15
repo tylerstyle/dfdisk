@@ -475,14 +475,22 @@ pub fn unmount_source_tree_with(
 
     // 2. The tree, its mounts, system mounts, foreign mounts on top, swap
     let tree = SourceTree::from_sysfs(&sys, &tree_identity);
-    let records = match host.mountinfo() {
-        Ok(m) => parse_mountinfo_records(&m),
-        Err(e) => {
-            refusals.push(format!("cannot read the mount table: {e}"));
-            Vec::new()
-        }
-    };
+    let mountinfo = host.mountinfo().unwrap_or_else(|e| {
+        refusals.push(format!("cannot read the mount table: {e}"));
+        String::new()
+    });
+    let records = parse_mountinfo_records(&mountinfo);
     let ours = tree.mounts(&records);
+    // S-N4: a device that may or may not map the source; dfdisk does not
+    // unmount what it cannot show to be the source's
+    for (node, points) in writeprotect::maybe_source_mounts(&sys, &tree_identity, &mountinfo) {
+        refusals.push(format!(
+            "cannot tell whether {} belongs to {}: it is mounted from {}, and dfdisk does not read that device's mapping; unmount it yourself",
+            points.join(", "),
+            identity.path,
+            node.describe()
+        ));
+    }
     let mounts_before: Vec<String> = ours.iter().map(|m| m.mount_point.clone()).collect();
     for m in &ours {
         if is_system_mount(&m.mount_point) {

@@ -903,9 +903,15 @@ fn section(title: &str) -> Line<'static> {
     Line::from(Span::styled(title.to_string(), bold(Color::Cyan)))
 }
 
+/// Width of the label column of the confirmation sheets: the longest
+/// label ("Authority / Agency", "Second Source Read") and two spaces.
+const SHEET_LABEL_WIDTH: usize = 20;
+
 fn sheet_row(label: &str, value: &str, style: Style) -> Line<'static> {
+    // I-R3-1: at least one space between label and value, whatever the label
+    let pad = SHEET_LABEL_WIDTH.max(str_width(label) + 1) - str_width(label);
     Line::from(vec![
-        Span::styled(format!("  {:<14}", label), dim()),
+        Span::styled(format!("  {label}{}", " ".repeat(pad)), dim()),
         Span::styled(sanitize_line(value), style),
     ])
 }

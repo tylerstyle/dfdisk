@@ -72,7 +72,8 @@ and when something was not done the report says so.
   internal error (a panic) is shown as FAILED (INTERNAL ERROR), exit code 4.
   After an internal error of the UI itself, a job still running is aborted
   and writes its report and audit record, and an unmount still running ends,
-  before dfdisk exits.
+  before dfdisk exits (within 6 minutes; otherwise dfdisk says so and exits
+  without them).
 - **TUI keys.** Esc never aborts; aborting needs a y/N confirmation; Tab and
   Shift-Tab always move between fields and path completion has its own key.
 - **Packaging.** The .deb depends on `$auto, ewf-tools, gddrescue, smartmontools,
@@ -142,9 +143,11 @@ and when something was not done the report says so.
   also after an interrupted session was resumed; sectors there that held data
   (left by a session killed before ddrescue saved its map, also sectors a retry
   pass read) are first copied to `<base>.zeroed-N.bin`, with their image
-  offsets and SHA-256 in `<base>.zeroed-N.tsv` (N: the rescue session; created
-  new and fsynced before the first zero, never overwritten), and both are
-  listed with the report's files. The verdict explanation
+  offsets and SHA-256 in `<base>.zeroed-N.tsv` (N: the rescue session, or one
+  past the highest such file a session that ended without its report left;
+  created new and fsynced before the first zero, never overwritten), and both
+  are listed with the report's files. When the zeros cannot be written, those
+  areas count as not acquired (`unread`), not as zeros. The verdict explanation
   follows what happened: a rescue is INCOMPLETE "because the map lists
   unfinished areas" only when it does and nothing else stopped it, a VERIFIED
   rescue names the second read of the source it was compared with, and a second
@@ -155,10 +158,10 @@ and when something was not done the report says so.
   the report's HASHES section says that the re-read failed and why; a rescue
   image without digests is not compared with a second read ("nothing to compare
   with"; the source is not read again), and "the second source read failed"
-  names only a second read that failed itself. An INCOMPLETE run that has every
-  byte of the source in its image but did not end cleanly (for example ddrescue
-  ending with an error status after a complete run) no longer calls its image
-  partial.
+  names only a second read that failed itself. The explanation of an INCOMPLETE
+  run whose image has the full length of the source but that did not end
+  cleanly (for example ddrescue ending with an error status after a complete
+  run) says so and does not call the image partial.
 - **H5** Write protection was not checked or recorded: the read-only state of
   the source and its partitions, holders, mounts and the exclusive open are
   recorded; BLKROSET is set by default on the source, its partitions, the nodes
@@ -170,7 +173,11 @@ and when something was not done the report says so.
   the partition under a LUKS source) whose byte range (`loop/offset`,
   `loop/sizelimit`) includes part of the source, with those of its partitions
   that do (`losetup -P /dev/sdb; mount /dev/loop0p2` for a source `sdb2`); a
-  loop or md source's own partitions belong to it.
+  loop or md source's own partitions belong to it. A dm or md device stacked
+  on such a loop device that covers more than the source (kpartx over
+  `losetup /dev/sdb` for `sdb2`) may or may not map the source (its mapping
+  is not read): its mounts refuse the acquisition without being called mounts
+  of the source, and `dfdisk unmount` refuses to unmount them.
 - **H6** Audit trail gaps: (a) the export is per boot and never replaces another
   boot's chain; (b) refusals are recognised by type, not by message text;
   (c) the "finished" record always carries the outcome, the digests known and
