@@ -631,6 +631,15 @@ pub struct ConvertArgs {
     #[arg(long, value_name = "INFO_JSON")]
     pub report: Option<PathBuf>,
 
+    /// Accept a destination on tmpfs/ramfs (lost at power-off)
+    #[arg(long)]
+    pub allow_tmpfs: bool,
+
+    /// E01 target: accept a destination with less free space than the source
+    /// image (the E01 fits only if compression saves the difference)
+    #[arg(long)]
+    pub allow_low_space: bool,
+
     /// Print the conversion report as JSON on stdout
     #[arg(long)]
     pub json: bool,

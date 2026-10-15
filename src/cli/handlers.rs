@@ -460,16 +460,19 @@ pub fn conversion_request(args: &ConvertArgs) -> Result<ConversionRequest, Acqui
             )));
         }
     }
+    if target == ConversionTarget::Raw && args.allow_low_space {
+        return Err(AcquisitionError::usage(
+            "--allow-low-space applies to an E01 target only (a RAW output needs the full size)",
+        ));
+    }
     Ok(ConversionRequest {
-        source: args.source.clone(),
-        target,
-        output_dir,
         case,
         compression: compression_of(args.compression),
         split_size: split_of(args.split),
-        notes: Vec::new(),
         source_report: args.report.clone().or_else(|| report_next_to(&args.source)),
-        ..Default::default()
+        allow_tmpfs: args.allow_tmpfs,
+        allow_low_space: args.allow_low_space,
+        ..ConversionRequest::new(args.source.clone(), target, output_dir)
     })
 }
 
@@ -630,6 +633,22 @@ mod tests {
         assert_eq!(e.exit_code(), 2);
         let e = conversion_request(&parse(&["--to", "e01", "--report", "/nonexistent.json"]))
             .unwrap_err();
+        assert_eq!(e.exit_code(), 2);
+        // The destination allowances reach the converter
+        let req = conversion_request(&parse(&[
+            "--to",
+            "e01",
+            "--allow-tmpfs",
+            "--allow-low-space",
+        ]))
+        .unwrap();
+        assert!(req.allow_tmpfs && req.allow_low_space);
+        assert!(
+            !conversion_request(&parse(&["--to", "e01"]))
+                .unwrap()
+                .allow_tmpfs
+        );
+        let e = conversion_request(&parse(&["--to", "raw", "--allow-low-space"])).unwrap_err();
         assert_eq!(e.exit_code(), 2);
     }
 }
