@@ -547,6 +547,18 @@ fn modals_are_sized_to_content_and_fit_80x24() {
     assert!(screen.contains("Abort now? [y/N]"), "{screen}");
     let (x, _) = find(&buf, "Abort now?").unwrap();
     assert!(x > 10, "centred, not full width");
+
+    // Quit while an unmount runs: it is not interrupted, dfdisk waits
+    let mut app = App::with_devices(devices());
+    app.unmounting = Some("/dev/sdx".into());
+    app.modal = Some(Modal::Quit);
+    let screen = text(&draw(&mut app, 80, 24));
+    assert!(
+        screen.contains("An audited unmount of /dev/sdx is running"),
+        "{screen}"
+    );
+    assert!(screen.contains("Quit then? [y/N]"), "{screen}");
+    assert!(!screen.contains("Abort and quit"), "{screen}");
 }
 
 #[test]

@@ -576,8 +576,12 @@ pub struct App {
     pub should_quit: bool,
     /// SIGHUP: the terminal is gone; nothing is drawn any more
     pub headless: bool,
-    /// Quit as soon as the running job has its result (signal, Ctrl+C)
+    /// Quit as soon as the running job has its result and a running unmount
+    /// has finished and been recorded (signal, Ctrl+C, Q)
     pub quit_after_job: bool,
+    /// What happened in the background after the examiner asked to quit
+    /// (an unmount's outcome), for the terminal once the TUI closed
+    pub exit_notes: Vec<String>,
     pub ticks: u64,
 
     // Devices
@@ -697,6 +701,7 @@ impl App {
             should_quit: false,
             headless: false,
             quit_after_job: false,
+            exit_notes: Vec::new(),
             ticks: 0,
             devices: Vec::new(),
             rows: Vec::new(),
@@ -853,6 +858,57 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Work that must finish before dfdisk may exit: a job (its report) or
+    /// an audited unmount (its audit record and the check that nothing stayed
+    /// mounted). Quitting waits for it; nothing else starts meanwhile.
+    pub fn busy(&self) -> bool {
+        self.job.is_some() || self.unmounting.is_some()
+    }
+
+    /// Quit now if a quit was requested and nothing is left to finish.
+    fn quit_when_idle(&mut self) {
+        if self.quit_after_job && !self.busy() {
+            self.should_quit = true;
+        }
+    }
+
+    /// Quit requested (Q, Ctrl+C answered, a signal): at once when idle,
+    /// else once the running work has finished.
+    fn request_quit(&mut self) {
+        self.quit_after_job = true;
+        if let Some(p) = self.unmounting.clone() {
+            self.notify(
+                Level::Warning,
+                format!(
+                    "Quitting once the unmount of {p} has finished and been recorded in the audit log."
+                ),
+            );
+        }
+        self.quit_when_idle();
+    }
+
+    /// Nothing may start while a job runs (it would share the abort flags)
+    /// or an unmount is pending (it changes the sources): tell why.
+    fn start_blocked(&mut self) -> bool {
+        let why = if let Some(job) = &self.job {
+            let article = if job.kind == JobKind::Acquisition {
+                "An"
+            } else {
+                "A"
+            };
+            format!(
+                "{article} {} is running; wait for its result before starting another.",
+                job.kind.label()
+            )
+        } else if let Some(p) = &self.unmounting {
+            format!("The unmount of {p} is still running; wait for its result before starting.")
+        } else {
+            return false;
+        };
+        self.notify(Level::Error, why);
+        true
     }
 
     /// Something runs in the background (spinner in the header).
@@ -1065,9 +1121,24 @@ impl App {
     /// the report is written); after an abort, offer the immediate stop.
     fn ctrl_c(&mut self) {
         match &self.job {
-            None => self.should_quit = true,
+            None => self.ask_quit(),
             Some(job) if job.abort_requested && !job.force_requested => {
                 self.modal = Some(Modal::Force)
+            }
+            Some(_) => self.modal = Some(Modal::Quit),
+        }
+    }
+
+    /// Quit without a running job: at once, or (an unmount runs) after a
+    /// y/N, once the unmount has finished and been recorded.
+    fn ask_quit(&mut self) {
+        match &self.unmounting {
+            None => self.should_quit = true,
+            Some(p) if self.quit_after_job => {
+                let text = format!(
+                    "Still waiting for the unmount of {p} to finish and be recorded; dfdisk quits then."
+                );
+                self.notify(Level::Info, text);
             }
             Some(_) => self.modal = Some(Modal::Quit),
         }
@@ -1112,10 +1183,8 @@ impl App {
                 if yes {
                     if self.job.is_some() {
                         self.request_abort();
-                        self.quit_after_job = true;
-                    } else {
-                        self.should_quit = true;
                     }
+                    self.request_quit();
                 }
             }
             Modal::Resume { map } => {
@@ -1181,7 +1250,7 @@ impl App {
                     self.notify(Level::Info, "No result yet in this session.");
                 }
             }
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.ask_quit(),
             _ => {}
         }
     }
@@ -1253,6 +1322,13 @@ impl App {
         let Some(row) = self.current_row().cloned() else {
             return;
         };
+        if let Some(p) = self.unmounting.clone() {
+            self.notify(
+                Level::Info,
+                format!("The unmount of {p} is still running; wait for its result."),
+            );
+            return;
+        }
         if !row.has(Badge::Mounted) {
             self.notify(
                 Level::Info,
@@ -1438,6 +1514,9 @@ impl App {
     /// dry run of the session (`check_with`) in the background.
     pub fn begin_acquisition(&mut self) {
         self.completion = None;
+        if self.start_blocked() {
+            return;
+        }
         let Some(source) = self.source.clone() else {
             self.notify(Level::Error, "Select a source in the device list first.");
             return;
@@ -1638,6 +1717,9 @@ impl App {
             self.notify(Level::Info, "The pre-flight checks are still running.");
             return;
         }
+        if self.start_blocked() {
+            return;
+        }
         if matches!(c.subject, ConfirmSubject::Acquisition { .. }) {
             if let Some(reason) = self.source_invalid.clone() {
                 self.notify(Level::Error, reason);
@@ -1784,9 +1866,7 @@ impl App {
         self.result_acknowledged = false;
         self.modal = None;
         self.screen = Screen::Result;
-        if self.quit_after_job {
-            self.should_quit = true;
-        }
+        self.quit_when_idle();
     }
 
     fn key_result(&mut self, key: KeyEvent) {
@@ -2013,6 +2093,9 @@ impl App {
     /// Start pressed in the converter: validate, then the confirmation sheet.
     pub fn begin_conversion(&mut self) {
         self.completion = None;
+        if self.start_blocked() {
+            return;
+        }
         let source = self.conv.source.trim().to_string();
         if source.is_empty() {
             self.conv.field = ConvField::Source;
@@ -2211,6 +2294,9 @@ impl App {
     /// audit record; no confirmation sheet: nothing is acquired).
     pub fn begin_verification(&mut self) {
         self.completion = None;
+        if self.start_blocked() {
+            return;
+        }
         let image = self.verify.image.trim().to_string();
         if image.is_empty() {
             self.verify.field = Some(VerField::Image);
@@ -2431,11 +2517,7 @@ impl App {
         match kind {
             SignalKind::Hangup => {
                 self.headless = true;
-                if self.job.is_some() {
-                    self.quit_after_job = true;
-                } else {
-                    self.should_quit = true;
-                }
+                self.request_quit();
             }
             SignalKind::Interrupt | SignalKind::Terminate | SignalKind::Quit => {
                 if let Some(job) = &mut self.job {
@@ -2443,11 +2525,11 @@ impl App {
                     if action == SignalAction::Force {
                         job.force_requested = true;
                     }
-                    self.quit_after_job = true;
                     self.notify(Level::Warning, action.message(kind));
-                } else {
-                    self.should_quit = true;
                 }
+                // An unmount is never cut short: dfdisk quits once it has
+                // finished and been recorded
+                self.request_quit();
             }
         }
     }
@@ -2468,22 +2550,22 @@ impl App {
     /// One line for the terminal after the TUI closed, when a result was not
     /// acknowledged on screen.
     pub fn exit_summary(&self) -> Option<String> {
-        if self.result_acknowledged {
-            return None;
+        let mut lines = self.exit_notes.clone();
+        if let Some(r) = self.result.as_ref().filter(|_| !self.result_acknowledged) {
+            let report = r
+                .files()
+                .into_iter()
+                .next()
+                .map(|(_, p)| format!("; report: {p}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "dfdisk: {} {}{}",
+                r.kind().label(),
+                r.title(),
+                report
+            ));
         }
-        let r = self.result.as_ref()?;
-        let report = r
-            .files()
-            .into_iter()
-            .next()
-            .map(|(_, p)| format!("; report: {p}"))
-            .unwrap_or_default();
-        Some(format!(
-            "dfdisk: {} {}{}",
-            r.kind().label(),
-            r.title(),
-            report
-        ))
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
     // ------------------------------------------------------------------
@@ -2639,16 +2721,22 @@ impl App {
                 self.unmounting = None;
                 match result {
                     Ok(res) => {
-                        self.notify(
-                            Level::Info,
-                            if res.unmounted.is_empty() {
-                                format!("Nothing was mounted on {path}.")
-                            } else if res.audit_hash.is_some() {
-                                format!("Unmounted (audited): {}", res.unmounted.join(", "))
-                            } else {
-                                format!("Unmounted: {}", res.unmounted.join(", "))
-                            },
-                        );
+                        let text = if res.unmounted.is_empty() {
+                            format!("Nothing was mounted on {path}.")
+                        } else if res.audit_hash.is_some() {
+                            format!("Unmounted (audited): {}", res.unmounted.join(", "))
+                        } else {
+                            format!("Unmounted: {}", res.unmounted.join(", "))
+                        };
+                        if self.quit_after_job {
+                            self.exit_notes.push(format!("dfdisk: {text}"));
+                            if let Some(e) = &res.audit_error {
+                                self.exit_notes.push(format!(
+                                    "dfdisk: the unmount was NOT recorded in the audit log: {e}"
+                                ));
+                            }
+                        }
+                        self.notify(Level::Info, text);
                         for note in &res.notes {
                             // The audit failure is among the notes: an error
                             let level = if res.audit_error.is_some()
@@ -2662,18 +2750,37 @@ impl App {
                         }
                         self.unmounted = res.unmounted;
                         self.unmounted_key = Some(key.clone());
+                        // On to the case setup only where the examiner asked
+                        // for it: still in the explorer, nothing running
                         if then_setup {
-                            if let Some(row) = self.rows.iter().find(|r| r.key == key).cloned() {
-                                self.pin_source(row);
+                            let row = self.rows.iter().find(|r| r.key == key).cloned();
+                            match row {
+                                Some(row)
+                                    if self.job.is_none()
+                                        && self.modal.is_none()
+                                        && !self.quit_after_job
+                                        && self.screen == Screen::Explorer =>
+                                {
+                                    self.pin_source(row)
+                                }
+                                _ => self.notify(
+                                    Level::Info,
+                                    format!("Select {path} again to set up its acquisition."),
+                                ),
                             }
                         }
                         self.start_scan(false);
                     }
-                    Err(e) => self.notify(
-                        Level::Error,
-                        format!("Unmount of {path} {}: {}", e.kind.label().to_lowercase(), e),
-                    ),
+                    Err(e) => {
+                        let text =
+                            format!("Unmount of {path} {}: {}", e.kind.label().to_lowercase(), e);
+                        if self.quit_after_job {
+                            self.exit_notes.push(format!("dfdisk: {text}"));
+                        }
+                        self.notify(Level::Error, text);
+                    }
                 }
+                self.quit_when_idle();
             }
             BgEvent::Prepared {
                 token,

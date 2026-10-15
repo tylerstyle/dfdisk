@@ -2033,6 +2033,20 @@ fn render_modal(frame: &mut Frame, app: &App, area: Rect) {
                 "Kill now? [y/N]".into(),
             ],
         ),
+        Modal::Quit if app.job.is_none() => (
+            " Quit? ".into(),
+            Color::Magenta,
+            vec![
+                format!(
+                    "An audited unmount of {} is running.",
+                    app.unmounting.as_deref().unwrap_or("the source")
+                ),
+                "It is not interrupted: dfdisk quits once it has finished, checked that nothing".into(),
+                "stayed mounted and written its audit record.".into(),
+                String::new(),
+                "Quit then? [y/N]".into(),
+            ],
+        ),
         Modal::Quit => (
             " Quit? ".into(),
             Color::Magenta,

@@ -16,7 +16,7 @@ use dfdisk::models::info_report::{ForensicInfoReport, HashResults};
 use dfdisk::models::outcome::{Outcome, VerificationResult};
 use dfdisk::models::telemetry::ProgressTelemetry;
 use dfdisk::signals::{SignalAction, SignalKind, StopFlags};
-use dfdisk::tui::app::{App, Level, Modal, RunResult, Screen};
+use dfdisk::tui::app::{App, JobKind, Level, Modal, RunResult, Screen};
 use dfdisk::tui::backend::{ProgressTx, TuiBackend};
 use dfdisk::tui::form::{ConvField, Field};
 use futures::future::BoxFuture;
@@ -176,6 +176,10 @@ struct Script {
     acquire: Acquire,
     destination: Result<DestinationFacts, String>,
     unmounts: Vec<String>,
+    /// How long umount takes (dirty data being flushed)
+    unmount_delay: Duration,
+    /// Unmounts that ran to the end (their audit record written)
+    unmounts_finished: Vec<String>,
     conversions: Vec<ConversionRequest>,
     audit_log: Option<PathBuf>,
 }
@@ -198,6 +202,8 @@ impl Fake {
                 ..Default::default()
             }),
             unmounts: Vec::new(),
+            unmount_delay: Duration::ZERO,
+            unmounts_finished: Vec::new(),
             conversions: Vec::new(),
             audit_log: None,
         })))
@@ -222,7 +228,13 @@ impl TuiBackend for Fake {
     }
 
     fn unmount(&self, device: &BlockDevice) -> Result<UnmountResult, AcquisitionError> {
-        self.s().unmounts.push(device.path.clone());
+        let delay = {
+            let mut s = self.s();
+            s.unmounts.push(device.path.clone());
+            s.unmount_delay
+        };
+        std::thread::sleep(delay);
+        self.s().unmounts_finished.push(device.path.clone());
         Ok(UnmountResult {
             unmounted: device.mountpoints.clone(),
             holders: Vec::new(),
@@ -868,6 +880,120 @@ async fn refused_sources_and_audited_unmount() {
     to_confirm(&mut app).await;
     let req = fake.s().check_requests[0].clone();
     assert_eq!(req.unmounted_by_dfdisk, vec!["/media/stick".to_string()]);
+}
+
+#[tokio::test]
+async fn quitting_waits_for_a_running_unmount() {
+    for how in ["q", "ctrl-c", "sigterm", "sigquit", "sighup"] {
+        let fake = Fake::new(vec![mounted(), evidence()]);
+        fake.s().unmount_delay = Duration::from_millis(300);
+        let mut app = app_with(&fake);
+        select(&mut app, "sdy");
+        app.handle_key(key(KeyCode::Char('u')));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.unmounting.is_some(), "{how}: unmount in flight");
+        match how {
+            "q" | "ctrl-c" => {
+                app.handle_key(if how == "q" {
+                    key(KeyCode::Char('q'))
+                } else {
+                    ctrl('c')
+                });
+                assert!(matches!(app.modal, Some(Modal::Quit)), "{how}: asks");
+                assert!(!app.should_quit, "{how}");
+                app.handle_key(key(KeyCode::Char('y')));
+            }
+            other => {
+                let kind = match other {
+                    "sigterm" => SignalKind::Terminate,
+                    "sigquit" => SignalKind::Quit,
+                    _ => SignalKind::Hangup,
+                };
+                let action = app.controller.handle(kind);
+                app.on_signal(kind, action);
+            }
+        }
+        assert!(
+            !app.should_quit,
+            "{how}: quit while umount was still running"
+        );
+        assert!(fake.s().unmounts_finished.is_empty());
+        pump(&mut app, "quit after the unmount", |a| a.should_quit).await;
+        assert_eq!(fake.s().unmounts_finished, ["/dev/sdy"], "{how}");
+        // What happened is said on the terminal after the TUI closed
+        let summary = app.exit_summary().unwrap_or_default();
+        assert!(
+            summary.contains("Unmounted (audited): /media/stick"),
+            "{how}: {summary}"
+        );
+    }
+
+    // N keeps dfdisk running after the unmount
+    let fake = Fake::new(vec![mounted(), evidence()]);
+    fake.s().unmount_delay = Duration::from_millis(100);
+    let mut app = app_with(&fake);
+    select(&mut app, "sdy");
+    app.handle_key(key(KeyCode::Char('u')));
+    app.handle_key(key(KeyCode::Char('y')));
+    app.handle_key(key(KeyCode::Char('q')));
+    app.handle_key(key(KeyCode::Char('n')));
+    pump(&mut app, "unmount", |a| a.unmounting.is_none()).await;
+    assert!(!app.should_quit);
+    // Idle again: Q quits at once
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit);
+}
+
+#[tokio::test]
+async fn nothing_starts_while_an_unmount_runs_and_its_result_keeps_the_screen() {
+    let fake = Fake::new(vec![mounted(), evidence()]);
+    fake.s().unmount_delay = Duration::from_millis(300);
+    fake.s().acquire = Acquire::UntilAborted;
+    let mut app = app_with(&fake);
+    // Enter on the mounted stick: unmount, then its case setup
+    select(&mut app, "sdy");
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(app.unmounting.is_some());
+    // Meanwhile the examiner sets up the evidence disk
+    to_case_setup(&mut app, "/mnt/case");
+    app.handle_key(key(KeyCode::F(5)));
+    assert_eq!(app.screen, Screen::CaseSetup, "no sheet while unmounting");
+    assert!(app
+        .notices
+        .iter()
+        .any(|n| n.level == Level::Error && n.text.contains("still running")));
+    // A second unmount waits too
+    app.handle_key(key(KeyCode::Esc));
+    select(&mut app, "sdy");
+    app.handle_key(key(KeyCode::Char('u')));
+    assert!(app.modal.is_none());
+    select(&mut app, "sdx");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen, Screen::CaseSetup);
+    pump(&mut app, "unmount done", |a| a.unmounting.is_none()).await;
+    // The unmount's "then the case setup" does not take the examiner's screen
+    // or source away (it switched to the stick's case setup)
+    assert_eq!(app.screen, Screen::CaseSetup);
+    assert_eq!(app.source.as_ref().unwrap().key.kernel_name, "sdx");
+    assert_eq!(fake.s().unmounts, ["/dev/sdy"]);
+
+    // Now the acquisition starts; while it runs nothing else does
+    to_confirm(&mut app).await;
+    typ(&mut app, "kd7y");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen, Screen::Running);
+    app.verify.image = "/tmp/x.raw".into();
+    app.begin_verification();
+    assert_eq!(app.job.as_ref().unwrap().kind, JobKind::Acquisition);
+    assert!(app
+        .notices
+        .iter()
+        .any(|n| n.text.contains("An acquisition is running")));
+    app.handle_key(key(KeyCode::Char('a')));
+    app.handle_key(key(KeyCode::Char('y')));
+    pump(&mut app, "result", |a| a.screen == Screen::Result).await;
+    assert_eq!(fake.s().acquire_requests.len(), 1);
 }
 
 #[tokio::test]

@@ -95,7 +95,7 @@ async fn run_tui_inner(
             // A drawing error on a terminal that just went away must not end a
             // running acquisition: its report is written first
             if let Err(e) = terminal.draw(|frame| ui::render(frame, &mut app)) {
-                if app.job.is_none() {
+                if !app.busy() {
                     return Err(e.into());
                 }
                 app.headless = true;
@@ -110,7 +110,7 @@ async fn run_tui_inner(
                     // The terminal input is gone (hang-up): finish headless
                     events_open = false;
                     app.headless = true;
-                    if app.job.is_some() {
+                    if app.busy() {
                         app.quit_after_job = true;
                     } else {
                         app.should_quit = true;
