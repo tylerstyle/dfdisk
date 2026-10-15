@@ -339,3 +339,26 @@ fn bad_lsblk_output_is_an_error() {
     inp.lsblk_json = "{}".into();
     assert!(scan(&inp).unwrap_err().contains("No blockdevices"));
 }
+
+#[test]
+fn a_loop_device_over_a_disk_is_its_holder_and_its_mount_counts() {
+    // losetup /dev/sdc; mount /dev/loop0 /mnt/l: lsblk lists loop0 on its
+    // own, sysfs has no holder link; the disk is in use and mounted
+    let f = host();
+    f.set("loop0", "loop/backing_file", "/dev/sdc");
+    let mut inp = input(&f);
+    inp.mountinfo = Ok(format!(
+        "{MOUNTINFO}60 22 7:0 / /mnt/l rw,relatime - ext4 /dev/loop0 rw\n"
+    ));
+    let scan = scan(&inp).unwrap();
+    let sources = scan.sources();
+    let sdc = source(&sources, "/dev/sdc");
+    assert_eq!(sdc.holders, ["loop0"]);
+    assert_eq!(sdc.mountpoints, ["/mnt/l"]);
+    assert_eq!(sdc.safety, DeviceSafety::Mounted(vec!["/mnt/l".into()]));
+    let badges = badges(sdc, None);
+    assert!(
+        badges.contains(&"MOUNTED") && badges.contains(&"IN-USE"),
+        "{badges:?}"
+    );
+}

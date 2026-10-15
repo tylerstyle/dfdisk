@@ -132,33 +132,52 @@ fn disks_of(identity: &SourceIdentity) -> Vec<String> {
     }
 }
 
-/// The source node, its partitions (for a disk) and everything stacked on
-/// them, by kernel name: the nodes whose mounts (and active swap, R8) are "in
-/// the source tree".
-pub fn source_tree(sys: &SysRoot, identity: &SourceIdentity) -> BTreeSet<String> {
+/// Most nodes a tree is followed to (a guard against a looping sysfs).
+const MAX_TREE_NODES: usize = 4096;
+
+/// `root` and everything that depends on it, by kernel name: its partitions
+/// (of any device: a disk's, a loop device's, an md array's), the devices
+/// stacked on them (dm, LUKS, LVM, md), and loop devices whose backing file is
+/// one of these nodes (`losetup /dev/sdb`), each again with its partitions and
+/// holders.
+fn dependent_tree(sys: &SysRoot, root: &str) -> BTreeSet<String> {
     let mut tree = BTreeSet::new();
-    let src = identity.kernel_name.clone();
-    let mut roots = vec![src.clone()];
-    if matches!(identity.kind, SourceKind::Disk | SourceKind::Other) {
-        roots.extend(sys.partitions(&src));
+    let mut pending = vec![root.to_string()];
+    let mut loops: Option<Vec<(String, DevNum)>> = None;
+    loop {
+        while let Some(node) = pending.pop() {
+            if tree.len() >= MAX_TREE_NODES || !tree.insert(node.clone()) {
+                continue;
+            }
+            pending.extend(sys.partitions(&node));
+            pending.extend(sys.holders(&node));
+        }
+        // Loop devices over a node of the tree (listed once, when needed)
+        let loops = loops.get_or_insert_with(|| sys.loops_over_block_devices());
+        let devs: BTreeSet<DevNum> = tree.iter().filter_map(|n| sys.dev_of(n)).collect();
+        pending.extend(
+            loops
+                .iter()
+                .filter(|(l, dev)| devs.contains(dev) && !tree.contains(l))
+                .map(|(l, _)| l.clone()),
+        );
+        if pending.is_empty() {
+            return tree;
+        }
     }
-    for r in roots {
-        tree.extend(sys.holders_recursive(&r));
-        tree.insert(r);
-    }
-    tree
 }
 
-/// Every node of a disk: the disk, its partitions and their holders.
+/// The source node and everything that depends on it ([`dependent_tree`]:
+/// its own partitions whatever its kind, stacked devices, loop devices over
+/// it), by kernel name: the nodes whose mounts (and active swap, R8) are "in
+/// the source tree".
+pub fn source_tree(sys: &SysRoot, identity: &SourceIdentity) -> BTreeSet<String> {
+    dependent_tree(sys, &identity.kernel_name)
+}
+
+/// Every node of a disk: the disk and everything that depends on it.
 fn disk_tree(sys: &SysRoot, disk: &str) -> BTreeSet<String> {
-    let mut tree = BTreeSet::new();
-    let mut roots = vec![disk.to_string()];
-    roots.extend(sys.partitions(disk));
-    for r in roots {
-        tree.extend(sys.holders_recursive(&r));
-        tree.insert(r);
-    }
-    tree
+    dependent_tree(sys, disk)
 }
 
 /// Mount points (from mountinfo content) of the given nodes, matched by
@@ -268,13 +287,13 @@ pub fn capture_in(
         })
         .collect();
     let tree = source_tree(sys, identity);
-    wp.holders = tree.iter().filter(|n| *n != src).cloned().collect();
-    // Partitions of a disk source are part of its tree but not holders
-    if matches!(identity.kind, SourceKind::Disk | SourceKind::Other) {
-        let parts: BTreeSet<String> = sys.partitions(src).into_iter().collect();
-        wp.holders.retain(|h| !parts.contains(h));
-        wp.holders.sort();
-    }
+    // The source's own partitions are part of its tree but not holders
+    let parts: BTreeSet<String> = sys.partitions(src).into_iter().collect();
+    wp.holders = tree
+        .iter()
+        .filter(|n| *n != src && !parts.contains(*n))
+        .cloned()
+        .collect();
     wp.mounts_before = mounts_of(sys, &tree, mountinfo);
     wp
 }
@@ -746,6 +765,101 @@ mod tests {
         };
         assert_eq!(nodes, ["sdb2"]);
         assert_eq!(notes.len(), 1);
+    }
+
+    #[test]
+    fn loop_devices_over_the_source_are_holders_with_source_mounts() {
+        // losetup -P /dev/sdb; mount /dev/loop0p1 /mnt/loop: no sysfs holder
+        // link, no exclusive claim on sdb, but writes through loop0 reach it
+        let f = FakeSysfs::new();
+        sata_with_partitions(&f);
+        f.add_loop("loop0", (7, 0), 10_000, "/dev/sdb");
+        f.add_partition("loop0", "loop0p1", (259, 0), 1, 2048, 4000);
+        // A loop over the source's partition, and one over an unrelated file
+        f.add_loop("loop1", (7, 1), 3000, "/dev/sdb2");
+        f.add_loop("loop2", (7, 2), 100, "/srv/images/unrelated.img");
+        let mi = "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                  50 22 259:0 / /mnt/loop rw - ext4 /dev/loop0p1 rw\n";
+        let sys = f.root();
+
+        let disk = identity("sdb", SourceKind::Disk, &[]);
+        let tree = source_tree(&sys, &disk);
+        for n in ["sdb", "sdb1", "sdb2", "loop0", "loop0p1", "loop1"] {
+            assert!(tree.contains(n), "{n} not in {tree:?}");
+        }
+        assert!(!tree.contains("loop2"), "{tree:?}");
+        let wp = capture_in(
+            &sys,
+            &disk,
+            mi,
+            RegistryPresence::Absent,
+            WriteProtectPolicy::Auto,
+        );
+        assert_eq!(wp.mounts_before, ["/mnt/loop"]);
+        assert_eq!(wp.holders, ["loop0", "loop0p1", "loop1"]);
+
+        // A partition source: the loop over it is a holder; the loop over the
+        // whole disk is outside its tree, so its mount is foreign to sdb2
+        let part = identity("sdb2", SourceKind::Partition, &["/dev/sdb"]);
+        let wp = capture_in(
+            &sys,
+            &part,
+            mi,
+            RegistryPresence::Absent,
+            WriteProtectPolicy::Auto,
+        );
+        assert_eq!(wp.holders, ["loop1"]);
+        assert!(wp.mounts_before.is_empty());
+        let inputs = decision_inputs(&sys, &part, mi);
+        assert_eq!(inputs.disks[0].foreign_mounts, ["/mnt/loop"]);
+    }
+
+    #[test]
+    fn loop_and_md_sources_include_their_own_partitions() {
+        let f = FakeSysfs::new();
+        sata_with_partitions(&f);
+        f.add_loop("loop0", (7, 0), 10_000, "/srv/images/a.img");
+        f.add_partition("loop0", "loop0p1", (259, 0), 1, 2048, 4000);
+        f.add_virtual("md0", (9, 0), 3000);
+        std::fs::create_dir_all(f.path().join("devices/virtual/block/md0/md")).unwrap();
+        f.stack("md0", "sdb1");
+        f.add_partition("md0", "md0p1", (259, 1), 1, 2048, 2000);
+        let mi = "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                  50 22 259:0 / /mnt/loop rw - ext4 /dev/loop0p1 rw\n\
+                  51 22 259:1 / /mnt/md rw - ext4 /dev/md0p1 rw\n";
+        let sys = f.root();
+        for (src, kind, mount) in [
+            (
+                "loop0",
+                SourceKind::Loop {
+                    backing_file: Some("/srv/images/a.img".into()),
+                },
+                "/mnt/loop",
+            ),
+            ("md0", SourceKind::Md, "/mnt/md"),
+        ] {
+            let id = identity(src, kind, &[]);
+            let wp = capture_in(
+                &sys,
+                &id,
+                mi,
+                RegistryPresence::Absent,
+                WriteProtectPolicy::Auto,
+            );
+            assert_eq!(wp.mounts_before, [mount], "{src}");
+            // Its own partition is part of the source, not a holder
+            assert!(wp.holders.is_empty(), "{src}: {:?}", wp.holders);
+        }
+        // The disk under md0 sees md0 and its partition as holders
+        let wp = capture_in(
+            &sys,
+            &identity("sdb", SourceKind::Disk, &[]),
+            mi,
+            RegistryPresence::Absent,
+            WriteProtectPolicy::Auto,
+        );
+        assert_eq!(wp.holders, ["md0", "md0p1"]);
+        assert_eq!(wp.mounts_before, ["/mnt/md"]);
     }
 
     #[test]

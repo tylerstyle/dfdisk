@@ -141,6 +141,38 @@ impl SysRoot {
     pub fn diskseq(&self, kname: &str) -> Option<u64> {
         self.topology().diskseq(kname)
     }
+
+    /// Every block device of this tree, by kernel name (sorted).
+    pub fn block_devices(&self) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(self.class_block())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Loop devices backed by a block device, with the device number of that
+    /// device. `loop/backing_file` holds a path: `/dev/<kname>` is resolved
+    /// through this tree, any other path by its `stat` st_rdev (a regular
+    /// backing file has none and is left out).
+    pub fn loops_over_block_devices(&self) -> Vec<(String, DevNum)> {
+        self.block_devices()
+            .into_iter()
+            .filter_map(|kname| {
+                let backing = self.attr(&kname, "loop/backing_file")?;
+                let backing = backing.trim_end_matches(" (deleted)");
+                let by_name = backing
+                    .strip_prefix("/dev/")
+                    .filter(|k| self.exists(k))
+                    .and_then(|k| self.dev_of(k));
+                let dev = by_name.or_else(|| dfcore::sysfs::dev_num_of_path(Path::new(backing)))?;
+                Some((kname, dev))
+            })
+            .collect()
+    }
 }
 
 /// Trimmed text of a sysfs attribute file.
@@ -249,6 +281,20 @@ pub(crate) mod fake {
             dir
         }
 
+        /// A loop device whose backing file is `backing` (a path as the
+        /// kernel shows it).
+        pub(crate) fn add_loop(
+            &self,
+            kname: &str,
+            dev: (u32, u32),
+            sectors: u64,
+            backing: &str,
+        ) -> PathBuf {
+            let dir = self.add_virtual(kname, dev, sectors);
+            self.write(&dir, "loop/backing_file", backing);
+            dir
+        }
+
         /// Write `<class/block/kname>/<attr>`.
         pub(crate) fn set(&self, kname: &str, attr: &str, value: &str) {
             let dir = std::fs::canonicalize(self.path().join("class/block").join(kname)).unwrap();
@@ -312,5 +358,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["sda"]
         );
+    }
+
+    #[test]
+    fn loops_over_block_devices_resolve_their_backing_node() {
+        let f = FakeSysfs::new();
+        f.add_disk("pci0/ata1/host0/target0:0:0/0:0:0:0", "sdb", (8, 16), 1000);
+        f.add_partition("sdb", "sdb1", (8, 17), 1, 2048, 500);
+        f.add_loop("loop0", (7, 0), 1000, "/dev/sdb");
+        f.add_loop("loop1", (7, 1), 500, "/dev/sdb1");
+        // A regular backing file is not a block device
+        f.add_loop("loop2", (7, 2), 100, "/srv/images/does-not-exist.img");
+        f.add_virtual("loop3", (7, 3), 0); // not bound
+        let sys = f.root();
+        assert_eq!(
+            sys.loops_over_block_devices(),
+            [
+                ("loop0".to_string(), (8, 16)),
+                ("loop1".to_string(), (8, 17))
+            ]
+        );
+        assert!(sys.block_devices().contains(&"loop3".to_string()));
     }
 }

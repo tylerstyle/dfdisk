@@ -460,8 +460,9 @@ fn build_node(
     );
     let protected = registry_protection(&input.registry, &ctx.flat, &path, dev);
 
-    // Holders: devices stacked on the node or its partitions
-    let partitions: BTreeSet<String> = if in_sysfs && identity.kind == SourceKind::Disk {
+    // Holders: devices stacked on the node or its partitions, loop devices
+    // over them; the node's own partitions (of a disk, loop or md) are not
+    let partitions: BTreeSet<String> = if in_sysfs {
         input
             .sys
             .partitions(&identity.kernel_name)
