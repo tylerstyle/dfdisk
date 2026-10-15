@@ -584,7 +584,16 @@ impl ForensicInfoReport {
         if let Some(uuid) = &s.dm_uuid {
             row(out, "DM UUID", uuid);
         }
-        row(out, "Vendor / Model", s.display_name());
+        // Nothing made up: no model is "(not reported)", not a placeholder name
+        row(
+            out,
+            "Vendor / Model",
+            if s.vendor.is_none() && s.model.is_none() {
+                "(not reported)".to_string()
+            } else {
+                s.display_name()
+            },
+        );
         row(
             out,
             "Firmware Revision",
@@ -1315,6 +1324,19 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("NVMe has no HPA or DCO"), "{text}");
+    }
+
+    #[test]
+    fn a_source_without_a_model_names_none() {
+        let mut r = verified();
+        r.source.model = None;
+        r.source.vendor = None;
+        let text = r.render_text();
+        assert!(
+            text.contains("Vendor / Model        : (not reported)"),
+            "{text}"
+        );
+        assert!(!text.contains("Unknown Drive"), "{text}");
     }
 
     #[test]
