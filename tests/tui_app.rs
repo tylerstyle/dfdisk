@@ -926,9 +926,28 @@ async fn case_profile_prefills_suggests_and_is_saved() {
     typ(&mut app, "KD7Y");
     app.handle_key(key(KeyCode::Enter));
     pump(&mut app, "result", |a| a.screen == Screen::Result).await;
-    let saved = std::fs::read_to_string(&path).unwrap();
-    assert!(saved.contains("last_evidence = \"HDD08\""), "{saved}");
-    assert!(saved.contains("examiner = \"A. Examiner\""));
+    // The profile is saved on a blocking thread, independently of the run:
+    // wait for its content, not for the result screen
+    let saved = wait_for_file(&path, "last_evidence = \"HDD08\"").await;
+    assert!(saved.contains("examiner = \"A. Examiner\""), "{saved}");
+}
+
+/// The content of `path` once it contains `needle` (5 s at most).
+async fn wait_for_file(path: &Path, needle: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..1000 {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if text.contains(needle) {
+                return text;
+            }
+            last = text;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!(
+        "{} never contained {needle:?}; last content:\n{last}",
+        path.display()
+    );
 }
 
 #[tokio::test]
