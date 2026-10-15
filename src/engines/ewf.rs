@@ -24,12 +24,13 @@
 //!   the probed size is a shortfall (Incomplete).
 //! - **Source loss.** When the source's node disappears (or is another device
 //!   now), ewfacquire stops with FAILURE (libsmdev re-checks the path after a
-//!   read error). When it does not notice and zero-fills to the end of the
-//!   medium, a read-error range that runs to the end together with a vanished,
-//!   replaced or smaller source (checked after ewfacquire ended: presence and
-//!   size) becomes "source lost at offset X" (the range is then `Unread`:
-//!   those zeros are not source data). The session re-checks the
-//!   identity as well. When the source ends before its probed size while it
+//!   read error; not the libsmdev of ewfacquire 20140807, Ubuntu 22.04's,
+//!   which zero-fills to the end and reports SUCCESS). When it does not
+//!   notice and zero-fills to the end of the medium, a read-error range that
+//!   runs to the end together with a vanished, replaced or smaller source
+//!   (checked after ewfacquire ended: presence and size) becomes "source
+//!   lost at offset X" (the range is then `Unread`: those zeros are not
+//!   source data). The session re-checks the identity as well. When the source ends before its probed size while it
 //!   stays attached (a shrunk file, a device reporting less), ewfacquire
 //!   waits for data forever: after [`SOURCE_STALL_SECS`] without progress the
 //!   engine checks the source's presence and size, and when it is gone or

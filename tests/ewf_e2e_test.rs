@@ -260,7 +260,11 @@ async fn clean_fake_device_is_verified() {
 #[tokio::test]
 async fn source_dying_mid_run_is_incomplete() {
     // Every read from 1 MiB on fails and the node disappears: ewfacquire
-    // stops with FAILURE
+    // stops with FAILURE (libsmdev checks after a read error whether the
+    // device node still exists: in the libewf 20140813, 20140814, 20140816
+    // and 20231119 sources). The libsmdev of ewfacquire 20140807 (Ubuntu
+    // 22.04; also 20140608) has no such check: it zero-fills to the end and
+    // reports SUCCESS (measured), so the source is found lost afterwards
     let Some(run) = acquire(
         "DIE1",
         &[("FAKEDEV_DIE_AT", "1048576"), ("FAKEDEV_VANISH", "1")],
@@ -273,15 +277,32 @@ async fn source_dying_mid_run_is_incomplete() {
     let report = run.result.unwrap();
     assert_eq!(report.outcome, Outcome::Incomplete, "{:?}", report.notes);
     assert_eq!(report.exit_code, 6);
+    let release = dfdisk::engines::ewf::libewf_release(&report.provenance.tools["ewfacquire"])
+        .expect("the ewfacquire release is recorded");
     let reason = report.stop_reason.clone().unwrap();
-    assert!(
-        reason.starts_with("source lost during the acquisition"),
-        "{reason}"
-    );
+    let (text, json) = read_files(&report);
+    if release <= 20140807 {
+        assert!(
+            reason.starts_with("source lost at offset 1048576 (1 MiB)")
+                && reason.contains("no longer exists"),
+            "{reason}"
+        );
+        assert_eq!(report.bytes_acquired, MIB);
+        // The zeros ewfacquire wrote from 1 MiB on are no source data
+        assert_eq!(
+            json_ranges(&json),
+            vec![(MIB, 3 * MIB, "unread".to_string())]
+        );
+        assert!(has_text_range(&text, MIB, 3 * MIB), "{text}");
+    } else {
+        assert!(
+            reason.starts_with("source lost during the acquisition"),
+            "{reason}"
+        );
+    }
     assert_eq!(report.identity_check.end_ok, Some(false));
     assert!(!run.src.exists());
     assert!(!report.image_files.is_empty(), "the segments are kept");
-    let (text, json) = read_files(&report);
     assert!(!text.contains("ALL HASHES MATCH"));
     assert!(text.contains("INCOMPLETE"));
     assert_eq!(json["exit_code"], 6);

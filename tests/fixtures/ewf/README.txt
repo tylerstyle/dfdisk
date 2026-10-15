@@ -46,3 +46,9 @@ Identical in both: ewfacquire's "Errors reading device:" block, the -l log,
 -r/-g notices on standard error, -m/-M/-g/-d/-l handling, the zero-filled
 ranges, the digests, FAILURE when the source node disappears, ABORTED on
 SIGINT and "Is corrupted: yes" for interrupted images.
+
+Ubuntu 22.04's ewf-tools 20140807 is not 20140816 (measured in an ubuntu:22.04
+container; the CI test job runs the end-to-end tests with it): ewfacquire
+crashes (SIGSEGV) on any -r, which dfdisk therefore gives only for a retry
+count other than the default of 2; and when the source node disappears it
+zero-fills to the end and reports SUCCESS instead of FAILURE.
