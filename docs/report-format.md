@@ -78,7 +78,7 @@ bidirectional overrides) become a space. Missing case values read
 
 | Section | Content |
 |---------|---------|
-| VERDICT | outcome label and exit code, one-sentence explanation, key numbers ("Acquired X of Y bytes", substituted and unread sectors, stop reason, identity change, verification result, second source read), timestamp basis, schema version |
+| VERDICT | outcome label and exit code, one-sentence explanation, key numbers ("Acquired X of Y bytes (P%, …)" with the percentage floored to tenths, so 100.0% only when every byte was acquired; substituted and unread sectors, stop reason, identity change, a known HPA/DCO hidden area, verification result, second source read), timestamp basis, schema version |
 | CASE INFORMATION | case number, EA, evidence number, examiner, authority, description, seal number, seizure time and place, notes |
 | SOURCE IDENTITY | device node, kind (whole disk, partition, device-mapper, decrypted dm-crypt plaintext, md, loop, regular file), kernel name with major:minor and diskseq, parent disk, partition start, vendor/model, firmware, serial with the source it came from and all candidates, a note when the serial may belong to a USB bridge, WWN, attachment, sector sizes, size, identity checks at start and end |
 | WRITE PROTECTION | policy, read-only flags before, nodes dfdisk set read-only (BLKROSET), holders, exclusive open, dfnix registry, mounts before, mounts dfdisk unmounted |

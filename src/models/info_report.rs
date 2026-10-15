@@ -539,10 +539,10 @@ impl ForensicInfoReport {
     pub fn key_numbers(&self) -> Vec<String> {
         let mut out = Vec::new();
         let pct = if self.expected_bytes > 0 {
-            format!(
-                "{:.1}%, ",
-                self.bytes_acquired as f64 * 100.0 / self.expected_bytes as f64
-            )
+            // Floored to tenths: "100.0%" only when every byte was acquired
+            // (rounding made 99.96% read "100.0%")
+            let tenths = u128::from(self.bytes_acquired) * 1000 / u128::from(self.expected_bytes);
+            format!("{}.{}%, ", tenths / 10, tenths % 10)
         } else {
             String::new()
         };
@@ -566,6 +566,16 @@ impl ForensicInfoReport {
         }
         if self.identity_check.end_ok == Some(false) {
             out.push("The source changed or disappeared during the acquisition.".into());
+        }
+        if let Some(c) = self
+            .capacity
+            .as_ref()
+            .filter(|c| c.hidden_area() == Some(true))
+        {
+            out.push(format!(
+                "HIDDEN AREA on the disk of the source: {}; those sectors are not part of the image.",
+                c.hidden_area_statements().join("; ")
+            ));
         }
         out.push(format!(
             "Verification: {}.",
@@ -1379,6 +1389,50 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("VERIFIED - ALL HASHES MATCH"));
+    }
+
+    #[test]
+    fn the_percentage_never_rounds_up_to_complete() {
+        let mut r = verified();
+        r.expected_bytes = 1_000_000;
+        r.bytes_acquired = 999_999;
+        let first = r.key_numbers().remove(0);
+        assert!(first.contains("(99.9%, "), "{first}");
+        r.bytes_acquired = 1_000_000;
+        assert!(r.key_numbers()[0].contains("(100.0%, "));
+        r.bytes_acquired = 0;
+        assert!(r.key_numbers()[0].contains("(0.0%, "));
+        r.expected_bytes = u64::MAX;
+        r.bytes_acquired = u64::MAX - 1;
+        assert!(r.key_numbers()[0].contains("(99.9%, "));
+    }
+
+    #[test]
+    fn a_known_hidden_area_is_in_the_verdict_banner() {
+        use crate::models::capacity::{AtaCapacity, CapacityInfo};
+        let mut r = verified();
+        let ata = |hpa: bool| AtaCapacity {
+            native_max_sectors: Some(4096),
+            current_max_sectors: Some(if hpa { 2048 } else { 4096 }),
+            hpa_present: Some(hpa),
+            dco_present: Some(false),
+            dco_real_max_sectors: Some(4096),
+            sector_bytes: Some(512),
+        };
+        r.capacity = Some(CapacityInfo {
+            reported_bytes: 1 << 20,
+            ata: Some(ata(true)),
+            method: "hdparm -N".into(),
+            ..Default::default()
+        });
+        let banner = r.verdict_lines().join("\n");
+        assert!(
+            banner.contains("HIDDEN AREA on the disk of the source: ")
+                && banner.contains("those sectors are not part of the image."),
+            "{banner}"
+        );
+        r.capacity.as_mut().unwrap().ata = Some(ata(false));
+        assert!(!r.verdict_lines().join("\n").contains("HIDDEN AREA"));
     }
 
     #[test]
