@@ -28,7 +28,12 @@
 //!   medium, a read-error range that runs to the end together with a vanished
 //!   or replaced source becomes "source lost at offset X" (the range is then
 //!   `Unread`: those zeros are not source data). The session re-checks the
-//!   identity as well.
+//!   identity as well. When the source ends before its probed size while it
+//!   stays attached (a shrunk file, a device reporting less), ewfacquire
+//!   waits for data forever: after [`SOURCE_STALL_SECS`] without progress the
+//!   engine checks the source's presence and size, and when it is gone or
+//!   smaller it stops ewfacquire itself (stop reason "source lost at offset
+//!   X", not an abort).
 //! - **Abort.** SIGINT to ewfacquire, 15 s grace, then SIGTERM/SIGKILL
 //!   (process runner); the force flag kills at once. The segments are kept and
 //!   the engine returns `Ok` with `aborted: true` and the last progress figure.
@@ -56,8 +61,14 @@ use dfcore::sysfs::parse_dev_num;
 use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Seconds ewfacquire may make no progress before the engine checks whether
+/// the source is still present with its size (E-1). A process-wide setting
+/// so tests can lower it; 60 s otherwise.
+pub static SOURCE_STALL_SECS: AtomicU64 = AtomicU64::new(60);
 
 /// SIGINT -> SIGTERM delay when ewfacquire is aborted (§13).
 pub const EWFACQUIRE_GRACE: Duration = Duration::from_secs(15);
@@ -855,16 +866,19 @@ fn total_size(files: &[PathBuf]) -> u64 {
 /// when its node is gone or now refers to another device (or file). Only
 /// stat(2) and sysfs reads; nothing is sent to the device.
 pub fn source_presence(identity: &SourceIdentity) -> Result<(), String> {
-    source_presence_in(identity, Path::new("/sys/dev/block"), &|p: &Path| {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        let m = fs::metadata(p)?;
-        Ok(m.file_type().is_block_device().then(|| {
-            (
-                libc::major(m.rdev() as libc::dev_t) as u32,
-                libc::minor(m.rdev() as libc::dev_t) as u32,
-            )
-        }))
-    })
+    source_presence_in(identity, Path::new("/sys/dev/block"), &block_rdev)
+}
+
+/// stat(2) of a device node: `Some((major, minor))` for a block device.
+fn block_rdev(p: &Path) -> std::io::Result<Option<(u32, u32)>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let m = fs::metadata(p)?;
+    Ok(m.file_type().is_block_device().then(|| {
+        (
+            libc::major(m.rdev() as libc::dev_t) as u32,
+            libc::minor(m.rdev() as libc::dev_t) as u32,
+        )
+    }))
 }
 
 /// Stat of a device node: `Ok(Some((major, minor)))` for a block device,
@@ -921,6 +935,86 @@ pub fn source_presence_in(
     }
 }
 
+/// Size of the source now: a regular file's length, a block device's size
+/// from `<sys_dev_block>/<major:minor>/size` (512-byte units). `None` when it
+/// cannot be read.
+pub fn source_size_in(identity: &SourceIdentity, sys_dev_block: &Path) -> Option<u64> {
+    if identity.is_block_device() {
+        let mm = identity.maj_min.as_deref()?;
+        let sectors: u64 = fs::read_to_string(sys_dev_block.join(mm).join("size"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        sectors.checked_mul(512)
+    } else {
+        fs::metadata(&identity.path).ok().map(|m| m.len())
+    }
+}
+
+/// Whether the source is still present with at least `expected` bytes
+/// (stat(2) and sysfs only; nothing is sent to the device).
+pub fn source_still_there(
+    identity: &SourceIdentity,
+    expected: u64,
+    sys_dev_block: &Path,
+    rdev_of: &RdevOf<'_>,
+) -> Result<(), String> {
+    source_presence_in(identity, sys_dev_block, rdev_of)?;
+    match source_size_in(identity, sys_dev_block) {
+        Some(now) if now < expected => Err(format!(
+            "the source has {now} bytes now, {expected} bytes when the acquisition started"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Watches ewfacquire's progress (E-1): after `limit` without progress it
+/// asks `probe` (at most once a second) whether the source is still there.
+#[derive(Debug)]
+pub struct StallWatch {
+    limit: Duration,
+    last_done: u64,
+    since: Instant,
+    checked: Option<Instant>,
+}
+
+impl StallWatch {
+    pub fn new(limit: Duration, now: Instant) -> Self {
+        Self {
+            limit,
+            last_done: 0,
+            since: now,
+            checked: None,
+        }
+    }
+
+    /// `done`: the progress figure now. `Some(why)` when there was no
+    /// progress for the limit and the probe says the source is gone or
+    /// smaller.
+    pub fn tick(
+        &mut self,
+        done: u64,
+        now: Instant,
+        probe: impl FnOnce() -> Result<(), String>,
+    ) -> Option<String> {
+        if done != self.last_done {
+            self.last_done = done;
+            self.since = now;
+            return None;
+        }
+        if now.duration_since(self.since) < self.limit
+            || self
+                .checked
+                .is_some_and(|c| now.duration_since(c) < Duration::from_secs(1))
+        {
+            return None;
+        }
+        self.checked = Some(now);
+        probe().err()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Acquisition
 // ---------------------------------------------------------------------------
@@ -969,6 +1063,9 @@ pub struct EwfFacts {
     pub info_media: Option<Result<EwfMediaInfo, String>>,
     /// [`source_presence`] after ewfacquire ended
     pub source_presence: Result<(), String>,
+    /// dfdisk stopped ewfacquire because it made no progress and the source
+    /// was gone or smaller (E-1): why ("source lost at offset X ...")
+    pub stalled: Option<String>,
 }
 
 fn table_from(runs: &[SectorRun], sector_size: u32, source: &str) -> ReadErrorTable {
@@ -1219,7 +1316,25 @@ pub fn assemble(f: &EwfFacts) -> Result<EngineOutput, AcquisitionError> {
         .collect::<Vec<_>>()
         .join(" / ");
 
-    if f.run.stopped {
+    if let Some(why) = &f.stalled {
+        // dfdisk stopped ewfacquire: the source ended while it waited
+        if f.segments.is_empty() {
+            return Err(AcquisitionError::failed(format!(
+                "{why}; ewfacquire had not written a segment file"
+            )));
+        }
+        out.bytes_acquired = lower_bound;
+        stop_reason = Some(why.clone());
+        notes.push(format!(
+            "dfdisk stopped ewfacquire ({}) because it made no progress and the source was gone or smaller than when the acquisition started; its segment files are kept but not finalized{} and cannot be verified; {}",
+            f.run.status_text,
+            if corrupted { " (ewfinfo: corrupted)" } else { "" },
+            match a.acquired_bytes {
+                Some(n) => format!("{n} bytes had been acquired at ewfacquire's last progress report"),
+                None => "ewfacquire had not reported progress yet, so the number of bytes acquired is not known (0 is recorded)".into(),
+            }
+        ));
+    } else if f.run.stopped {
         // The examiner (or a signal) stopped ewfacquire
         if f.segments.is_empty() {
             return Err(AcquisitionError::aborted(
@@ -1486,9 +1601,16 @@ pub async fn acquire(ctx: &EngineContext) -> Result<EngineOutput, AcquisitionErr
 
     let mut parser = EwfacquireParser::new();
     let mut gauge = Gauge::new(expected);
+    // ewfacquire stops on the examiner's abort, or when the source ended
+    // while it waited (E-1); the force flag kills at once
+    let stop_flag = Arc::new(AtomicBool::new(ctx.is_aborted()));
+    let control = StopControl::abort(stop_flag.clone()).with_force(ctx.force.clone());
+    let stall_limit = Duration::from_secs(SOURCE_STALL_SECS.load(Ordering::Relaxed));
+    let mut watch = StallWatch::new(stall_limit, Instant::now());
+    let mut stalled: Option<String> = None;
     let outcome = process::run(
         &spec,
-        &ctx.stop_control(),
+        &control,
         Some(&ctx.provenance),
         |ev| match ev {
             ProcessEvent::Line { stream, text, .. } => {
@@ -1507,10 +1629,34 @@ pub async fn acquire(ctx: &EngineContext) -> Result<EngineOutput, AcquisitionErr
                 }
             }
             ProcessEvent::Tick { pid, .. } => {
+                if ctx.is_aborted() {
+                    stop_flag.store(true, Ordering::SeqCst);
+                }
                 let read = pid.and_then(read_proc_rchar).unwrap_or(0);
                 let done = read.max(parser.report().acquired_bytes.unwrap_or(0));
                 if done > 0 {
                     gauge.update(ctx, done);
+                }
+                if stalled.is_none() && !stop_flag.load(Ordering::SeqCst) {
+                    let probe = || {
+                        source_still_there(
+                            &ctx.identity,
+                            expected,
+                            Path::new("/sys/dev/block"),
+                            &block_rdev,
+                        )
+                    };
+                    if let Some(why) = watch.tick(done, Instant::now(), probe) {
+                        let at = parser.report().acquired_bytes.unwrap_or(0);
+                        let reason = format!(
+                            "source lost at offset {at} ({}): {why}; ewfacquire made no progress for {} s and was stopped by dfdisk",
+                            format_iec(at),
+                            stall_limit.as_secs()
+                        );
+                        ctx.progress.warn(reason.clone());
+                        stalled = Some(reason);
+                        stop_flag.store(true, Ordering::SeqCst);
+                    }
                 }
             }
         },
@@ -1540,17 +1686,24 @@ pub async fn acquire(ctx: &EngineContext) -> Result<EngineOutput, AcquisitionErr
         }
         _ => (None, None),
     };
+    // dfdisk's own stop is no abort, unless the examiner stopped it too
+    let stalled = stalled.filter(|_| !ctx.is_aborted() && !ctx.is_forced());
+    let mut run = RunEnd::from_outcome(&outcome);
+    if stalled.is_some() {
+        run.stopped = false;
+    }
     let facts = EwfFacts {
         expected_bytes: expected,
         sector_size: ctx.sector_size(),
         requested: Some(requested),
-        run: RunEnd::from_outcome(&outcome),
+        run,
         acquire: report,
         segments,
         log_file: log.exists().then_some(log),
         info_errors,
         info_media,
         source_presence: source_presence(&ctx.identity),
+        stalled,
     };
     let out = assemble(&facts)?;
     if !out.read_errors.is_empty() {
@@ -1898,6 +2051,7 @@ mod tests {
             info_errors: info_e.map(|t| Ok(parse_ewfinfo_errors(t))),
             info_media: info_m.map(|t| Ok(parse_ewfinfo_media(t))),
             source_presence: Ok(()),
+            stalled: None,
         }
     }
 
@@ -2890,6 +3044,92 @@ mod tests {
             }
             previous = Some(ext);
         }
+    }
+
+    #[test]
+    fn a_stall_is_checked_only_after_the_limit_and_names_the_cause() {
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut w = StallWatch::new(s(60), t0);
+        let lost = || Err("the source has 1048576 bytes now".to_string());
+        let never = || -> Result<(), String> { panic!("probed too early") };
+        // Progress resets the clock; no probe before the limit
+        assert_eq!(w.tick(100, t0 + s(30), never), None);
+        assert_eq!(w.tick(200, t0 + s(70), never), None);
+        assert_eq!(w.tick(200, t0 + s(129), never), None);
+        // No progress for the limit: probed; a present source keeps waiting
+        assert_eq!(w.tick(200, t0 + s(131), || Ok(())), None);
+        // ... and is probed again at most once a second
+        assert_eq!(
+            w.tick(200, t0 + s(131) + Duration::from_millis(500), never),
+            None
+        );
+        assert_eq!(
+            w.tick(200, t0 + s(133), lost).as_deref(),
+            Some("the source has 1048576 bytes now")
+        );
+    }
+
+    #[test]
+    fn a_smaller_or_vanished_source_is_not_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path().join("sys");
+        std::fs::create_dir_all(sys.join("8:16")).unwrap();
+        std::fs::write(sys.join("8:16/size"), "8192\n").unwrap();
+        let disk = SourceIdentity {
+            path: "/dev/sdx".into(),
+            maj_min: Some("8:16".into()),
+            kind: SourceKind::Disk,
+            ..Default::default()
+        };
+        let same = |_: &Path| Ok(Some((8, 16)));
+        assert_eq!(source_size_in(&disk, &sys), Some(4 * MIB));
+        assert_eq!(source_still_there(&disk, 4 * MIB, &sys, &same), Ok(()));
+        std::fs::write(sys.join("8:16/size"), "2048\n").unwrap();
+        let e = source_still_there(&disk, 4 * MIB, &sys, &same).unwrap_err();
+        assert!(
+            e.contains("1048576 bytes now, 4194304 bytes when the acquisition started"),
+            "{e}"
+        );
+        let gone = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(source_still_there(&disk, MIB, &sys, &gone).is_err());
+        // A regular file that was truncated
+        let f = tmp.path().join("src.img");
+        std::fs::write(&f, vec![1u8; 4096]).unwrap();
+        let file = crate::discovery::identity::probe_file(&f.to_string_lossy()).unwrap();
+        assert_eq!(source_still_there(&file, 4096, &sys, &same), Ok(()));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&f)
+            .unwrap()
+            .set_len(512)
+            .unwrap();
+        assert!(source_still_there(&file, 4096, &sys, &same)
+            .unwrap_err()
+            .contains("512 bytes now"));
+    }
+
+    #[test]
+    fn a_stalled_ewfacquire_is_a_lost_source_not_an_abort() {
+        let mut f = facts("", "aborted", None, None, 1);
+        f.run.status_text = "exit 1 (aborted: SIGINT)".into();
+        f.stalled = Some("source lost at offset 1048576 (1 MiB): the source has 1048576 bytes now, 4194304 bytes when the acquisition started; ewfacquire made no progress for 60 s and was stopped by dfdisk".into());
+        let out = assemble(&f).unwrap();
+        assert!(!out.aborted);
+        assert!(out
+            .stop_reason
+            .as_deref()
+            .unwrap()
+            .starts_with("source lost at offset 1048576"));
+        assert!(out
+            .notes
+            .iter()
+            .any(|n| n.starts_with("dfdisk stopped ewfacquire (exit 1 (aborted: SIGINT))")));
+        // Nothing written: an error
+        f.segments.clear();
+        let e = assemble(&f).unwrap_err();
+        assert_eq!(e.kind, crate::engines::ErrorKind::Failed);
+        assert!(e.message.contains("source lost"), "{e}");
     }
 
     #[test]
