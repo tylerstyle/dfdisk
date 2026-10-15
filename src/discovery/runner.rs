@@ -112,6 +112,14 @@ pub fn physical_disk(
     let Some(node) = env.sys.node(&kname) else {
         return Err(format!("invalid kernel name {kname:?}"));
     };
+    if env.sys.is_loop(&kname) {
+        // S-N1: under a loop device there is no disk of the evidence; the
+        // disk holding its backing file is the host's
+        return Err(format!(
+            "{} is stored on the loop device /dev/{kname}; the disk holding its backing file is not the evidence",
+            identity.path
+        ));
+    }
     if !node.join("device").exists() {
         return Err(format!(
             "{kname} has no hardware device in sysfs (virtual, loop or memory device)"

@@ -460,7 +460,9 @@ identify-class queries that the report records.
   kernel read-only flag (BLKROSET) on the source node, its own partitions, every
   node it sits on down to the disk (the partition and intermediate dm/md devices
   under a LUKS, LVM or md source) and the disk(s) it is stored on together with
-  every partition node of those disks. A disk that has other mounted filesystems
+  every partition node of those disks. Under a mapping of an image file (LUKS or
+  kpartx over a loop device) the loop device counts as the disk: the host disk
+  that holds the file is never touched, identified or queried. A disk that has other mounted filesystems
   stays writable together with its partitions outside the source's chain (as
   does a node of the chain that another mounted device depends on); the report
   names exactly the nodes left writable. It refuses if a flag cannot be set,
@@ -471,7 +473,8 @@ identify-class queries that the report records.
   the audit "acquisition_started" record is written. On dfnix an audit log that
   cannot be written refuses the acquisition.
 - **Hidden areas.** `hdparm -N` and `hdparm --dco-identify` (ATA) or
-  `nvme id-ns` (NVMe) run on the physical disk, read-only, with a timeout. A
+  `nvme id-ns` (NVMe) run on the physical disk (there is none under a loop
+  device), read-only, with a timeout. A
   host protected area or device configuration overlay is a loud warning and is
   recorded; `--refuse-hidden-areas` turns it into a refusal. dfdisk never changes
   them.

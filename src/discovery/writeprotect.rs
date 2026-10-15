@@ -172,7 +172,9 @@ fn kname_of_path(p: &str) -> String {
 
 /// Disks whose read-only state belongs to the source, by kernel name. A loop
 /// device has none: the disk holding its backing file is the host's, never
-/// evidence, and is never set read-only.
+/// evidence, and is never set read-only. Under a dm or md source the walk
+/// stops at a loop device (S-N1, [`SysRoot::storage_disks`] behind
+/// `parent_disks`): the loop node is the disk.
 fn disks_of(identity: &SourceIdentity) -> Vec<String> {
     match identity.kind {
         SourceKind::Disk | SourceKind::Other => vec![identity.kernel_name.clone()],

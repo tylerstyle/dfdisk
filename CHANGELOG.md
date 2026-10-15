@@ -291,6 +291,12 @@ and when something was not done the report says so.
   device-mapper (dm-linear, dm-crypt, LVM), md and loop devices carry their own
   facts and the hardware identity of the one disk they are stored on; the
   virtio-blk serial is read from sysfs, so a virtio disk matches its selection.
+  A device stored on a loop device (a LUKS or kpartx mapping of an image file,
+  a partition of a loop device) has no hardware identity: the walk down to the
+  disk stops at the loop device, so the host disk that holds the image file
+  never lends its serial, model or WWN to the report, the file names or
+  `--expect-serial`, and SMART, `hdparm`, `nvme` and BLKROSET never reach it
+  (the loop node is set read-only as the disk).
 - The flake check `libewf-legacy` builds and tests dfdisk against libewf
   20140816, the release line of the Debian/Ubuntu `ewf-tools` package.
 
