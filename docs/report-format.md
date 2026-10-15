@@ -190,10 +190,9 @@ byte, sorted, non-overlapping, with adjacent ranges of the same kind merged:
 ### Verification result
 
 `verification.result` (the verification as a whole), `verification.image` (the
-written image alone, before the second read was taken into account; missing in
-reports of earlier versions) and `verification.source_reread` (the second read
-of the source with `--verify-source`; null when there was none) are tagged
-objects:
+written image alone, before the second read was taken into account) and
+`verification.source_reread` (the second read of the source with
+`--verify-source`; null when there was none) are tagged objects:
 
 ```json
 {"status": "matched", "method": "ewfverify -d md5"}
