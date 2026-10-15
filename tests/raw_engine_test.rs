@@ -340,11 +340,9 @@ async fn raw_acquisition_records_pieces_that_verify_pieces_rechecks() {
     assert!(raw.source_io.is_some());
     let rendered = report.render_text();
     assert!(rendered.contains("Piecewise SHA-256"), "{rendered}");
-    // The piece size is a maximum ("pieces of up to 1 MiB", T7)
+    // The piece size is a maximum: the last piece may be shorter (T7)
     assert!(
-        regex::Regex::new(r"4 pieces of (up to )?1 MiB in ")
-            .unwrap()
-            .is_match(&rendered),
+        rendered.contains("4 pieces of up to 1 MiB in "),
         "{rendered}"
     );
     assert!(rendered.contains("Source I/O"), "{rendered}");
