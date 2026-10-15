@@ -65,11 +65,12 @@ fn block(title: impl Into<String>, color: Color) -> Block<'static> {
 /// Draw the whole screen.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.frame_size = (area.width, area.height);
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_too_small(frame, area);
         return;
     }
-    let notice_lines = notice_lines(app, area.width as usize);
+    let notice_lines = notice_lines(app, area.width as usize, area.height);
     let [header, notices, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(notice_lines.len() as u16),
@@ -193,39 +194,43 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Notification lines: errors first, then warnings, then information,
-/// newest first; at most 3 lines.
-fn notice_lines(app: &App, width: usize) -> Vec<Line<'static>> {
-    let mut notices: Vec<_> = app.notices.iter().collect();
-    notices.sort_by(|a, b| b.level.cmp(&a.level).then(b.at.cmp(&a.at)));
-    let max = 3;
+/// newest first, each wrapped in full ([`App::notice_page`]); a last line
+/// counts the notices that did not fit, errors among them.
+fn notice_lines(app: &App, width: usize, height: u16) -> Vec<Line<'static>> {
+    let page = app.notice_page(width, App::notice_lines_max(height));
     let mut lines = Vec::new();
-    let shown = if notices.len() > max {
-        max - 1
-    } else {
-        notices.len()
-    };
-    for n in notices.iter().take(shown) {
-        let (icon, color) = match n.level {
-            Level::Error => ("✖ ", Color::Red),
-            Level::Warning => ("⚠ ", Color::Yellow),
-            Level::Info => ("ℹ ", Color::Cyan),
+    for (n, text) in &page.shown {
+        let color = match n.level {
+            Level::Error => Color::Red,
+            Level::Warning => Color::Yellow,
+            Level::Info => Color::Cyan,
         };
-        let text = format!("{icon}{}", n.text);
-        lines.push(Line::from(Span::styled(
-            truncate_to_width(&text, width),
-            bold(color),
-        )));
+        for l in text {
+            lines.push(Line::from(Span::styled(
+                truncate_to_width(l, width),
+                bold(color),
+            )));
+        }
     }
-    if notices.len() > shown {
+    if page.hidden > 0 {
+        let errors = match page.hidden_errors {
+            0 => String::new(),
+            1 => ", 1 of them an error".into(),
+            e => format!(", {e} of them errors"),
+        };
         lines.push(Line::from(Span::styled(
             truncate_to_width(
                 &format!(
-                    "  … {} more message(s); Ctrl+X dismisses all, F1 help",
-                    notices.len() - shown
+                    "  … {} more message(s){errors}; Ctrl+X dismisses the ones shown",
+                    page.hidden
                 ),
                 width,
             ),
-            Style::default().fg(Color::Yellow),
+            if page.hidden_errors > 0 {
+                bold(Color::Red)
+            } else {
+                Style::default().fg(Color::Yellow)
+            },
         )));
     }
     lines
@@ -259,7 +264,7 @@ pub(crate) fn footer_hints(app: &App) -> String {
         Screen::Verify => "Tab/Shift+Tab fields · F4 complete path · F5 start · Esc back · F1 help",
     };
     if app.notices.iter().any(|n| n.level != Level::Info) {
-        format!("Ctrl+X dismiss messages · {base}")
+        format!("Ctrl+X dismiss shown messages · {base}")
     } else {
         base.to_string()
     }
@@ -1941,7 +1946,7 @@ pub fn modal_rect(area: Rect, content_w: usize, content_h: usize) -> Rect {
 
 fn help_lines(app: &App) -> Vec<String> {
     let mut l = vec![
-        "Everywhere: F1 help · Esc back · Ctrl+C quit (asks while a run is busy) · Ctrl+X dismiss messages".to_string(),
+        "Everywhere: F1 help · Esc back · Ctrl+C quit (asks while a run or an unmount is busy) · Ctrl+X dismiss the messages shown (the next ones move up)".to_string(),
         "Text fields: ←→ Home End move · Backspace Delete · Ctrl+U clear · Ctrl+W delete word".to_string(),
         "Forms: Tab / Shift+Tab next / previous field · Space ←→ change a choice · F4 path completion".to_string(),
         String::new(),

@@ -528,6 +528,31 @@ fn verify_gauge_is_truthful() {
 }
 
 #[test]
+fn long_errors_are_wrapped_and_the_hidden_ones_counted() {
+    let mut app = App::with_devices(devices());
+    for i in 0..4 {
+        app.notify(
+            Level::Error,
+            format!("error number {i}: Unmount of /dev/sdx1 refused: /media/evidence/some/long/path is held by process 1234 (bash) and cannot be unmounted without force"),
+        );
+    }
+    let screen = text(&draw(&mut app, 80, 24));
+    // The newest error in full (it was cut at the terminal width)
+    assert!(
+        screen.contains("✖ error number 3: Unmount of /dev/sdx1 refused"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("cannot be unmounted without force"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("2 more message(s), 2 of them errors; Ctrl+X dismisses the ones shown"),
+        "{screen}"
+    );
+}
+
+#[test]
 fn modals_are_sized_to_content_and_fit_80x24() {
     let mut app = App::with_devices(devices());
     app.modal = Some(Modal::Help);

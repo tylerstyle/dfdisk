@@ -105,12 +105,40 @@ pub enum Level {
 }
 
 /// A message in the notification area. Info expires after [`INFO_TTL`];
-/// warnings and errors stay until dismissed (Ctrl+X).
+/// warnings and errors stay until dismissed (Ctrl+X dismisses the ones shown).
 #[derive(Debug, Clone)]
 pub struct Notice {
     pub text: String,
     pub level: Level,
     pub at: Instant,
+    /// Unique within the App (dismissal by identity)
+    pub id: u64,
+}
+
+/// Lines the notification area may take at least / at most a quarter of the
+/// terminal height.
+pub const NOTICE_MIN_LINES: usize = 4;
+
+/// The notices the notification area shows at a given size, wrapped, and
+/// how many it cannot show.
+#[derive(Debug, Clone)]
+pub struct NoticePage<'a> {
+    /// The notices shown with their lines (icon included); errors first,
+    /// then warnings, then information, newest first
+    pub shown: Vec<(&'a Notice, Vec<String>)>,
+    /// Notices not shown
+    pub hidden: usize,
+    /// Errors among them
+    pub hidden_errors: usize,
+}
+
+/// The icon in front of a notice.
+pub fn notice_icon(level: Level) -> &'static str {
+    match level {
+        Level::Error => "✖ ",
+        Level::Warning => "⚠ ",
+        Level::Info => "ℹ ",
+    }
 }
 
 /// A text input (for path completion).
@@ -684,6 +712,9 @@ pub struct App {
     verify_due: Option<Instant>,
 
     pub notices: Vec<Notice>,
+    notice_seq: u64,
+    /// Terminal size of the last frame drawn: which notices were shown
+    pub frame_size: (u16, u16),
     pub profile: CaseProfile,
     pub profile_path: Option<PathBuf>,
     pub ssh_warning: Option<String>,
@@ -785,6 +816,8 @@ impl App {
             verify: VerifyForm::default(),
             verify_due: None,
             notices: Vec::new(),
+            notice_seq: 0,
+            frame_size: (MIN_WIDTH, MIN_HEIGHT),
             profile: CaseProfile::default(),
             profile_path: None,
             ssh_warning: None,
@@ -834,24 +867,89 @@ impl App {
                 return;
             }
         }
+        self.notice_seq += 1;
         self.notices.push(Notice {
             text,
             level,
             at: Instant::now(),
+            id: self.notice_seq,
         });
         if self.notices.len() > 50 {
-            self.notices.remove(0);
+            // The oldest message that is not an error goes first
+            let drop = self
+                .notices
+                .iter()
+                .position(|n| n.level != Level::Error)
+                .unwrap_or(0);
+            self.notices.remove(drop);
         }
     }
 
-    /// Notices that are still shown (info ones expire).
+    /// Notices that are still kept (info ones expire), newest first.
     pub fn visible_notices(&self) -> Vec<&Notice> {
         self.notices.iter().rev().collect()
     }
 
-    /// Acknowledge every notice (Ctrl+X).
+    /// The notices the notification area shows `width` cells wide in at
+    /// most `max_lines` lines: errors first, then warnings, then
+    /// information, newest first, each wrapped in full. The first one is
+    /// always shown (cut with "…" only when it alone is longer than the
+    /// area); one line is kept free to count the notices not shown.
+    pub fn notice_page(&self, width: usize, max_lines: usize) -> NoticePage<'_> {
+        let mut sorted: Vec<&Notice> = self.notices.iter().collect();
+        sorted.sort_by(|a, b| b.level.cmp(&a.level).then(b.at.cmp(&a.at)));
+        let max_lines = max_lines.max(1);
+        let mut shown: Vec<(&Notice, Vec<String>)> = Vec::new();
+        let mut used = 0;
+        for (i, n) in sorted.iter().enumerate() {
+            // The icon, then the text; continuation lines indented under it
+            let icon = notice_icon(n.level);
+            let indent = " ".repeat(crate::tui::input::str_width(icon));
+            let mut lines: Vec<String> =
+                crate::tui::input::wrap_text(&n.text, width.saturating_sub(indent.len()))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, l)| format!("{}{l}", if j == 0 { icon } else { &indent }))
+                    .collect();
+            let reserve = usize::from(i + 1 < sorted.len());
+            let avail = max_lines.saturating_sub(used + reserve);
+            if lines.len() > avail {
+                if !shown.is_empty() {
+                    break;
+                }
+                lines.truncate(avail.max(1));
+                if let Some(last) = lines.last_mut() {
+                    *last = crate::tui::input::truncate_to_width(&format!("{last} …"), width);
+                }
+            }
+            used += lines.len();
+            shown.push((*n, lines));
+        }
+        let hidden: Vec<&&Notice> = sorted.iter().skip(shown.len()).collect();
+        NoticePage {
+            hidden: hidden.len(),
+            hidden_errors: hidden.iter().filter(|n| n.level == Level::Error).count(),
+            shown,
+        }
+    }
+
+    /// Lines the notification area may take on a terminal `height` rows
+    /// high.
+    pub fn notice_lines_max(height: u16) -> usize {
+        (height as usize / 4).max(NOTICE_MIN_LINES)
+    }
+
+    /// Acknowledge the notices shown (Ctrl+X); the ones that did not fit
+    /// stay and move up.
     pub fn dismiss_notices(&mut self) {
-        self.notices.clear();
+        let (w, h) = self.frame_size;
+        let ids: Vec<u64> = self
+            .notice_page(w as usize, Self::notice_lines_max(h))
+            .shown
+            .iter()
+            .map(|(n, _)| n.id)
+            .collect();
+        self.notices.retain(|n| !ids.contains(&n.id));
     }
 
     pub fn has_errors(&self) -> bool {
@@ -3176,6 +3274,67 @@ mod tests {
         assert_eq!(app.notices[0].text, "error");
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         assert!(app.notices.is_empty());
+    }
+
+    fn long_error(i: usize) -> String {
+        format!(
+            "error number {i}: Unmount of /dev/sdx1 refused: /media/evidence/some/long/path is held by process 1234 (bash) and cannot be unmounted without force"
+        )
+    }
+
+    #[test]
+    fn notices_are_wrapped_in_full_and_the_hidden_ones_counted() {
+        let mut app = App::with_devices(Vec::new());
+        app.notify(Level::Info, "Device list refreshed (2 disks).");
+        for i in 0..4 {
+            app.notify(Level::Error, long_error(i));
+        }
+        let page = app.notice_page(80, App::notice_lines_max(24));
+        // The newest errors first, each complete (no "…")
+        assert_eq!(page.shown.len(), 2);
+        for (n, lines) in &page.shown {
+            assert!(lines.iter().all(|l| crate::tui::input::str_width(l) <= 80));
+            let joined = lines
+                .iter()
+                .map(|l| l.trim_start_matches(notice_icon(n.level)).trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(joined, n.text, "nothing cut");
+        }
+        assert!(page.shown[0].1[0].starts_with("✖ error number 3"));
+        assert_eq!((page.hidden, page.hidden_errors), (3, 2));
+        let lines: usize = page.shown.iter().map(|(_, l)| l.len()).sum();
+        assert!(
+            lines < App::notice_lines_max(24),
+            "a line left for the count"
+        );
+    }
+
+    #[test]
+    fn ctrl_x_dismisses_only_the_notices_shown() {
+        let mut app = App::with_devices(Vec::new());
+        for i in 0..4 {
+            app.notify(Level::Error, long_error(i));
+        }
+        app.frame_size = (80, 24);
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_x);
+        // The two shown are gone; the two that did not fit stay, unread
+        let left: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(left[0].starts_with("error number 0") && left[1].starts_with("error number 1"));
+        app.handle_key(ctrl_x);
+        assert!(app.notices.is_empty());
+    }
+
+    #[test]
+    fn a_notice_longer_than_the_area_is_cut_visibly() {
+        let mut app = App::with_devices(Vec::new());
+        app.notify(Level::Error, "x".repeat(2000));
+        let page = app.notice_page(80, 4);
+        assert_eq!(page.shown[0].1.len(), 4);
+        assert!(page.shown[0].1[3].ends_with('…'));
+        assert_eq!(page.hidden, 0);
     }
 
     #[test]
