@@ -310,11 +310,23 @@ pub fn verify_verdict(v: &ImageVerification) -> String {
 /// pieces file: both are in its verdict, its exit code, the addendum and the
 /// audit record.
 pub async fn handle_verify(
-    args: VerifyArgs,
+    mut args: VerifyArgs,
     controller: &AbortController,
     listener: &mut Option<SignalListener>,
     console: &Console,
 ) -> Result<i32, AcquisitionError> {
+    // The addendum, the result and the audit record name absolute paths (I6)
+    args.image = absolute(&args.image, "image")?;
+    args.report = args
+        .report
+        .as_deref()
+        .map(|r| absolute(r, "report"))
+        .transpose()?;
+    args.pieces = args
+        .pieces
+        .as_deref()
+        .map(|p| absolute(p, "pieces file"))
+        .transpose()?;
     let expected = match &args.report {
         Some(report) => ExpectedHashes::from_report_json(report)?,
         None => ExpectedHashes::given(args.md5.clone(), args.sha1.clone(), args.sha256.clone()),
@@ -419,6 +431,15 @@ pub async fn handle_verify(
 // convert
 // ---------------------------------------------------------------------------
 
+/// `path` made absolute against the current directory, keeping the name the
+/// examiner typed (no symlink resolution): court-facing records (reports,
+/// addenda, audit records) never carry a relative path (I6).
+pub fn absolute(path: &Path, what: &str) -> Result<PathBuf, AcquisitionError> {
+    std::path::absolute(path).map_err(|e| {
+        AcquisitionError::usage(format!("invalid {what} path {}: {e}", path.display()))
+    })
+}
+
 /// `<base>.info.json` next to an image `<base>.<ext>` (`.raw`, `.001`,
 /// `.E01`), if it exists.
 pub fn report_next_to(image: &Path) -> Option<PathBuf> {
@@ -459,13 +480,14 @@ pub fn conversion_request(args: &ConvertArgs) -> Result<ConversionRequest, Acqui
             seizure_location: opt(&c.seized_location),
         }
     });
-    let output_dir = std::path::absolute(&args.output_dir).map_err(|e| {
-        AcquisitionError::usage(format!(
-            "invalid output directory {}: {e}",
-            args.output_dir.display()
-        ))
-    })?;
-    if let Some(r) = &args.report {
+    let output_dir = absolute(&args.output_dir, "output directory")?;
+    let source = absolute(&args.source, "source")?;
+    let report = args
+        .report
+        .as_deref()
+        .map(|r| absolute(r, "report"))
+        .transpose()?;
+    if let Some(r) = &report {
         if !r.is_file() {
             return Err(AcquisitionError::usage(format!(
                 "report not found: {}",
@@ -482,10 +504,10 @@ pub fn conversion_request(args: &ConvertArgs) -> Result<ConversionRequest, Acqui
         case,
         compression: compression_of(args.compression),
         split_size: split_of(args.split),
-        source_report: args.report.clone(),
+        source_report: report,
         allow_tmpfs: args.allow_tmpfs,
         allow_low_space: args.allow_low_space,
-        ..ConversionRequest::new(args.source.clone(), target, output_dir)
+        ..ConversionRequest::new(source, target, output_dir)
     })
 }
 
@@ -677,6 +699,25 @@ mod tests {
         let e = conversion_request(&parse(&["--to", "e01", "--report", "/nonexistent.json"]))
             .unwrap_err();
         assert_eq!(e.exit_code(), 2);
+        // I6: a relative source and report become absolute (as typed, not
+        // resolved), so the records never carry a relative path
+        let mut rel = parse(&["--to", "e01", "--report", "rel/r.info.json"]);
+        rel.source = PathBuf::from("rel/img.raw");
+        let e = conversion_request(&rel).unwrap_err();
+        assert!(
+            e.message.contains(&format!(
+                "{}",
+                std::env::current_dir()
+                    .unwrap()
+                    .join("rel/r.info.json")
+                    .display()
+            )),
+            "{e}"
+        );
+        rel.report = None;
+        let req = conversion_request(&rel).unwrap();
+        assert!(req.source.is_absolute());
+        assert!(req.source.ends_with("rel/img.raw"));
         // The destination allowances reach the converter
         let req = conversion_request(&parse(&[
             "--to",

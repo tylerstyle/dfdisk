@@ -741,6 +741,38 @@ fn verify_exit_codes() {
 }
 
 #[test]
+fn verify_records_absolute_paths_for_a_relative_image() {
+    // I6: the addendum, the JSON result and the audit record never carry
+    // the relative path that was typed
+    let tmp = scratch();
+    std::fs::create_dir(tmp.path().join("case")).unwrap();
+    std::fs::write(tmp.path().join("case/rel.raw"), b"relative").unwrap();
+    let o = dfdisk()
+        .current_dir(tmp.path())
+        .args(["verify", "case/rel.raw", "--json"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&o);
+    assert_eq!(o.status.code(), Some(9), "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let image = v["verification"]["image"].as_str().unwrap();
+    assert!(Path::new(image).is_absolute(), "{image}");
+    assert!(image.ends_with("case/rel.raw"), "{image}");
+    let log = std::fs::read_to_string(sandbox().join("audit.jsonl")).unwrap();
+    let record: serde_json::Value = log
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|r| r["action"] == "image_verification")
+        .find(|r| {
+            r["details"]["image"]
+                .as_str()
+                .is_some_and(|i| i.ends_with("case/rel.raw"))
+        })
+        .expect("a record of this verification");
+    assert!(Path::new(record["details"]["image"].as_str().unwrap()).is_absolute());
+}
+
+#[test]
 fn verify_takes_the_expected_digests_from_a_report() {
     let tmp = scratch();
     let src = tmp.path().join("evidence.bin");
