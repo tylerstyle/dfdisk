@@ -147,6 +147,22 @@ fn audit_actions(log: &Path) -> Vec<Value> {
         .collect()
 }
 
+/// Abort `stop` once `file` exists with more than `min_len` bytes (at most
+/// 30 s later): a fixed delay raced with a slow tool start under load, and an
+/// abort before the tool wrote anything is (correctly) an error, not a report.
+fn abort_once_written(stop: &StopFlags, file: PathBuf, min_len: u64) {
+    let flag = stop.clone();
+    tokio::spawn(async move {
+        for _ in 0..1500 {
+            if std::fs::metadata(&file).is_ok_and(|m| m.len() > min_len) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        flag.abort.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
 fn ewfinfo(image: &Path) -> String {
     let out = std::process::Command::new("ewfinfo")
         .arg(image)
@@ -839,11 +855,7 @@ async fn abort_stops_ewfacquire_and_reports_aborted() {
     req.case = Some(case());
     req.compression = CompressionLevel::Best;
     let stop = StopFlags::new();
-    let flag = stop.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        flag.abort.store(true, std::sync::atomic::Ordering::SeqCst);
-    });
+    abort_once_written(&stop, f.out.join("x.E01"), 0);
     let started = std::time::Instant::now();
     let r = run(&f.env, req, stop).await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(20));
@@ -1250,18 +1262,8 @@ async fn an_aborted_e01_is_never_converted_whole() {
     req.case = Some(case());
     req.compression = CompressionLevel::Best;
     let stop = StopFlags::new();
-    let flag = stop.clone();
     // Abort once ewfacquire has written a few MiB
-    let first = f.root.join("e01").join("x.E01");
-    tokio::spawn(async move {
-        for _ in 0..600 {
-            if std::fs::metadata(&first).is_ok_and(|m| m.len() > 4 << 20) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        flag.abort.store(true, std::sync::atomic::Ordering::SeqCst);
-    });
+    abort_once_written(&stop, f.root.join("e01").join("x.E01"), 4 << 20);
     let made = run(&f.env, req, stop).await.unwrap();
     assert_eq!(made.outcome, Outcome::Aborted, "{}", made.render_text());
     // The unfinalized E01 alone, away from its report
@@ -1300,11 +1302,7 @@ async fn abort_escalates_when_the_tool_ignores_sigint() {
     let mut req = request(&raw, ConversionTarget::E01, &f.out);
     req.case = Some(case());
     let stop = StopFlags::new();
-    let flag = stop.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        flag.abort.store(true, std::sync::atomic::Ordering::SeqCst);
-    });
+    abort_once_written(&stop, f.out.join("x.E01"), 0);
     let started = std::time::Instant::now();
     let r = run(&env, req, stop).await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(20));

@@ -100,10 +100,14 @@ fn rescue_config(out: &Path) -> AcquisitionConfig {
     }
 }
 
+/// Run the session; with `abort_when_mapped`, abort shortly after ddrescue
+/// wrote its map into that directory (a fixed delay raced with a slow
+/// session start under load: an abort before ddrescue wrote anything is an
+/// error, not a report).
 async fn run_with_abort(
     device: BlockDevice,
     config: AcquisitionConfig,
-    abort_after: Option<Duration>,
+    abort_when_mapped: Option<PathBuf>,
 ) -> Result<ForensicInfoReport, AcquisitionError> {
     audit_sandbox();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ProgressTelemetry>(1000);
@@ -115,10 +119,22 @@ async fn run_with_abort(
         t
     });
     let abort = Arc::new(AtomicBool::new(false));
-    if let Some(delay) = abort_after {
+    if let Some(dir) = abort_when_mapped {
         let flag = abort.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
+            for _ in 0..1500 {
+                let mapped = std::fs::read_dir(&dir).is_ok_and(|rd| {
+                    rd.flatten().any(|e| {
+                        e.file_name().to_string_lossy().ends_with(".map")
+                            && e.metadata().is_ok_and(|m| m.len() > 0)
+                    })
+                });
+                if mapped {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
             flag.store(true, Ordering::SeqCst);
         });
     }
@@ -365,18 +381,15 @@ async fn an_aborted_rescue_resumes_with_its_sessions_listed() {
     }
     let tmp = scratch();
     let size = 4 * MIB;
-    // 256 KiB/s: the 4 MiB source takes 16 s; abort after 1.5 s
+    // 256 KiB/s: the 4 MiB source takes 16 s; abort 0.5 s after the map
+    // appears
     let args = format!("-Z 262144 -H {}", fixture(TESTMODE_4MIB).display());
     let (src, data) = source(tmp.path(), size, Some(args));
     let out = tmp.path().join("out");
     let device = file_device(&src, size as u64, Some("RESUME01"));
-    let report = run_with_abort(
-        device.clone(),
-        rescue_config(&out),
-        Some(Duration::from_millis(1500)),
-    )
-    .await
-    .unwrap();
+    let report = run_with_abort(device.clone(), rescue_config(&out), Some(out.clone()))
+        .await
+        .unwrap();
     assert_eq!(
         report.outcome,
         Outcome::Aborted,
