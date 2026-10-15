@@ -123,6 +123,20 @@ impl SysRoot {
         self.topology().holders(kname)
     }
 
+    /// Devices this one is stacked on directly (`slaves/`), sorted.
+    pub fn slaves(&self, kname: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .node(kname)
+            .and_then(|n| std::fs::read_dir(n.join("slaves")).ok())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Holders, their holders, and so on (breadth first, no duplicates).
     pub fn holders_recursive(&self, kname: &str) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
@@ -349,6 +363,9 @@ mod tests {
         assert_eq!(sys.read_only("sda"), Some(false));
         assert_eq!(sys.holders("sda2"), ["dm-0"]);
         assert_eq!(sys.holders_recursive("sda2"), ["dm-0", "dm-1"]);
+        assert_eq!(sys.slaves("dm-1"), ["dm-0"]);
+        assert_eq!(sys.slaves("dm-0"), ["sda2"]);
+        assert!(sys.slaves("sda2").is_empty());
         assert_eq!(sys.dev_of("dm-0"), Some((254, 0)));
         assert_eq!(sys.node("../etc"), None);
         assert_eq!(

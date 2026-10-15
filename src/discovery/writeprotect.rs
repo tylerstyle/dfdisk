@@ -39,6 +39,18 @@ pub struct DiskState {
     pub foreign_mounts: Vec<String>,
 }
 
+/// Read-only state of a node the source sits on between it and its disks:
+/// the partition under a dm/md source, an intermediate dm or md device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainNode {
+    /// Kernel name, e.g. "sdb2", "dm-0"
+    pub node: String,
+    pub ro: Option<bool>,
+    /// Mount points of devices that depend on this node outside the source
+    /// tree (another LV of the same volume group, for example)
+    pub foreign_mounts: Vec<String>,
+}
+
 /// Everything [`decide`] needs, read from sysfs and mountinfo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionInputs {
@@ -46,6 +58,12 @@ pub struct DecisionInputs {
     /// Kernel name of the source node
     pub source: String,
     pub source_ro: Option<bool>,
+    /// (kernel name, ro) of the source's own partitions (a loop or md
+    /// source's; a disk source's are in `disks`)
+    pub source_partitions: Vec<(String, Option<bool>)>,
+    /// The nodes the source sits on below it, down to (not including) the
+    /// disks: partitions and intermediate dm/md devices
+    pub chain: Vec<ChainNode>,
     /// The source itself when it is a disk; otherwise the disks below it
     pub disks: Vec<DiskState>,
 }
@@ -65,11 +83,14 @@ pub enum WriteProtectDecision {
 }
 
 /// Pure decision for policy `auto` / `off`. Under `auto`, the source node,
-/// each disk it is stored on and every partition of those disks are set
-/// read-only (R2) - except a disk that holds mounts outside the source tree
-/// (a sibling partition in use), which stays writable with a note, since the
-/// disk flag would make that mount read-only too. Nodes already read-only are
-/// not set again.
+/// its own partitions, the nodes it sits on down to the disk (the partition
+/// and intermediate dm/md devices), each disk it is stored on and every
+/// partition of those disks are set read-only (R2). Exceptions, each named in
+/// a note: a disk that holds mounts outside the source tree (a sibling
+/// partition in use) stays writable together with its partitions outside the
+/// source's chain, since the disk flag would make that mount read-only too;
+/// likewise a node of the chain that other mounted devices depend on. Nodes
+/// already read-only are not set again.
 pub fn decide(policy: WriteProtectPolicy, inputs: &DecisionInputs) -> WriteProtectDecision {
     if policy == WriteProtectPolicy::Off {
         return WriteProtectDecision::RecordOnly {
@@ -81,6 +102,7 @@ pub fn decide(policy: WriteProtectPolicy, inputs: &DecisionInputs) -> WriteProte
             reason: "the source is a regular file; BLKROSET applies to block devices only".into(),
         };
     }
+    let in_chain = |n: &str| n == inputs.source || inputs.chain.iter().any(|c| c.node == n);
     let mut targets: Vec<(String, Option<bool>)> = Vec::new();
     let mut notes = Vec::new();
     for disk in &inputs.disks {
@@ -88,21 +110,42 @@ pub fn decide(policy: WriteProtectPolicy, inputs: &DecisionInputs) -> WriteProte
             targets.push((disk.node.clone(), disk.ro));
             targets.extend(disk.partitions.iter().cloned());
         } else {
+            let mut writable = vec![format!("/dev/{}", disk.node)];
+            writable.extend(
+                disk.partitions
+                    .iter()
+                    .filter(|(p, _)| !in_chain(p))
+                    .map(|(p, _)| format!("/dev/{p}")),
+            );
             notes.push(format!(
-                "/dev/{} and its other partitions were left writable because {} is mounted outside the source",
-                disk.node,
-                disk.foreign_mounts.join(", ")
+                "{} left writable because {} is mounted outside the source (the flag on the disk would make that mount read-only too); writes through /dev/{} can still reach the source",
+                name_list(&writable),
+                disk.foreign_mounts.join(", "),
+                disk.node
             ));
         }
     }
-    if !targets.iter().any(|(n, _)| n == &inputs.source) {
-        targets.push((inputs.source.clone(), inputs.source_ro));
+    // Bottom-up: the node nearest the disk first
+    for c in inputs.chain.iter().rev() {
+        if c.foreign_mounts.is_empty() {
+            targets.push((c.node.clone(), c.ro));
+        } else {
+            notes.push(format!(
+                "/dev/{} (the source sits on it) was left writable because {} is mounted on another device that depends on it; writes through /dev/{} can still reach the source",
+                c.node,
+                c.foreign_mounts.join(", "),
+                c.node
+            ));
+        }
     }
-    let pending: Vec<String> = targets
-        .into_iter()
-        .filter(|(_, ro)| *ro != Some(true))
-        .map(|(n, _)| n)
-        .collect();
+    targets.push((inputs.source.clone(), inputs.source_ro));
+    targets.extend(inputs.source_partitions.iter().cloned());
+    let mut pending: Vec<String> = Vec::new();
+    for (n, ro) in targets {
+        if ro != Some(true) && !pending.contains(&n) {
+            pending.push(n);
+        }
+    }
     if pending.is_empty() {
         WriteProtectDecision::AlreadyReadOnly
     } else {
@@ -110,6 +153,16 @@ pub fn decide(policy: WriteProtectPolicy, inputs: &DecisionInputs) -> WriteProte
             nodes: pending,
             notes,
         }
+    }
+}
+
+/// "/dev/sdb was", "/dev/sdb and /dev/sdb1 were", "/dev/sdb, /dev/sdb1 and
+/// /dev/sdb3 were".
+fn name_list(nodes: &[String]) -> String {
+    match nodes {
+        [] => "nothing was".into(),
+        [one] => format!("{one} was"),
+        [rest @ .., last] => format!("{} and {last} were", rest.join(", ")),
     }
 }
 
@@ -229,12 +282,63 @@ pub fn decision_inputs(
             }
         })
         .collect();
+    let disk_names = disks_of(identity);
+    let chain = if matches!(identity.kind, SourceKind::Loop { .. }) {
+        // A loop device's lower node is its backing file's, never evidence
+        Vec::new()
+    } else {
+        lower_nodes(sys, &identity.kernel_name)
+            .into_iter()
+            .filter(|n| !disk_names.contains(n))
+            .map(|node| {
+                let foreign: BTreeSet<String> = dependent_tree(sys, &node)
+                    .into_iter()
+                    .filter(|n| !tree.contains(n))
+                    .collect();
+                ChainNode {
+                    ro: sys.read_only(&node),
+                    foreign_mounts: mounts_of(sys, &foreign, mountinfo),
+                    node,
+                }
+            })
+            .collect()
+    };
+    let source_partitions = if disk_names.contains(&identity.kernel_name) {
+        Vec::new()
+    } else {
+        sys.partitions(&identity.kernel_name)
+            .into_iter()
+            .map(|p| {
+                let ro = sys.read_only(&p);
+                (p, ro)
+            })
+            .collect()
+    };
     DecisionInputs {
         is_block_device: identity.is_block_device(),
         source: identity.kernel_name.clone(),
         source_ro: sys.read_only(&identity.kernel_name),
+        source_partitions,
+        chain,
         disks,
     }
+}
+
+/// The nodes `kname` is stacked on, recursively (`slaves/`), nearest first:
+/// for dm-1 on dm-0 on sdb2, [dm-0, sdb2]. A partition's disk is not among
+/// them (a partition has no slaves).
+fn lower_nodes(sys: &SysRoot, kname: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut queue = sys.slaves(kname);
+    while !queue.is_empty() && out.len() < MAX_TREE_NODES {
+        let n = queue.remove(0);
+        if n == kname || out.contains(&n) {
+            continue;
+        }
+        queue.extend(sys.slaves(&n));
+        out.push(n);
+    }
+    out
 }
 
 /// Registry presence on this host (`dfcore::protected::path()`).
@@ -406,10 +510,12 @@ pub fn enforce_in(
                     still_writable.join(", ")
                 ));
             }
-            wp.notes.push(
-                "dfdisk leaves the read-only flag set after the acquisition (blockdev --setrw clears it)"
-                    .into(),
-            );
+            if !wp.nodes_set.is_empty() {
+                wp.notes.push(format!(
+                    "dfdisk leaves the read-only flag set after the acquisition on {}; each node keeps its own flag: `blockdev --setrw <node>` clears it on that node only",
+                    wp.nodes_set.join(", ")
+                ));
+            }
             Ok(())
         }
     }
@@ -474,6 +580,8 @@ mod tests {
             is_block_device: true,
             source: "sdb".into(),
             source_ro: Some(false),
+            source_partitions: vec![],
+            chain: vec![],
             disks: vec![disk("sdb", Some(false), &[])],
         };
         assert!(matches!(
@@ -498,6 +606,8 @@ mod tests {
             is_block_device: true,
             source: "sdb".into(),
             source_ro: Some(false),
+            source_partitions: vec![],
+            chain: vec![],
             disks: vec![disk(
                 "sdb",
                 Some(false),
@@ -529,6 +639,8 @@ mod tests {
             is_block_device: true,
             source: "sdb2".into(),
             source_ro: Some(false),
+            source_partitions: vec![],
+            chain: vec![],
             disks: vec![disk(
                 "sdb",
                 Some(false),
@@ -670,10 +782,14 @@ mod tests {
         assert_eq!(wp.method.as_deref(), Some("BLKROSET ioctl"));
         assert_eq!(wp.nodes_set, ["/dev/sdb", "/dev/sdb1", "/dev/sdb2"]);
         assert!(wp.ro_after.iter().all(|n| n.ro == Some(true)));
-        assert!(wp
-            .notes
-            .iter()
-            .any(|n| n.contains("leaves the read-only flag set")));
+        // The flag is per node: the note names every node and says so
+        assert!(
+            wp.notes.iter().any(|n| n.contains(
+                "leaves the read-only flag set after the acquisition on /dev/sdb, /dev/sdb1, /dev/sdb2"
+            ) && n.contains("`blockdev --setrw <node>` clears it on that node only")),
+            "{:?}",
+            wp.notes
+        );
         assert!(wp.summary().starts_with("set read-only by dfdisk"));
 
         // Second run: nothing left to set
@@ -860,6 +976,117 @@ mod tests {
         );
         assert_eq!(wp.holders, ["md0", "md0p1"]);
         assert_eq!(wp.mounts_before, ["/mnt/md"]);
+    }
+
+    fn set_nodes(d: WriteProtectDecision) -> (Vec<String>, Vec<String>) {
+        match d {
+            WriteProtectDecision::Set { nodes, notes } => (nodes, notes),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stacked_source_protects_its_chain_down_to_the_disk() {
+        // dm-0 (LUKS) on sdb2; the sibling sdb1 is mounted: the disk stays
+        // writable, the partition the source sits on does not
+        let f = FakeSysfs::new();
+        sata_with_partitions(&f);
+        f.add_partition("sdb", "sdb3", (8, 19), 3, 9048, 500);
+        f.add_virtual("dm-0", (254, 0), 2900);
+        f.set("dm-0", "dm/name", "evluks");
+        f.stack("dm-0", "sdb2");
+        let sys = f.root();
+        let dm0 = identity(
+            "dm-0",
+            SourceKind::DeviceMapper {
+                crypt_plaintext: true,
+            },
+            &["/dev/sdb"],
+        );
+        let inputs = decision_inputs(&sys, &dm0, MOUNTINFO);
+        assert_eq!(inputs.chain.len(), 1);
+        assert_eq!(inputs.chain[0].node, "sdb2");
+        let (nodes, notes) = set_nodes(decide(WriteProtectPolicy::Auto, &inputs));
+        assert_eq!(nodes, ["sdb2", "dm-0"]);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        // Exactly the nodes left writable, and what that means
+        assert!(
+            notes[0].starts_with("/dev/sdb, /dev/sdb1 and /dev/sdb3 were left writable"),
+            "{notes:?}"
+        );
+        assert!(notes[0].contains("/mnt/evidence-a"), "{notes:?}");
+        assert!(!notes[0].contains("its other partitions"), "{notes:?}");
+
+        // Nothing mounted outside: the whole disk too, bottom-up
+        let (nodes, notes) = set_nodes(decide(
+            WriteProtectPolicy::Auto,
+            &decision_inputs(&sys, &dm0, ""),
+        ));
+        assert_eq!(nodes, ["sdb", "sdb1", "sdb2", "sdb3", "dm-0"]);
+        assert!(notes.is_empty());
+
+        // Two levels (LV dm-1 on LUKS dm-0 on sdb2): the chain bottom-up
+        f.add_virtual("dm-1", (254, 1), 2000);
+        f.stack("dm-1", "dm-0");
+        let dm1 = identity(
+            "dm-1",
+            SourceKind::DeviceMapper {
+                crypt_plaintext: false,
+            },
+            &["/dev/sdb"],
+        );
+        let (nodes, _) = set_nodes(decide(
+            WriteProtectPolicy::Auto,
+            &decision_inputs(&sys, &dm1, MOUNTINFO),
+        ));
+        assert_eq!(nodes, ["sdb2", "dm-0", "dm-1"]);
+
+        // A second LV on the same LUKS device is mounted: dm-0 and sdb2 carry
+        // it, so they stay writable as well, and the notes say so
+        f.add_virtual("dm-2", (254, 2), 800);
+        f.stack("dm-2", "dm-0");
+        let mi = format!("{MOUNTINFO}50 22 254:2 / /mnt/lv2 rw - ext4 /dev/dm-2 rw\n");
+        let (nodes, notes) = set_nodes(decide(
+            WriteProtectPolicy::Auto,
+            &decision_inputs(&sys, &dm1, &mi),
+        ));
+        assert_eq!(nodes, ["dm-1"]);
+        for n in [
+            "/dev/sdb2 (the source sits on it)",
+            "/dev/dm-0 (the source sits on it)",
+        ] {
+            assert!(notes.iter().any(|x| x.starts_with(n)), "{n}: {notes:?}");
+        }
+        assert!(notes
+            .iter()
+            .all(|x| x.contains("/mnt/lv2") || x.contains("/mnt/evidence-a")));
+    }
+
+    #[test]
+    fn an_md_source_on_two_disks_protects_both_members() {
+        let f = FakeSysfs::new();
+        sata_with_partitions(&f);
+        f.add_disk(
+            "pci0000:00/0000:00:17.0/ata3/host2/target2:0:0/2:0:0:0",
+            "sdc",
+            (8, 32),
+            10_000,
+        );
+        f.add_partition("sdc", "sdc1", (8, 33), 1, 2048, 4000);
+        f.add_virtual("md0", (9, 0), 3900);
+        f.stack("md0", "sdb2");
+        f.stack("md0", "sdc1");
+        let md = identity("md0", SourceKind::Md, &["/dev/sdb", "/dev/sdc"]);
+        // sdb1 is mounted: sdb and sdb1 stay writable, every member is set
+        let (nodes, notes) = set_nodes(decide(
+            WriteProtectPolicy::Auto,
+            &decision_inputs(&f.root(), &md, MOUNTINFO),
+        ));
+        assert_eq!(nodes, ["sdc", "sdc1", "sdb2", "md0"]);
+        assert!(
+            notes[0].starts_with("/dev/sdb and /dev/sdb1 were left writable"),
+            "{notes:?}"
+        );
     }
 
     #[test]
