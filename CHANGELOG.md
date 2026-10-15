@@ -27,7 +27,7 @@ and when something was not done the report says so.
   `--evidence` and `--examiner`. The 0.1 placeholder defaults (`CASE001`, `cf01`,
   `Forensic Examiner`, `Law Enforcement / DFIR Unit`, `Physical Storage Media`)
   are gone; no placeholder is ever recorded. `convert` takes the case fields from
-  `<source>.info.json` or requires them.
+  the source image's report (and an E01's header) or requires them.
 - **Exit codes.** One documented table (docs/exit-codes.md): 0 verified,
   1 internal error, 2 usage, 3 refused, 4 failed, 5 mismatch, 6 incomplete,
   7 completed with read errors, 8 aborted, 9 complete but not verified. In 0.1
@@ -90,7 +90,10 @@ and when something was not done the report says so.
   again at the start and at the end; the source is held open with `O_EXCL` for
   the whole run; external tools read through `/dev/disk/by-diskseq/<N>` when it
   points at the pinned device; the TUI keys its selection on the identity and
-  shows a confirmation sheet.
+  shows a confirmation sheet. An E01 acquisition of a source that ends before
+  its size while it stays attached no longer waits forever: after 60 s without
+  progress dfdisk checks the source and, when it is gone or smaller, stops
+  ewfacquire (INCOMPLETE, "source lost at offset X").
 - **H1** The TUI hid the verdict: the result screen starts with the verdict
   banner, coloured by outcome, shows the key numbers and paths, scrolls the full
   report and stays until acknowledged; errors no longer expire. Notices are
@@ -108,16 +111,31 @@ and when something was not done the report says so.
   verified against the source digests, it writes `<base>.conversion.info` /
   `.conversion.info.json` and audit records, abort works, sizes that are not a
   multiple of 512 bytes are refused, split RAW inputs are converted completely
-  or refused.
+  or refused. An E01 that ewfinfo reports as corrupted (segments missing, or
+  never finalized) is INCOMPLETE (exit 6), and the sectors ewfexport could not
+  read correctly are listed as the conversion's own read errors (libewf
+  20140816 exports such an image with zeros and "SUCCESS"); segments beyond
+  `.EZZ` (`.FAA` …) are listed, flushed and refused like the others; a source
+  image whose report says HASH MISMATCH or VERIFICATION FAILED gives at best
+  COMPLETE, NOT VERIFIED (exit 9); a report found next to the image that
+  describes another image is ignored with a note (only a report given with
+  `--report` must describe it).
 - **H4** Rescue reports were not truthful: read-error ranges and counts come
   from the ddrescue mapfile, untried areas make the run INCOMPLETE, the map is
   hashed and listed, a resume requires the same device (identity sidecar) and
   passes `-I`, the earlier report is kept as `<base>.info.session-N`, and the TUI
-  offers to resume. The verdict explanation follows what happened: a rescue is
-  INCOMPLETE "because the map lists unfinished areas" only when it does and
-  nothing else stopped it, a VERIFIED rescue names the second read of the
-  source it was compared with, and a second read that differs is labelled by
-  what was compared (acquisition digests or the image).
+  offers to resume. A resume refuses an identity record whose SHA-256 differs
+  from the one the last report lists, and behind a USB bridge without a WWN it
+  ties the drive only by its own ATA IDENTIFY serial (recorded when SMART runs)
+  or the same attachment, not by the bridge's serial; a refused resume leaves
+  the previous report as `<base>.info`. After every ddrescue run dfdisk writes
+  zeros over the bad-sector areas of the map, so they are zeros in the image
+  also after an interrupted session was resumed. The verdict explanation
+  follows what happened: a rescue is INCOMPLETE "because the map lists
+  unfinished areas" only when it does and nothing else stopped it, a VERIFIED
+  rescue names the second read of the source it was compared with, and a second
+  read that differs is labelled by what was compared (acquisition digests or
+  the image).
 - **H5** Write protection was not checked or recorded: the read-only state of
   the source and its partitions, holders, mounts and the exclusive open are
   recorded; BLKROSET is set by default on the source, its partitions, the nodes
@@ -135,7 +153,8 @@ and when something was not done the report says so.
   verifications and conversions have the outcome `error` and the verdict as
   message; (d) an unwritable audit log refuses on dfnix and
   is stated in the report and the UI elsewhere; (e) tests no longer mirror
-  records into the host journal (dfcore 0.2.0).
+  records into the host journal (dfcore 0.2.0); (f) a refused conversion is
+  recorded (`conversion_refused`), as a refused acquisition is.
 - **H7** Unmount: `dfdisk unmount` and `--auto-unmount` collect the mounts of
   the source and all its descendants by device number, check the registry and
   system mounts before unmounting anything, unmount deepest first, verify that
@@ -173,10 +192,10 @@ and when something was not done the report says so.
   with timeouts) are recorded; `--refuse-hidden-areas` refuses.
 - **M3** Verification read the page cache: images, auxiliary files and the
   directory are fsynced and evicted from the page cache before verification. An
-  image that cannot be fsynced fails the verification (exit 4); one that cannot
-  be evicted is noted in the verification method ("the re-read may have come
-  from memory"); the method states the fsync and eviction only when they
-  happened.
+  image (or a conversion's output) that cannot be fsynced fails the
+  verification (exit 4); one that cannot be evicted is noted in the
+  verification method ("the re-read may have come from memory"); the method
+  states the fsync and eviction only when they happened.
 - **M4** Metadata: control characters are sanitised (no shifted E01 header
   fields), placeholders are never recorded, file names are capped at 255 bytes
   (refused, never truncated), tokens are NFC-normalised, existing outputs are
@@ -211,12 +230,15 @@ and when something was not done the report says so.
   never a pass; `.Ex01` and `.E02` segment families are recognised as EWF; an
   expected digest that is not 32/40/64 hex digits is a usage error (exit 2)
   instead of a HASH MISMATCH with an addendum.
-- Low: `-r` above 255 is a usage error instead of silently becoming 2; `-m` and
-  `-M` (media type and flags) are set from the source; firmware and other device
-  strings are sanitised; false README claims removed; runtime tools are no longer
-  build inputs of the Nix package; the Debian copyright covers both licenses;
-  `rust-version` is declared; active swap files on the source are refused by
-  name; `/iso`, `/run/initramfs` and swap join the system-mount list.
+- Low: `--split none` passes the largest segment size both libewf lines accept
+  (9223372036854775806 bytes; 0.1.10 passed 7900 GiB, so a larger source got
+  several segments); `-r` above 255 is a usage error instead of silently
+  becoming 2; `-m` and `-M` (media type and flags) are set from the source;
+  firmware and other device strings are sanitised; false README claims removed;
+  runtime tools are no longer build inputs of the Nix package; the Debian
+  copyright covers both licenses; `rust-version` is declared; active swap files
+  on the source are refused by name; `/iso`, `/run/initramfs` and swap join the
+  system-mount list.
 
 ### Added
 
@@ -243,9 +265,11 @@ and when something was not done the report says so.
   warning when the TUI runs over SSH outside tmux or screen.
 - **F10** `--rescue-to-e01`: a finished rescue is converted to E01 next to the
   rescue image; the rescue's verdict, read-error summary and zero-filled sector
-  ranges go into the E01 notes and the conversion report, which names the rescue
-  report by path and SHA-256. The ddrescue map is not imported into the E01 as
-  EWF error ranges.
+  ranges (in the notes the first 20, with the number of ranges) go into the E01
+  notes and the conversion report, which names the rescue report by path and
+  SHA-256. The ddrescue map is not imported into the E01 as EWF error ranges:
+  converted back to RAW without a report that lists those ranges, such an E01
+  is at best COMPLETE, NOT VERIFIED (exit 9), and the report quotes its notes.
 - **F11** Chain-of-custody fields `--seal`, `--seized-at`, `--seized-location`;
   required examiner, case and evidence number; a TUI case profile
   (`$XDG_CONFIG_HOME/dfdisk/profile.toml`) with an evidence-number suggestion.

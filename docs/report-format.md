@@ -31,7 +31,7 @@ case-insensitively (exFAT, NTFS and FAT destinations).
 
 | File | Written by | Content |
 |------|------------|---------|
-| `<base>.E01`, `.E02`, … `.EAA` … | E01 engine (ewfacquire) | EWF image segments |
+| `<base>.E01`, `.E02`, … `.EAA` … `.EZZ`, `.FAA` … | E01 engine (ewfacquire) | EWF image segments |
 | `<base>.raw` | RAW engine, rescue engine | the image (one file; RAW is never split) |
 | `<base>.info` | every acquisition | text report |
 | `<base>.info.json` | every acquisition | JSON report, schema 2 |
@@ -66,8 +66,19 @@ listed in the report with their SHA-256.
 A conversion (`dfdisk convert`, `--rescue-to-e01`) writes its own reports,
 `<base>.conversion.info` and `<base>.conversion.info.json`, next to its output;
 they name the report of the source image (path and SHA-256) and inherit its
-read-error table. `--rescue-to-e01` writes the E01 next to the rescue image; a
-later `--resume` of that rescue is refused while the E01 is there.
+read-error table (section READ ERRORS OF THE SOURCE ACQUISITION, JSON key
+`read_errors`). Sectors of the source image the conversion itself could not read
+correctly (ewfexport's "Read errors during export": data missing from the image,
+zeros in the output, or a chunk whose checksum does not match, written as
+stored) are listed separately as `unread` ranges ("not read" in the text):
+section READ ERRORS OF THIS CONVERSION, JSON key `conversion_errors` (same shape
+as `read_errors`); they make the conversion INCOMPLETE. `read_errors_note`
+(JSON; "Unreadable Ranges" in the text) states what is known about unreadable
+ranges the table cannot list, for example an E01 whose header notes alone record
+zero-filled sectors. An output that cannot be fsynced fails the conversion's
+verification (exit 4), as for an acquisition. `--rescue-to-e01` writes the E01
+next to the rescue image; a later `--resume` of that rescue is refused while the
+E01 is there.
 
 ## Text report (`<base>.info`)
 
@@ -256,7 +267,8 @@ lines, `/run/dfnix/audit.jsonl` by default; `DFNIX_AUDIT_LOG` overrides the path
 | `acquisition_refused` | a refusal after the device was selected and before "started" (identity, source safety, destination); nothing was written to the destination |
 | `unmount` | `dfdisk unmount` and `--auto-unmount`: the mounts and what happened to them |
 | `image_verification` | `dfdisk verify` |
-| `conversion_started`, `conversion_finished` | `dfdisk convert` and `--rescue-to-e01`; a conversion refused before it started (usage, destination checks, existing outputs) writes no record |
+| `conversion_started`, `conversion_finished` | `dfdisk convert` and `--rescue-to-e01`; a usage error or a failure before the start writes no record |
+| `conversion_refused` | a conversion refused before it started (for example by the destination checks, an existing output, or an output that would be the source): source, intended output, target format, output directory, base name (when known), the error kind and message, exit code 3; nothing was written |
 
 The top-level `outcome` of a record that carries a verdict
 (`acquisition_finished`, `image_verification`, `conversion_finished`) is `ok`
