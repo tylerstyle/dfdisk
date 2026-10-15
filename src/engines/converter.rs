@@ -2115,7 +2115,8 @@ struct ToolRun {
     /// "<tool>: SUCCESS" printed
     success_line: bool,
     /// "Read errors during export:" (ewfexport): sectors it could not read
-    /// from the EWF image and wrote as zeros
+    /// correctly from the EWF image (missing data: zeros in the output; a
+    /// checksum error: the data as stored)
     export_errors: Option<RunBlock>,
 }
 
@@ -2348,8 +2349,7 @@ struct Measured {
     verification: Option<VerificationResult>,
     verification_method: String,
     notes: Vec<String>,
-    /// Sectors the tool could not read from the source image (zeros in the
-    /// output)
+    /// Sectors the tool could not read correctly from the source image
     conversion_errors: ReadErrorTable,
 }
 
@@ -2720,9 +2720,10 @@ fn flush(env: &ConvertEnv, m: &Measured, plan: &Plan, sink: &ProgressSink) -> Fl
 }
 
 /// Why an E01 to RAW output is not the whole source image, and the sectors
-/// ewfexport wrote as zeros because it could not read them (C-1): ewfinfo's
-/// "Is corrupted: yes" (segments missing, or never finalized) and
-/// ewfexport's "Read errors during export".
+/// ewfexport could not read correctly (C-1): ewfinfo's "Is corrupted: yes"
+/// (segments missing, or never finalized) and ewfexport's "Read errors
+/// during export" (both libewf lines: zeros where data is missing from the
+/// image, the data as stored where a chunk's checksum does not match).
 fn export_problems(plan: &Plan, tool: &ToolRun, out_len: u64) -> (Vec<String>, ReadErrorTable) {
     let src = source_name(&plan.source);
     let mut problems = Vec::new();
@@ -2737,14 +2738,16 @@ fn export_problems(plan: &Plan, tool: &ToolRun, out_len: u64) -> (Vec<String>, R
     );
     if let Some(block) = &tool.export_errors {
         for r in &block.runs {
-            table.push_sectors(r.first, r.count, RangeKind::Substituted);
+            table.push_sectors(r.first, r.count, RangeKind::Unread);
         }
         table.normalise();
         let what = table
-            .summary(RangeKind::Substituted)
+            .summary(RangeKind::Unread)
             .unwrap_or_else(|| "sectors".into());
+        // Measured on both libewf lines: data missing from the E01 is
+        // written as zeros, a chunk whose checksum does not match as stored
         let mut p = format!(
-            "ewfexport could not read {what} of {src} and wrote zeros there instead (listed under the read errors of this conversion)"
+            "ewfexport could not read {what} of {src} correctly (data missing from the image, or a checksum that does not match): the output holds zeros or unchecked data there, not verified data of the image (listed under the read errors of this conversion)"
         );
         if block.incomplete() {
             p.push_str(&format!(
@@ -3270,7 +3273,7 @@ mod tests {
         assert!(e.block.is_none());
 
         let mut t = ReadErrorTable::new(512, "x");
-        t.push_sectors(5952, 192, RangeKind::Substituted);
+        t.push_sectors(5952, 192, RangeKind::Unread);
         assert_eq!(zeros_within(&t, 3 << 20), 192 * 512);
         assert_eq!(zeros_within(&t, 5952 * 512 + 512), 512);
         assert_eq!(zeros_within(&t, 1000), 0);

@@ -317,9 +317,10 @@ pub struct ConversionReport {
     /// E01 whose header notes alone record zero-filled sectors
     #[serde(default)]
     pub read_errors_note: Option<String>,
-    /// Sectors of the source image the conversion tool could not read and
-    /// wrote as zeros into the output (ewfexport's "Read errors during
-    /// export"); empty when it read every sector
+    /// Sectors of the source image the conversion tool could not read
+    /// correctly (ewfexport's "Read errors during export": data missing from
+    /// the image, written as zeros, or a chunk whose checksum does not
+    /// match, written as stored); empty when it read every sector
     #[serde(default)]
     pub conversion_errors: ReadErrorTable,
     pub comparisons: Vec<DigestComparison>,
@@ -485,9 +486,9 @@ impl ConversionReport {
                 "{s} of the source medium were never read by its acquisition and are not in the image."
             ));
         }
-        if let Some(s) = self.conversion_errors.summary(RangeKind::Substituted) {
+        if let Some(s) = self.conversion_errors.summary(RangeKind::Unread) {
             out.push(format!(
-                "{s} of the source image could not be read by the conversion and are zeros in the output, not data of the image."
+                "{s} of the source image could not be read correctly by the conversion; the output holds zeros or unchecked data there, not verified data of the image."
             ));
         }
         if let Some(stop) = &self.stop_reason {
@@ -784,11 +785,13 @@ impl ConversionReport {
             return;
         }
         out.push_str("[READ ERRORS OF THIS CONVERSION]\n");
-        if let Some(s) = t.summary(RangeKind::Substituted) {
+        if let Some(s) = t.summary(RangeKind::Unread) {
             row(
                 out,
-                "Zeros in the Output",
-                format!("{s}: the source image could not be read there"),
+                "Not Read Correctly",
+                format!(
+                    "{s}: the output holds zeros (data missing from the image) or the data as stored (a checksum that does not match) there"
+                ),
             );
         }
         self.render_ranges(out, t);

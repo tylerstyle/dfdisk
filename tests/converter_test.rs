@@ -909,12 +909,12 @@ fn assert_corrupted_e01_conversion(r: &ConversionReport, out_raw: &Path) {
         "{text}"
     );
     if legacy_libewf() {
-        // Zeros for the unreadable part, listed with their positions
-        assert!(r.conversion_errors.substituted_bytes() > 0, "{text}");
+        // Zeros for the missing part, listed with their positions
+        assert!(r.conversion_errors.unread_bytes() > 0, "{text}");
         assert!(stop.contains("ewfexport could not read"), "{stop}");
         assert!(text.contains("[READ ERRORS OF THIS CONVERSION]"), "{text}");
         assert_eq!(
-            r.bytes_converted + r.conversion_errors.substituted_bytes(),
+            r.bytes_converted + r.conversion_errors.unread_bytes(),
             r.expected_bytes,
             "{text}"
         );
@@ -924,6 +924,50 @@ fn assert_corrupted_e01_conversion(r: &ConversionReport, out_raw: &Path) {
             assert!(out[a..b.min(out.len())].iter().all(|x| *x == 0));
         }
     }
+}
+
+/// C-1: a chunk whose checksum does not match is exported as stored (both
+/// libewf lines report it under "Read errors during export"); the report
+/// lists it and never calls it zeros or converted.
+#[tokio::test]
+async fn a_chunk_that_fails_its_checksum_is_listed_not_converted() {
+    if !have_libewf() {
+        return;
+    }
+    let f = fixture();
+    let content = data(1 << 20, 26);
+    let raw = f.src.join("x.raw");
+    std::fs::write(&raw, &content).unwrap();
+    let mut req = request(&raw, ConversionTarget::E01, &f.root.join("e01"));
+    req.case = Some(case());
+    req.compression = CompressionLevel::None;
+    run(&f.env, req, StopFlags::new()).await.unwrap();
+    let e01 = f.root.join("e01").join("x.E01");
+    // Overwrite 8 bytes of chunk data (uncompressed E01, past the headers)
+    {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::OpenOptions::new().write(true).open(&e01).unwrap();
+        file.write_all_at(b"XXXXXXXX", 300_000).unwrap();
+    }
+    let alone = f.root.join("alone");
+    std::fs::create_dir_all(&alone).unwrap();
+    std::fs::copy(&e01, alone.join("x.E01")).unwrap();
+    let mut req = request(&alone.join("x.E01"), ConversionTarget::Raw, &f.out);
+    req.case = Some(case());
+    let r = run(&f.env, req, StopFlags::new()).await.unwrap();
+    let text = r.render_text();
+    assert_eq!(r.outcome, Outcome::Incomplete, "{text}");
+    assert_eq!(r.conversion_errors.ranges.len(), 1, "{text}");
+    assert_eq!(r.conversion_errors.unread_bytes(), 64 * 512);
+    assert_eq!(r.bytes_converted, (1 << 20) - 64 * 512);
+    let stop = r.stop_reason.clone().unwrap();
+    assert!(stop.contains("could not read 64 sectors"), "{stop}");
+    assert!(stop.contains("zeros or unchecked data"), "{stop}");
+    assert!(!text.contains("zero-filled"), "{text}");
+    // The output holds the data as stored, not zeros
+    let out = std::fs::read(f.out.join("x.raw")).unwrap();
+    assert_eq!(out.len(), 1 << 20);
+    assert!(out[288 * 1024..320 * 1024].iter().any(|b| *b != 0));
 }
 
 /// C-4: an E01 made from a rescue (as --rescue-to-e01 does) records its
