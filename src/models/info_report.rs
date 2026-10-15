@@ -151,12 +151,18 @@ pub fn compare_digest_sets(
 /// How the acquisition was verified.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationInfo {
-    /// Image digests (re-read) against acquisition digests, or why not
+    /// The verification as a whole: the image re-read combined with the
+    /// second source read (`--verify-source`), or why there is none
     pub result: VerificationResult,
     /// e.g. "ewfverify -d md5,sha256 after flush and cache eviction"
     pub method: String,
     /// Second read of the source (`--verify-source`) against the acquisition
     pub source_reread: Option<VerificationResult>,
+    /// The verification of the written image alone (its re-read, after the
+    /// flush), before the second source read was taken into account; `None`
+    /// in reports written before this field existed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<VerificationResult>,
 }
 
 /// Piecewise SHA-256 of a RAW acquisition (R5).
@@ -1051,7 +1057,15 @@ impl ForensicInfoReport {
         }
         out.push_str("Image re-read (recomputed from the written image):\n");
         if self.image_hashes.is_empty() {
-            out.push_str("  (none: the image was not re-read)\n");
+            // Why there is none: the image's own result, not the combined one
+            let why = match &self.verification.image {
+                Some(VerificationResult::Failed { reason }) => {
+                    format!("the image re-read failed: {}", sanitize(reason))
+                }
+                Some(VerificationResult::NotPossible { reason }) => sanitize(reason),
+                _ => "the image was not re-read".to_string(),
+            };
+            out.push_str(&format!("  (none: {why})\n"));
         }
         for (label, digest) in self.image_hashes.present() {
             out.push_str(&format!("  {:<8}: {}\n", label, sanitize(digest)));
@@ -1390,6 +1404,7 @@ mod tests {
             },
             method: "image re-read by dfdisk after fsync".into(),
             source_reread: None,
+            image: None,
         };
         r.apply_classification();
         r

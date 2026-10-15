@@ -135,7 +135,13 @@ and when something was not done the report says so.
   unfinished areas" only when it does and nothing else stopped it, a VERIFIED
   rescue names the second read of the source it was compared with, and a second
   read that differs is labelled by what was compared (acquisition digests or
-  the image).
+  the image). An image that cannot be re-read keeps its own read error as the
+  reason of VERIFICATION FAILED (also next to a failed flush), with the second
+  read's result appended, and
+  the report's HASHES section says that the re-read failed and why; a rescue
+  image without digests is not compared with a second read ("nothing to compare
+  with"; the source is not read again), and "the second source read failed"
+  names only a second read that failed itself.
 - **H5** Write protection was not checked or recorded: the read-only state of
   the source and its partitions, holders, mounts and the exclusive open are
   recorded; BLKROSET is set by default on the source, its partitions, the nodes
