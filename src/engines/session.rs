@@ -54,8 +54,9 @@ use crate::models::config::{
 use crate::models::device::{BlockDevice, SmartSnapshot};
 use crate::models::identity::{SerialSource, SourceIdentity};
 use crate::models::info_report::{
-    compare_digests, sync_dir, AuditInfo, AuditStatus, FileDigest, ForensicInfoReport, HashResults,
-    IdentityCheck, PiecewiseInfo, ReportFiles, SessionInfo, VerificationInfo, RESERVE_SUFFIX,
+    compare_digest_sets, sync_dir, AuditInfo, AuditStatus, FileDigest, ForensicInfoReport,
+    HashResults, IdentityCheck, PiecewiseInfo, ReportFiles, SessionInfo, VerificationInfo,
+    RESERVE_SUFFIX,
 };
 use crate::models::outcome::{AcquisitionFacts, ReadErrorTable, VerificationResult};
 use crate::models::protection::{RegistryPresence, WriteProtection};
@@ -1022,22 +1023,56 @@ impl ImageFlush {
     }
 }
 
+/// The second read of the source compared with what the acquisition
+/// measured, labelled by what was compared (R-4): with acquisition digests,
+/// a difference means the source changed or reads unstably; without them
+/// (ddrescue), the second read is compared with the image, and a difference
+/// means the image differs from the source as read again (a damaged image,
+/// or a changed or unstable source).
+pub fn compare_second_read(
+    selection: HashSelection,
+    acquisition: &HashResults,
+    image: &HashResults,
+    reread: &HashResults,
+) -> VerificationResult {
+    const METHOD: &str = "second read of the source";
+    let (result, cause) = if acquisition.is_empty() {
+        (
+            compare_digest_sets(selection, ("image", image), ("second read", reread), METHOD),
+            "the image differs from the source as read a second time (a damaged image, or a source that changed or reads unstably)",
+        )
+    } else {
+        (
+            compare_digest_sets(
+                selection,
+                ("acquisition", acquisition),
+                ("second read", reread),
+                METHOD,
+            ),
+            "the source changed or reads unstably",
+        )
+    };
+    match result {
+        VerificationResult::Mismatched { method, details } => VerificationResult::Mismatched {
+            method,
+            details: format!("{cause}: {details}"),
+        },
+        other => other,
+    }
+}
+
 /// The image verification combined with the second source read: a
-/// differing second read is a mismatch ("source changed or unstable"); a
-/// requested second read that failed fails the verification; a matching
-/// second read verifies an acquisition whose engine had no stream digest.
+/// differing second read is a mismatch (as [`compare_second_read`] labelled
+/// it); a requested second read that failed fails the verification; a
+/// matching second read verifies an acquisition whose engine had no stream
+/// digest.
 pub fn combine_verification(
     image: VerificationResult,
     source_reread: Option<&VerificationResult>,
 ) -> VerificationResult {
     match source_reread {
         None | Some(VerificationResult::NotPossible { .. }) => image,
-        Some(VerificationResult::Mismatched { method, details }) => {
-            VerificationResult::Mismatched {
-                method: method.clone(),
-                details: format!("source changed or unstable: {details}"),
-            }
-        }
+        Some(mismatch @ VerificationResult::Mismatched { .. }) => mismatch.clone(),
         Some(VerificationResult::Failed { reason }) => match image {
             VerificationResult::Mismatched { .. } => image,
             _ => VerificationResult::Failed {
@@ -1300,19 +1335,12 @@ async fn acquire_phase(
             "Reading the source a second time (--verify-source)",
         );
         match host.reread_source(&ctx, out.bytes_acquired).await {
-            Ok(reread) => {
-                let reference = if out.acquisition_hashes.is_empty() {
-                    &image_hashes
-                } else {
-                    &out.acquisition_hashes
-                };
-                Some(compare_digests(
-                    v.selection,
-                    reference,
-                    &reread,
-                    "second read of the source",
-                ))
-            }
+            Ok(reread) => Some(compare_second_read(
+                v.selection,
+                &out.acquisition_hashes,
+                &image_hashes,
+                &reread,
+            )),
             Err(e) if e.kind == ErrorKind::Aborted || stop.is_aborted() => {
                 out.aborted = true;
                 Some(VerificationResult::NotPossible {

@@ -187,8 +187,19 @@ source with `--verify-source`; null when there was none) are tagged objects:
 {"status": "failed", "reason": "..."}
 ```
 
-A second source read that differs from the acquisition digests makes the verdict
-MISMATCH ("source changed or unstable").
+A second source read that differs makes the verdict MISMATCH, labelled by what
+was compared: with acquisition digests (E01, RAW) "the source changed or reads
+unstably: MD5 acquisition … but second read …"; without them (rescue, where the
+second read is compared with the image) "the image differs from the source as
+read a second time …: MD5 image … but second read …".
+
+The one-sentence explanation under the verdict is chosen by what happened, not
+only by the verdict: a rescue is INCOMPLETE "because the ddrescue map still
+lists areas that were not tried or not finished" only when the map has such
+areas and nothing else stopped the run (otherwise the explanation names the
+stop or the identity change); a VERIFIED rescue says that its image digests
+equal a second, independent read of the source; an ABORTED or INCOMPLETE run
+says "its digests cover only what was acquired" only when digests exist.
 
 ## Piecewise hashes (`<base>.pieces.tsv`)
 

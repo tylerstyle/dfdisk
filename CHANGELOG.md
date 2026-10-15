@@ -94,7 +94,11 @@ and when something was not done the report says so.
   from the ddrescue mapfile, untried areas make the run INCOMPLETE, the map is
   hashed and listed, a resume requires the same device (identity sidecar) and
   passes `-I`, the earlier report is kept as `<base>.info.session-N`, and the TUI
-  offers to resume.
+  offers to resume. The verdict explanation follows what happened: a rescue is
+  INCOMPLETE "because the map lists unfinished areas" only when it does and
+  nothing else stopped it, a VERIFIED rescue names the second read of the
+  source it was compared with, and a second read that differs is labelled by
+  what was compared (acquisition digests or the image).
 - **H5** Write protection was not checked or recorded: the read-only state of
   the source and its partitions, holders, mounts and the exclusive open are
   recorded; BLKROSET is set by default.

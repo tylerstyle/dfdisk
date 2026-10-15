@@ -1202,7 +1202,46 @@ async fn second_source_read_that_differs_is_source_changed() {
     let VerificationResult::Mismatched { details, .. } = &report.verification.result else {
         panic!("{:?}", report.verification.result)
     };
-    assert!(details.contains("source changed or unstable"), "{details}");
+    assert!(
+        details.starts_with("the source changed or reads unstably: MD5 acquisition "),
+        "{details}"
+    );
+    assert!(details.contains(" but second read "), "{details}");
+    let banner = report.verdict_lines().join("\n");
+    assert!(
+        banner.contains("a second read of the source differ from those computed while reading it"),
+        "{banner}"
+    );
+
+    // Rescue (no acquisition digests): the second read is compared with the
+    // image, and the labels and the explanation say so (R-4)
+    let mut fake = Fake::new();
+    fake.engine = Some(rescue_engine(fake.data.clone()));
+    fake.reread = Some(Ok(hashes(b"changed")));
+    let config = AcquisitionConfig {
+        verify_source: true,
+        smart: SmartPolicy::Off,
+        ..AcquisitionConfig::rescue(fake.out())
+    };
+    let report = run_fake(&fake, config).await.0.unwrap();
+    assert_eq!(report.outcome, Outcome::Mismatch);
+    let VerificationResult::Mismatched { details, .. } = &report.verification.result else {
+        panic!("{:?}", report.verification.result)
+    };
+    assert!(
+        details.starts_with("the image differs from the source as read a second time"),
+        "{details}"
+    );
+    assert!(details.contains("MD5 image "), "{details}");
+    assert!(!details.contains("acquisition"), "{details}");
+    let banner = report.verdict_lines().join("\n");
+    assert!(
+        banner.contains(
+            "The digests of the written image differ from those of a second read of the source"
+        ),
+        "{banner}"
+    );
+    assert!(!banner.contains("computed during acquisition"), "{banner}");
 
     // A second read that fails fails the verification
     let mut fake = Fake::new();
@@ -1253,7 +1292,12 @@ async fn rescue_is_unverified_unless_the_source_is_read_again() {
         .any(|f| f.path.ends_with(".map")));
     assert!(!fake.calls().contains(&"smart"));
 
-    // --verify-source: the second read matches the image -> verified
+    // Without --verify-source the explanation names the remedy
+    let banner = report.verdict_lines().join("\n");
+    assert!(banner.contains("acquire with --verify-source"), "{banner}");
+
+    // --verify-source: the second read matches the image -> verified, and the
+    // explanation says what was compared (no stream digest exists, T2)
     let mut fake = Fake::new();
     fake.engine = Some(rescue_engine(fake.data.clone()));
     let config = AcquisitionConfig {
@@ -1266,6 +1310,15 @@ async fn rescue_is_unverified_unless_the_source_is_read_again() {
         Outcome::Verified,
         "{}",
         report.outcome_reason
+    );
+    let banner = report.verdict_lines().join("\n");
+    assert!(
+        banner.contains("equal those of a second, independent read of the source"),
+        "{banner}"
+    );
+    assert!(
+        !banner.contains("computed while reading the source"),
+        "{banner}"
     );
     // SMART before and after a rescue
     assert_eq!(fake.calls().iter().filter(|c| **c == "smart").count(), 2);
@@ -1548,12 +1601,30 @@ fn verification_and_second_read_combine() {
         combine_verification(matched("img"), Some(&failed)),
         VerificationResult::Failed { .. }
     ));
+    // The second read's mismatch is passed on as compare_second_read
+    // labelled it
+    assert_eq!(
+        combine_verification(matched("img"), Some(&mismatched)),
+        mismatched
+    );
+    let sel = HashSelection::for_engine(&AcquisitionConfig::raw("/x"));
     let VerificationResult::Mismatched { details, .. } =
-        combine_verification(matched("img"), Some(&mismatched))
+        compare_second_read(sel, &hashes(b"a"), &hashes(b"a"), &hashes(b"b"))
     else {
         panic!()
     };
-    assert!(details.starts_with("source changed or unstable"));
+    assert!(details.starts_with("the source changed or reads unstably: MD5 acquisition"));
+    let VerificationResult::Mismatched { details, .. } =
+        compare_second_read(sel, &HashResults::default(), &hashes(b"a"), &hashes(b"b"))
+    else {
+        panic!()
+    };
+    assert!(details.starts_with("the image differs from the source"));
+    assert!(details.contains("MD5 image "), "{details}");
+    assert!(
+        compare_second_read(sel, &HashResults::default(), &hashes(b"a"), &hashes(b"a"))
+            .is_matched()
+    );
     // An image mismatch stays a mismatch when the second read failed
     assert!(matches!(
         combine_verification(mismatched.clone(), Some(&failed)),
