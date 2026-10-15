@@ -758,6 +758,55 @@ fn serial_tie(recorded: &SourceIdentity, now: &SourceIdentity) -> Result<Option<
         .ok_or_else(|| format!("serial {}, was {}", distinct(&b), distinct(&a)))
 }
 
+/// Attached through USB (transport "usb").
+fn is_usb(id: &SourceIdentity) -> bool {
+    id.transport
+        .as_deref()
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("usb"))
+}
+
+/// The serial the drive itself reported through ATA IDENTIFY (smartctl),
+/// when both identities have it and it is the same: behind a USB bridge the
+/// only serial that names the drive rather than the bridge.
+fn drive_serial_tie(recorded: &SourceIdentity, now: &SourceIdentity) -> Option<String> {
+    let identify = |id: &SourceIdentity| -> Option<String> {
+        id.serial_candidates
+            .iter()
+            .find(|c| c.source == SerialSource::SmartctlIdentify)
+            .map(|c| c.value.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    match (identify(recorded), identify(now)) {
+        (Some(a), Some(b)) if a.eq_ignore_ascii_case(&b) => Some(b),
+        _ => None,
+    }
+}
+
+/// The same attachment: kernel name and major:minor, and the disk sequence
+/// number where both have one (a new attachment gets a new one).
+fn same_attachment(recorded: &SourceIdentity, now: &SourceIdentity) -> bool {
+    let seq_ok = match (recorded.diskseq, now.diskseq) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
+    recorded.maj_min.is_some()
+        && recorded.maj_min == now.maj_min
+        && recorded.kernel_name == now.kernel_name
+        && seq_ok
+}
+
+/// "sdx, major:minor 8:16, disk sequence number 7".
+fn attachment(id: &SourceIdentity) -> String {
+    format!(
+        "{}, major:minor {}{}",
+        id.kernel_name,
+        id.maj_min.as_deref().unwrap_or("unknown"),
+        id.diskseq
+            .map(|s| format!(", disk sequence number {s}"))
+            .unwrap_or_else(|| ", disk sequence number unknown".into())
+    )
+}
+
 /// Both known and different (trimmed, case-insensitive).
 fn differs(a: &Option<String>, b: &Option<String>) -> bool {
     match (a, b) {
@@ -773,6 +822,9 @@ fn differs(a: &Option<String>, b: &Option<String>) -> bool {
 /// serial source may disagree; a device with neither serial nor WWN is
 /// accepted only in the same attachment (major:minor, disk sequence number),
 /// because a re-attached drive without either cannot be told from another.
+/// Behind a USB bridge without a WWN the serials (SCSI VPD page, udev) are
+/// the bridge's: only the drive's own ATA IDENTIFY serial on both sides, or
+/// the same attachment, ties the drive.
 /// Regular files: same canonical path and file identity. `Ok` says what tied
 /// them; `Err` lists every difference.
 pub fn compare_resume_identity(
@@ -845,38 +897,39 @@ pub fn compare_resume_identity(
             }
             _ => false,
         };
+        let usb = is_usb(recorded) || is_usb(now);
         match serial_tie(recorded, now) {
+            Ok(Some(s)) if usb && !wwn_pair => match drive_serial_tie(recorded, now) {
+                Some(drive) => basis.push(format!(
+                    "the drive's own serial {drive} (ATA IDENTIFY)"
+                )),
+                // Behind a USB bridge the serial is the bridge's (SCSI VPD
+                // page, udev): another drive of the same model and size in
+                // the same enclosure reports it too (R-5)
+                None if same_attachment(recorded, now) => basis.push(format!(
+                    "serial {s} as the USB bridge reports it, in the same attachment ({})",
+                    attachment(now)
+                )),
+                None => diffs.push(format!(
+                    "the source is attached through USB and its serial {s} is the one the USB bridge reports (SCSI VPD page, udev), not the drive's own: another drive of the same model and size behind the same bridge reports it too. Without the drive's own serial (ATA IDENTIFY, read when SMART runs) at the first start and now, or a WWN, only the same attachment can tie it to this rescue; it is now ({}), was ({})",
+                    attachment(now),
+                    attachment(recorded)
+                )),
+            },
             Ok(Some(s)) => basis.push(format!("serial {s}")),
             Ok(None) if !wwn_pair => {
                 // dfcore's fallback (name + major:minor) cannot tell a
                 // re-attached drive from another one: the same attachment only
-                let seq_ok = match (recorded.diskseq, now.diskseq) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => true,
-                };
-                if recorded.maj_min.is_some()
-                    && recorded.maj_min == now.maj_min
-                    && recorded.kernel_name == now.kernel_name
-                    && seq_ok
-                {
+                if same_attachment(recorded, now) {
                     basis.push(format!(
-                        "no serial number or WWN; the same attachment ({}, major:minor {}{})",
-                        now.kernel_name,
-                        now.maj_min.as_deref().unwrap_or("-"),
-                        now.diskseq
-                            .map(|s| format!(", disk sequence number {s}"))
-                            .unwrap_or_default()
+                        "no serial number or WWN; the same attachment ({})",
+                        attachment(now)
                     ));
                 } else {
-                    let unknown = || "unknown".to_string();
                     diffs.push(format!(
-                        "the source reports no serial number and no WWN, so only the same attachment can tie it to this rescue; it is now {} major:minor {} disk sequence number {}, was {} major:minor {} disk sequence number {} (a re-attached drive without serial cannot be told from another drive)",
-                        now.kernel_name,
-                        now.maj_min.clone().unwrap_or_else(unknown),
-                        now.diskseq.map(|s| s.to_string()).unwrap_or_else(unknown),
-                        recorded.kernel_name,
-                        recorded.maj_min.clone().unwrap_or_else(unknown),
-                        recorded.diskseq.map(|s| s.to_string()).unwrap_or_else(unknown),
+                        "the source reports no serial number and no WWN, so only the same attachment can tie it to this rescue; it is now ({}), was ({}) (a re-attached drive without serial cannot be told from another drive)",
+                        attachment(now),
+                        attachment(recorded)
                     ));
                 }
             }
@@ -1538,12 +1591,69 @@ mod tests {
             e.contains("DRIVE-B (ATA IDENTIFY (smartctl)), was DRIVE-A"),
             "{e}"
         );
-        // Without IDENTIFY on this side the bridge serial ties them
+        // Without IDENTIFY on this side the bridge serial ties them only in
+        // the same attachment
         let mut now = rec.clone();
         now.serial_candidates
             .retain(|c| c.source == SerialSource::VpdPage80);
         now.choose_serial();
-        assert!(compare_resume_identity(&rec, &now).is_ok());
+        let tie = compare_resume_identity(&rec, &now).unwrap();
+        assert!(tie.contains("as the USB bridge reports it"), "{tie}");
+        now.diskseq = Some(8);
+        let e = compare_resume_identity(&rec, &now).unwrap_err();
+        assert!(e.contains("is the one the USB bridge reports"), "{e}");
+    }
+
+    #[test]
+    fn a_usb_bridge_serial_alone_ties_only_the_same_attachment() {
+        // R-5: SMART did not run at the first start; the bridge's serial is
+        // all there is, and another drive in the same enclosure has it too
+        let mut rec = no_serial();
+        rec.transport = Some("usb".into());
+        rec.model = Some("ST2000DM008".into());
+        rec.add_serial_candidate("BRIDGE0001", SerialSource::VpdPage80);
+        rec.add_serial_candidate("BRIDGE0001", SerialSource::UdevIdSerialShort);
+        let mut other_drive = rec.clone();
+        other_drive.kernel_name = "sdy".into();
+        other_drive.maj_min = Some("8:32".into());
+        other_drive.diskseq = Some(12);
+        let e = compare_resume_identity(&rec, &other_drive).unwrap_err();
+        assert!(
+            e.contains("serial BRIDGE0001 is the one the USB bridge"),
+            "{e}"
+        );
+        assert!(e.contains("ATA IDENTIFY"), "{e}");
+        assert!(
+            e.contains(
+                "it is now (sdy, major:minor 8:32, disk sequence number 12), was (sdx, major:minor 8:16, disk sequence number 7)"
+            ),
+            "{e}"
+        );
+        // SMART now, but not at the first start: still the bridge's serial
+        let mut smart_now = other_drive.clone();
+        smart_now.add_serial_candidate("DRIVE-B", SerialSource::SmartctlIdentify);
+        assert!(compare_resume_identity(&rec, &smart_now).is_err());
+        // The same attachment (never unplugged): the same drive
+        assert!(compare_resume_identity(&rec, &rec.clone()).is_ok());
+        // The drive's own serial on both sides ties a re-attached drive
+        let mut rec_smart = rec.clone();
+        rec_smart.add_serial_candidate("DRIVE-A", SerialSource::SmartctlIdentify);
+        let mut again = other_drive.clone();
+        again.add_serial_candidate("DRIVE-A", SerialSource::SmartctlIdentify);
+        let tie = compare_resume_identity(&rec_smart, &again).unwrap();
+        assert!(tie.contains("the drive's own serial DRIVE-A"), "{tie}");
+        // A WWN ties as on any transport
+        let mut a = rec.clone();
+        a.wwn = Some("0x5000c500a1b2c3d4".into());
+        let mut b = other_drive.clone();
+        b.wwn = a.wwn.clone();
+        assert!(compare_resume_identity(&a, &b).unwrap().contains("WWN"));
+        // Not USB: the serial ties a re-attached drive as before
+        let mut sata = rec.clone();
+        sata.transport = Some("sata".into());
+        let mut sata_now = other_drive.clone();
+        sata_now.transport = Some("sata".into());
+        assert!(compare_resume_identity(&sata, &sata_now).is_ok());
     }
 
     #[test]
