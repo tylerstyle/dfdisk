@@ -321,6 +321,12 @@ impl<'a> Prober<'a> {
             };
             id.add_serial_candidate(&serial, source);
         }
+        // virtio-blk reports the serial of the virtual disk on the disk node
+        // itself (/sys/block/vda/serial); lsblk shows it, so the probe must
+        // know it too or a selected virtio disk would look swapped
+        if let Some(serial) = sys.attr(hw, "serial").and_then(|v| sanitize_opt(&v)) {
+            id.add_serial_candidate(&serial, SerialSource::SysfsDeviceSerial);
+        }
 
         // NVMe namespaces carry their own wwid; SCSI/ATA devices have it on the device
         id.wwn = sys
@@ -622,6 +628,42 @@ mod tests {
         assert_eq!(lvm.serial, None);
         assert_eq!(lvm.model, None);
         assert!(lvm.probe_notes.iter().any(|n| n.contains("2 disks")));
+    }
+
+    #[test]
+    fn virtio_disk_serial_and_dm_linear_over_it() {
+        const VIRTIO: &str = "pci0000:00/0000:00:05.0/virtio2";
+        let f = FakeSysfs::new();
+        f.add_disk(VIRTIO, "vdb", (252, 16), 131_072);
+        f.set("vdb", "serial", "CFTT-DISK-1");
+        f.set("vdb", "diskseq", "4");
+        let id = Prober::sysfs_only(f.root())
+            .probe_block("/dev/vdb", (252, 16))
+            .unwrap();
+        assert_eq!(id.kind, SourceKind::Disk);
+        assert_eq!(id.transport.as_deref(), Some("virtio"));
+        assert_eq!(id.serial.as_deref(), Some("CFTT-DISK-1"));
+        assert_eq!(id.serial_source(), Some(SerialSource::SysfsDeviceSerial));
+
+        // dm-linear over the whole disk: the disk's hardware identity
+        f.add_virtual("dm-2", (254, 2), 131_072);
+        f.set("dm-2", "dm/name", "lin");
+        f.set("dm-2", "diskseq", "11");
+        f.stack("dm-2", "vdb");
+        let dm = Prober::sysfs_only(f.root())
+            .probe_block("/dev/mapper/lin", (254, 2))
+            .unwrap();
+        assert_eq!(
+            dm.kind,
+            SourceKind::DeviceMapper {
+                crypt_plaintext: false
+            }
+        );
+        assert_eq!(dm.parent_disks, ["/dev/vdb"]);
+        assert_eq!(dm.hardware_of.as_deref(), Some("vdb"));
+        assert_eq!(dm.serial.as_deref(), Some("CFTT-DISK-1"));
+        assert_eq!(dm.diskseq, Some(11), "a dm device has its own diskseq");
+        assert_eq!(by_diskseq_name(&dm).as_deref(), Some("11"));
     }
 
     #[test]

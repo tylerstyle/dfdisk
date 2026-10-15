@@ -87,7 +87,8 @@ pub enum SerialSource {
     VpdPage80,
     /// NVMe controller `serial` attribute in sysfs
     NvmeController,
-    /// Other device `serial` attribute in sysfs (e.g. MMC/SD CID)
+    /// Other `serial` attribute in sysfs (e.g. MMC/SD CID on the device,
+    /// virtio-blk on the disk node)
     SysfsDeviceSerial,
     /// udev `ID_SERIAL_SHORT`
     UdevIdSerialShort,
