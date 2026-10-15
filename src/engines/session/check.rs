@@ -4,7 +4,8 @@
 //! described), no SMART JSON file. The exclusive open is tried and released.
 
 use super::{
-    destination_checks, identify, missing_tools, source_safety, tools_error, validate, SessionHost,
+    destination_checks, identify, missing_tools, source_safety, tool_options_error, tools_error,
+    validate, SessionHost,
 };
 use crate::discovery::writeprotect::{self, WriteProtectDecision};
 use crate::engines::error::{AcquisitionError, ErrorKind};
@@ -234,7 +235,9 @@ pub(super) async fn run_check(
     }
     let missing = missing_tools(host, &request.config);
     report.missing_tools = Some(missing.iter().map(|t| t.to_string()).collect());
-    if let Err(e) = tools_error(&request.config, &missing) {
+    if let Err(e) = tools_error(&request.config, &missing)
+        .and_then(|()| tool_options_error(host, &request.config))
+    {
         report.problem("tools", e);
     }
 

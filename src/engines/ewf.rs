@@ -40,11 +40,16 @@
 //!   the engine returns `Ok` with `aborted: true` and the last progress figure.
 //!   An interrupted ewfacquire leaves an unfinalized image ("Is corrupted:
 //!   yes"), which the report states.
-//! - **Options.** `-r` (0..=255), `-g`, `-m`, `-M` and `-l <base>.ewfacquire.log`
-//!   are passed as the effective config states; what ewfacquire actually
-//!   applied (its "defaulting to" notices, the granularity, media type and
-//!   flags the image records) replaces the requested values in the report,
-//!   with a note when they differ.
+//! - **Options.** `-g`, `-m`, `-M` and `-l <base>.ewfacquire.log` are passed
+//!   as the effective config states; what ewfacquire actually applied (its
+//!   "defaulting to" notices, the granularity, media type and flags the image
+//!   records) replaces the requested values in the report, with a note when
+//!   they differ. `-r` (0..=255) is passed only for a count other than
+//!   ewfacquire's own default of 2 ([`EWFACQUIRE_DEFAULT_RETRIES`]; the
+//!   report then says "-r not given"): ewfacquire 20140807 (Ubuntu 22.04's
+//!   ewf-tools) and the other releases [`retries_option_crashes`] names crash
+//!   on any `-r`, and the session refuses another count with them before
+//!   anything is written ([`check_retries_option`]).
 
 use crate::engines::error::AcquisitionError;
 use crate::engines::process::{
@@ -52,7 +57,8 @@ use crate::engines::process::{
 };
 use crate::engines::session::{EngineContext, EngineOutput};
 use crate::models::config::{
-    AcquisitionConfig, EffectiveConfig, EngineSettings, EwfSettings, HashSelection, MAX_RETRIES,
+    AcquisitionConfig, EffectiveConfig, EngineSettings, EwfSettings, HashSelection,
+    EWFACQUIRE_DEFAULT_RETRIES, MAX_RETRIES,
 };
 use crate::models::identity::SourceIdentity;
 use crate::models::info_report::{compare_digests, HashResults};
@@ -681,6 +687,58 @@ pub fn check_source_size(size_bytes: u64) -> Result<(), String> {
     ))
 }
 
+/// The libewf release of an ewfacquire version line ("ewfacquire 20140807"
+/// gives 20140807); `None` when the line names no release (eight digits).
+pub fn libewf_release(version_line: &str) -> Option<u32> {
+    let token = version_line
+        .trim()
+        .strip_prefix("ewfacquire")?
+        .split_whitespace()
+        .next()?;
+    (token.len() == 8 && token.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| token.parse().ok())
+        .flatten()
+}
+
+/// Whether ewfacquire of libewf `release` crashes on `-r`. Its option parser
+/// hands the `-b` string to the retry setting instead of the `-r` string, so
+/// `-r N` without `-b` dereferences a null pointer (SIGSEGV before anything
+/// is written) and `-r N -b M` applies M retries. Determined from libewf's
+/// history (ewfacquire.c, `device_handle_set_number_of_error_retries(...,
+/// option_sectors_per_chunk, ...)`): introduced in 20101105, fixed upstream
+/// on 2020-02-10 ("Addressed issue with error retries in ewfacquire"): in
+/// libewf-legacy from 20140810 on (20140806 to 20140808 still have it) and in
+/// libewf after 20200210 (whose development line restarted at 20141002 after
+/// 20140608). Run with each distribution's ewf-tools: 20140608 (Ubuntu
+/// 18.04), 20140804 (Debian 10) and 20140807 (Debian 11, Ubuntu 20.04 and
+/// 22.04) crash on `ewfacquire -u -r 2`; 20140813 (Debian 12), 20140814
+/// (Ubuntu 24.04), 20140816 (Debian 13, nixpkgs libewf-legacy) and 20231119
+/// (nixpkgs libewf) apply it.
+pub fn retries_option_crashes(release: u32) -> bool {
+    (20101105..=20140808).contains(&release) || (20141002..=20200210).contains(&release)
+}
+
+/// `retries` read retries with the ewfacquire whose version line is
+/// `version` (`None`: unknown, e.g. `ewfacquire -V` failed): the usage error
+/// when that ewfacquire would be given `-r` and crashes on it. The default
+/// count is never passed, so it works with every release; an unknown
+/// release is not refused (a crash would fail the run before ewfacquire
+/// wrote anything).
+pub fn check_retries_option(retries: u32, version: Option<&str>) -> Result<(), String> {
+    if retries == EWFACQUIRE_DEFAULT_RETRIES {
+        return Ok(());
+    }
+    let Some(release) = version.and_then(libewf_release) else {
+        return Ok(());
+    };
+    if !retries_option_crashes(release) {
+        return Ok(());
+    }
+    Err(format!(
+        "{retries} read retries need ewfacquire's -r option, and the installed ewfacquire {release} crashes on -r (libewf 20101105 to 20140808 and 20141002 to 20200210 hand the -b value to the retry setting, so -r without -b ends in a segmentation fault). Use the default of {EWFACQUIRE_DEFAULT_RETRIES} read retries (leave out --retries), or install a libewf whose ewfacquire takes -r: ewf-tools 20140813 or later (Debian 12, Ubuntu 24.04), libewf-legacy 20140810 or later, or libewf later than 20200210 (such as 20231119). Nothing was written and nothing was sent to the source"
+    ))
+}
+
 /// The ewfacquire settings the session's effective config asks for.
 pub fn requested_settings(ctx: &EngineContext) -> EwfSettings {
     if let EngineSettings::Ewf(e) = &ctx.effective.settings {
@@ -723,9 +781,13 @@ pub fn ewfacquire_spec(ctx: &EngineContext, settings: &EwfSettings, log: &Path) 
         .arg("-c")
         .arg(settings.compression.as_ewf_arg())
         .arg("-S")
-        .arg(config.split_size.as_ewf_arg())
-        .arg("-r")
-        .arg(settings.retries.to_string())
+        .arg(config.split_size.as_ewf_arg());
+    // The default count is ewfacquire's own: no -r, which some releases crash
+    // on (retries_option_crashes)
+    if !settings.retries_default {
+        spec = spec.arg("-r").arg(settings.retries.to_string());
+    }
+    spec = spec
         .arg("-g")
         .arg(settings.error_granularity_sectors.to_string())
         .arg("-m")
@@ -2030,6 +2092,7 @@ mod tests {
             segment_size: "2.0 GiB".into(),
             segment_bytes: Some(2048 * MIB),
             retries,
+            retries_default: retries == EWFACQUIRE_DEFAULT_RETRIES,
             wipe_on_error: true,
             error_granularity_sectors: granularity,
             media_type: "fixed".into(),
@@ -2829,6 +2892,111 @@ mod tests {
         );
         assert!(!argv.iter().any(|a| a.contains("not provided")), "{argv:?}");
         assert_eq!(argv.last().unwrap(), "/dev/disk/by-diskseq/9-part1");
+    }
+
+    #[test]
+    fn r_is_given_only_for_a_count_other_than_ewfacquires_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let argv_for = |retries: u32| {
+            let config = AcquisitionConfig {
+                error_retries: retries,
+                ..AcquisitionConfig::ewf(tmp.path())
+            };
+            let ctx = context(tmp.path(), CaseMetadata::default(), config);
+            let settings = requested_settings(&ctx);
+            assert_eq!(settings.retries, retries);
+            assert_eq!(settings.retries_default, retries == 2);
+            ewfacquire_spec(&ctx, &settings, &ctx.output_path(LOG_SUFFIX)).argv()
+        };
+        // ewfacquire 20140807 crashes on any -r; its default is 2 everywhere
+        let argv = argv_for(EWFACQUIRE_DEFAULT_RETRIES);
+        assert!(!argv.contains(&"-r".to_string()), "{argv:?}");
+        for retries in [0, 1, 3, 255] {
+            let argv = argv_for(retries);
+            assert!(
+                argv.windows(2)
+                    .any(|w| w[0] == "-r" && w[1] == retries.to_string()),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_release_comes_from_the_version_line() {
+        assert_eq!(libewf_release("ewfacquire 20140807"), Some(20140807));
+        assert_eq!(libewf_release("ewfacquire 20231119\n"), Some(20231119));
+        assert_eq!(libewf_release("  ewfacquire 20140816  "), Some(20140816));
+        for odd in [
+            "",
+            "ewfacquire",
+            "ewfacquire 2014080",
+            "ewfacquire 201408077",
+            "ewfacquire 20140807-2ubuntu2",
+            "ewfacquire v20140807",
+            "ewfexport 20140807",
+            "fake-ewfacquire 0",
+        ] {
+            assert_eq!(libewf_release(odd), None, "{odd:?}");
+        }
+    }
+
+    #[test]
+    fn releases_that_crash_on_r_are_named_by_evidence() {
+        // Run with each distribution's ewf-tools (SIGSEGV on -r): Ubuntu
+        // 18.04, Debian 10, Debian 11 / Ubuntu 20.04 / Ubuntu 22.04
+        for crashes in [20140608, 20140804, 20140807] {
+            assert!(retries_option_crashes(crashes), "{crashes}");
+        }
+        // Run: Debian 12, Ubuntu 24.04, Debian 13 / nixpkgs libewf-legacy,
+        // nixpkgs libewf
+        for applies in [20140813, 20140814, 20140816, 20231119] {
+            assert!(!retries_option_crashes(applies), "{applies}");
+        }
+        // The edges in libewf's history: the bug came with 20101105, the
+        // libewf-legacy fix with 20140810, the libewf fix after 20200210
+        for (release, crashes) in [
+            (20101104, false),
+            (20101105, true),
+            (20130128, true),
+            (20140806, true),
+            (20140808, true),
+            (20140810, false),
+            (20140817, false),
+            (20141002, true),
+            (20171104, true),
+            (20200210, true),
+            (20200216, false),
+            (20240506, false),
+        ] {
+            assert_eq!(retries_option_crashes(release), crashes, "{release}");
+        }
+    }
+
+    #[test]
+    fn other_retries_are_refused_only_where_r_crashes() {
+        let broken = Some("ewfacquire 20140807");
+        // The default needs no -r: accepted by every release
+        assert_eq!(check_retries_option(2, broken), Ok(()));
+        for retries in [0, 1, 3, 255] {
+            let err = check_retries_option(retries, broken).unwrap_err();
+            // The cause and the remedies
+            assert!(err.contains("ewfacquire 20140807 crashes on -r"), "{err}");
+            assert!(err.contains("segmentation fault"), "{err}");
+            assert!(err.contains("default of 2 read retries"), "{err}");
+            assert!(err.contains("leave out --retries"), "{err}");
+            assert!(err.contains("ewf-tools 20140813 or later"), "{err}");
+            assert!(err.contains("libewf later than 20200210"), "{err}");
+            assert!(err.contains("Nothing was written"), "{err}");
+            for fixed in ["ewfacquire 20140816", "ewfacquire 20231119"] {
+                assert_eq!(check_retries_option(retries, Some(fixed)), Ok(()));
+            }
+            // An unknown release is not refused
+            assert_eq!(check_retries_option(retries, None), Ok(()));
+            assert_eq!(
+                check_retries_option(retries, Some("ewfacquire custom")),
+                Ok(())
+            );
+        }
     }
 
     #[test]

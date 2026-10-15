@@ -90,6 +90,17 @@ pub trait SessionHost: Send + Sync {
         find_on_path(program)
     }
 
+    /// The version line of the external `program` (`ewfacquire -V`: e.g.
+    /// "ewfacquire 20140807"), before anything is written; `None` when it
+    /// does not run or prints none within 5 s.
+    fn tool_version(&self, program: &str) -> Option<String> {
+        crate::engines::process::tool_version_blocking(
+            program,
+            crate::models::provenance::version_args(program),
+            std::time::Duration::from_secs(5),
+        )
+    }
+
     /// Identity of the source at `path` (§5); `Err` refuses (P2).
     fn probe_identity(&self, path: &str) -> Result<SourceIdentity, String>;
 

@@ -291,6 +291,16 @@ async fn raw_to_e01_is_verified_against_dfdisks_own_hash() {
         argv0.contains(&"ewfacquire") && argv0.contains(&"ewfverify"),
         "{argv0:?}"
     );
+    // Reading a file needs no retries, and ewfacquire 20140807 (Ubuntu
+    // 22.04) crashes on any -r: the conversion never gives it
+    for c in r
+        .provenance
+        .commands
+        .iter()
+        .filter(|c| c.argv[0] == "ewfacquire")
+    {
+        assert!(!c.argv.iter().any(|a| a == "-r"), "{:?}", c.argv);
+    }
     assert!(r
         .provenance
         .tools

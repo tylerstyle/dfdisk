@@ -214,6 +214,17 @@ async fn one_bad_sector_is_completed_with_read_errors_exit_7() {
         .unwrap();
     assert!(ewfacquire.argv.windows(2).any(|w| w == ["-g", "1"]));
     assert!(ewfacquire.argv.windows(2).any(|w| w[0] == "-l"));
+    // The default retry count is ewfacquire's own: no -r (ewfacquire
+    // 20140807 crashes on any -r), and the report says so
+    assert!(
+        !ewfacquire.argv.iter().any(|a| a == "-r"),
+        "{:?}",
+        ewfacquire.argv
+    );
+    assert!(
+        text.contains("2 (ewfacquire's default; -r not given)"),
+        "{text}"
+    );
     for tool in ["ewfacquire", "ewfinfo", "ewfverify"] {
         assert!(
             report.provenance.commands.iter().any(|c| c.argv[0] == tool),
@@ -229,6 +240,7 @@ async fn one_bad_sector_is_completed_with_read_errors_exit_7() {
         panic!()
     };
     assert_eq!((s.error_granularity_sectors, s.retries), (1, 2));
+    assert!(s.retries_default);
 }
 
 #[tokio::test]

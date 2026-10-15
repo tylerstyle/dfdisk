@@ -286,6 +286,13 @@ pub const DEFAULT_PIECE_SIZE: u64 = 1 << 30;
 pub const MIN_PIECE_SIZE: u64 = 1 << 20;
 /// Highest retry count passed to ewfacquire / ddrescue.
 pub const MAX_RETRIES: u32 = 255;
+/// The read retries ewfacquire applies when it is not given `-r`: 2 in every
+/// release checked (`ewfacquire -h`: "default is 2"; libewf 20140608,
+/// 20140804, 20140807, 20140813, 20140814, 20140816 and 20231119; the
+/// device handle starts with 2 in the 20140807 source). dfdisk passes `-r`
+/// only for another count, because ewfacquire 20140807 (Ubuntu 22.04) and
+/// other releases crash on any `-r` ([`crate::engines::ewf::retries_option_crashes`]).
+pub const EWFACQUIRE_DEFAULT_RETRIES: u32 = 2;
 /// `--on-read-error zero-fill` (RAW): consecutive unreadable sectors after
 /// which the source counts as lost (§13).
 pub const SOURCE_LOSS_SECTORS: u64 = 4096;
@@ -513,8 +520,13 @@ pub struct EwfSettings {
     pub segment_size: String,
     /// `-S` in bytes, `None`: unlimited
     pub segment_bytes: Option<u64>,
-    /// `-r`
+    /// `-r`, or ewfacquire's default when `retries_default`
     pub retries: u32,
+    /// `-r` was not given: `retries` is ewfacquire's own default
+    /// ([`EWFACQUIRE_DEFAULT_RETRIES`]). Absent in records of dfdisk 0.1,
+    /// which always gave `-r`.
+    #[serde(default)]
+    pub retries_default: bool,
     /// `-w`
     pub wipe_on_error: bool,
     /// `-g`, sectors
@@ -604,6 +616,7 @@ impl EffectiveConfig {
                         segment_size: config.split_size.display_name(),
                         segment_bytes: config.split_size.bytes(),
                         retries: config.error_retries,
+                        retries_default: config.error_retries == EWFACQUIRE_DEFAULT_RETRIES,
                         wipe_on_error: config.wipe_bad_sectors,
                         error_granularity_sectors: config
                             .ewf_error_granularity
@@ -665,7 +678,14 @@ impl EffectiveConfig {
                 rows.push(("EWF Format".into(), e.ewf_format.clone()));
                 rows.push(("Compression".into(), e.compression.as_ewf_arg().into()));
                 rows.push(("Segment Size".into(), e.segment_size.clone()));
-                rows.push(("Read Retries".into(), e.retries.to_string()));
+                rows.push((
+                    "Read Retries".into(),
+                    if e.retries_default {
+                        format!("{} (ewfacquire's default; -r not given)", e.retries)
+                    } else {
+                        format!("{} (-r)", e.retries)
+                    },
+                ));
                 rows.push((
                     "On Read Error".into(),
                     format!(
@@ -976,6 +996,39 @@ mod tests {
             panic!()
         };
         assert_eq!(e.error_granularity_sectors, 64);
+    }
+
+    #[test]
+    fn e01_retries_state_whether_ewfacquire_was_given_r() {
+        let rows_for = |retries: u32| {
+            let eff = EffectiveConfig::build(
+                &AcquisitionConfig {
+                    error_retries: retries,
+                    ..Default::default()
+                },
+                None,
+            );
+            let EngineSettings::Ewf(e) = &eff.settings else {
+                panic!()
+            };
+            (e.retries, e.retries_default, eff.rows())
+        };
+        // The default is left to ewfacquire (no -r) and says so
+        let (n, by_default, rows) = rows_for(EWFACQUIRE_DEFAULT_RETRIES);
+        assert_eq!((n, by_default), (2, true));
+        assert!(rows.contains(&(
+            "Read Retries".into(),
+            "2 (ewfacquire's default; -r not given)".into()
+        )));
+        for retries in [0, 1, 3, MAX_RETRIES] {
+            let (n, by_default, rows) = rows_for(retries);
+            assert_eq!((n, by_default), (retries, false));
+            assert!(rows.contains(&("Read Retries".into(), format!("{retries} (-r)"))));
+        }
+        // A record without the field (dfdisk 0.1 always gave -r)
+        let old = r#"{"ewf_format":"encase6","compression":"Fast","segment_size":"2.0 GiB","segment_bytes":2147483648,"retries":2,"wipe_on_error":true,"error_granularity_sectors":1,"media_type":"fixed","media_flags":"physical"}"#;
+        let e: EwfSettings = serde_json::from_str(old).unwrap();
+        assert!(!e.retries_default);
     }
 
     #[test]

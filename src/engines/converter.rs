@@ -2463,7 +2463,9 @@ impl ExportErrors {
     }
 }
 
-/// The ewfacquire command of a RAW to E01 conversion.
+/// The ewfacquire command of a RAW to E01 conversion. No `-r`: reading a
+/// file needs no retries, and ewfacquire 20140807 (Ubuntu 22.04) crashes on
+/// any `-r` ([`crate::engines::ewf::retries_option_crashes`]).
 fn ewfacquire_spec(env: &ConvertEnv, plan: &Plan, req: &ConversionRequest) -> ProcessSpec {
     let s = &plan.settings;
     let case = &plan.case;

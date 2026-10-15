@@ -210,6 +210,83 @@ async fn ewf_without_sha1_has_no_false_mismatch() {
 }
 
 #[tokio::test]
+async fn ewf_retries_other_than_the_default_are_given_as_r_or_refused_by_release() {
+    // The installed ewfacquire either takes -r 3 (libewf-legacy 20140810+,
+    // libewf after 20200210) or crashes on any -r (20140807, the Ubuntu
+    // 22.04 package): then 3 retries are a usage error before anything is
+    // written, and the default still works (the other E01 tests)
+    if !support::tool_available(&["ewfacquire", "ewfverify"]) {
+        return;
+    }
+    let version = std::process::Command::new("ewfacquire")
+        .arg("-V")
+        .output()
+        .unwrap();
+    let version = String::from_utf8_lossy(&version.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let release = engines::ewf::libewf_release(&version)
+        .unwrap_or_else(|| panic!("no release in {version:?}"));
+    let tmp = scratch();
+    let dir = tmp.path();
+    let data = sample(1024 * 1024);
+    let src = dir.join("src.bin");
+    std::fs::write(&src, &data).unwrap();
+    let out = dir.join("out");
+    let config = AcquisitionConfig {
+        error_retries: 3,
+        ..config(EngineKind::Ewf, &out)
+    };
+    let result = run(
+        file_device(&src, data.len() as u64, Some("EWFRETRIES3")),
+        config,
+    )
+    .await;
+    if engines::ewf::retries_option_crashes(release) {
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Usage, "{err}");
+        assert!(
+            err.message
+                .contains(&format!("the installed ewfacquire {release} crashes on -r")),
+            "{err}"
+        );
+        // scratch() made the empty output directory
+        let written: Vec<_> = std::fs::read_dir(&out).unwrap().flatten().collect();
+        assert!(written.is_empty(), "nothing was written: {written:?}");
+        return;
+    }
+    let report = result.unwrap();
+    assert_eq!(
+        report.outcome,
+        Outcome::Verified,
+        "{}",
+        report.outcome_reason
+    );
+    let ewfacquire = report
+        .provenance
+        .commands
+        .iter()
+        .find(|c| c.argv[0] == "ewfacquire")
+        .unwrap();
+    assert!(
+        ewfacquire.argv.windows(2).any(|w| w == ["-r", "3"]),
+        "{:?}",
+        ewfacquire.argv
+    );
+    let models::config::EngineSettings::Ewf(s) = &report.effective_config.settings else {
+        panic!()
+    };
+    assert_eq!((s.retries, s.retries_default), (3, false));
+    assert!(
+        report.render_text().contains("3 (-r)"),
+        "{}",
+        report.render_text()
+    );
+}
+
+#[tokio::test]
 async fn ewf_without_sha256_has_no_false_mismatch() {
     let Some((_, report)) = run_ewf("nosha256", true, false).await else {
         return;

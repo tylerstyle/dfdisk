@@ -697,6 +697,110 @@ fn check_writes_nothing_and_reports_readiness() {
     );
 }
 
+/// A directory with fake libewf tools that print `ewfacquire <release>`
+/// (and so on) for -V and otherwise record their arguments in `ran` and fail.
+fn fake_libewf(dir: &Path, release: &str, ran: &Path) -> String {
+    let bin = dir.join(format!("libewf-{release}"));
+    std::fs::create_dir_all(&bin).unwrap();
+    for tool in ["ewfacquire", "ewfinfo", "ewfverify"] {
+        let p = bin.join(tool);
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = -V ]; then printf '{tool} {release}\\n\\nCopyright (C) 2006-2014, Joachim Metz.\\n'; exit 0; fi\necho \"{tool} $*\" >> '{}'\nexit 1\n",
+                ran.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    format!("{}:{}", bin.display(), mock_path())
+}
+
+#[test]
+fn retries_that_the_installed_ewfacquire_crashes_on_are_a_usage_error() {
+    // ewfacquire 20140807 (Ubuntu 22.04 ewf-tools) crashes on any -r: dfdisk
+    // gives -r only for a count other than ewfacquire's default (2) and
+    // refuses one with this release before anything is written, sent to the
+    // source or recorded, in check and in acquire (exit 2)
+    let tmp = scratch();
+    let src = tmp.path().join("ubuntu-ewf.bin");
+    std::fs::write(&src, sample(64 * 1024)).unwrap();
+    let out = tmp.path().join("case/out");
+    let ran = tmp.path().join("ran.txt");
+    let ubuntu = fake_libewf(tmp.path(), "20140807", &ran);
+    let fixed = fake_libewf(tmp.path(), "20140816", &ran);
+    let run_with = |command: &str, path: &str, extra: &[&str]| {
+        let mut args: Vec<String> = [
+            command,
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "-C",
+            "K",
+            "-E",
+            "E1",
+            "-e",
+            "X",
+            "--format",
+            "e01",
+            "--allow-tmpfs",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        args.extend(extra.iter().map(|s| s.to_string()));
+        let output = dfdisk().env("PATH", path).args(&args).output().unwrap();
+        let (stdout, stderr) = text(&output);
+        (output.status.code(), stdout, stderr)
+    };
+
+    let (code, stdout, stderr) = run_with("check", &ubuntu, &["-r", "3"]);
+    assert_eq!(code, Some(2), "{stdout}\n{stderr}");
+    assert!(stdout.contains("NOT READY"), "{stdout}");
+    assert!(
+        stdout.contains("the installed ewfacquire 20140807 crashes on -r"),
+        "{stdout}"
+    );
+    let (code, stdout, stderr) = run_with("check", &ubuntu, &["-r", "3", "--json"]);
+    assert_eq!(code, Some(2), "{stdout}\n{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["ready"], false, "{v}");
+    assert_eq!(v["problems"][0]["step"], "tools", "{v}");
+    assert_eq!(v["problems"][0]["kind"], "usage", "{v}");
+
+    let log_before = std::fs::read_to_string(sandbox().join("audit.jsonl")).unwrap_or_default();
+    let (code, stdout, stderr) = run_with("acquire", &ubuntu, &["-r", "3"]);
+    assert_eq!(code, Some(2), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("3 read retries need ewfacquire's -r option")
+            && stderr.contains("Use the default of 2 read retries (leave out --retries)")
+            && stderr.contains("ewf-tools 20140813 or later"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("ACQUIRING"), "nothing started: {stderr}");
+    assert!(!tmp.path().join("case").exists(), "nothing was written");
+    assert!(!ran.exists(), "no libewf tool ran beyond -V");
+    let log_after = std::fs::read_to_string(sandbox().join("audit.jsonl")).unwrap_or_default();
+    assert!(
+        !log_after[log_before.len()..].contains(&src.to_string_lossy().into_owned()),
+        "no audit record for this run"
+    );
+
+    // The default count needs no -r; a release that takes -r takes 3
+    for (path, extra) in [
+        (&ubuntu, &[][..]),
+        (&ubuntu, &["-r", "2"][..]),
+        (&fixed, &["-r", "3"][..]),
+    ] {
+        let (code, stdout, stderr) = run_with("check", path, extra);
+        assert_eq!(code, Some(0), "{extra:?}: {stdout}\n{stderr}");
+        assert!(stdout.contains("READY"), "{stdout}");
+    }
+    assert!(!tmp.path().join("case").exists());
+    assert!(!ran.exists());
+}
+
 // ---------------------------------------------------------------------------
 // verify
 // ---------------------------------------------------------------------------

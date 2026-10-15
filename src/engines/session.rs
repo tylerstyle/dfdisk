@@ -11,8 +11,9 @@
 //! - 3 source safety: dfnix registry by pinned major:minor, system disk,
 //!   active swap (R8) and mounts in the source tree, holders, O_EXCL open
 //!   held for the whole run (R1)
-//! - 4 destination checks, the engine's external tools can be run (I3), then
-//!   the first write: output directory and report reservation (R11)
+//! - 4 destination checks, the engine's external tools can be run and can
+//!   apply the requested options (I3), then the first write: output
+//!   directory and report reservation (R11)
 //! - 7 audit "started" (refuses on dfnix if it cannot be written)
 //! - 5 write protection, 6 capacity probe (R6) and SMART before (§8)
 //! - 8 engine acquire, 9 identity re-check, 10 fsync + cache eviction (an
@@ -52,6 +53,7 @@ use crate::models::capacity::CapacityInfo;
 use crate::models::case::CaseMetadata;
 use crate::models::config::{
     AcquisitionConfig, EffectiveConfig, EngineSettings, HashSelection, SmartPolicy,
+    EWFACQUIRE_DEFAULT_RETRIES,
 };
 use crate::models::device::{BlockDevice, SmartSnapshot};
 use crate::models::identity::{SerialSource, SourceIdentity};
@@ -418,8 +420,27 @@ fn missing_tools(host: &dyn SessionHost, config: &AcquisitionConfig) -> Vec<&'st
 /// Step 4 (I3): every external program of the engine can be run, so a
 /// missing tool fails the run before anything is written, sent to the
 /// source or recorded as started (FAILED, exit 4; `check` lists it too).
+/// Then the installed programs can apply the requested options
+/// ([`tool_options_error`]).
 fn check_tools(host: &dyn SessionHost, config: &AcquisitionConfig) -> Result<(), AcquisitionError> {
-    tools_error(config, &missing_tools(host, config))
+    tools_error(config, &missing_tools(host, config))?;
+    tool_options_error(host, config)
+}
+
+/// Step 4, the installed tools: an E01 with read retries other than
+/// ewfacquire's default needs `-r`, which some ewfacquire releases crash on
+/// ([`ewf::check_retries_option`]); with those it is a usage error (exit 2)
+/// before anything is written, sent to the source or recorded as started.
+fn tool_options_error(
+    host: &dyn SessionHost,
+    config: &AcquisitionConfig,
+) -> Result<(), AcquisitionError> {
+    if config.engine() != EngineKind::Ewf || config.error_retries == EWFACQUIRE_DEFAULT_RETRIES {
+        return Ok(());
+    }
+    let version = host.tool_version("ewfacquire");
+    ewf::check_retries_option(config.error_retries, version.as_deref())
+        .map_err(AcquisitionError::usage)
 }
 
 /// The error for the `missing` programs of `config`'s engine (none: Ok).

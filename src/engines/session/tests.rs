@@ -122,6 +122,8 @@ struct Fake {
     evict_fail: Option<&'static str>,
     /// External programs this host does not have (every other one is found)
     missing_tools: Vec<&'static str>,
+    /// What `ewfacquire -V` prints first (`None`: it prints nothing)
+    ewfacquire_version: Option<&'static str>,
     calls: Mutex<Vec<&'static str>>,
 }
 
@@ -164,6 +166,7 @@ impl Fake {
             fsync_fail: None,
             evict_fail: None,
             missing_tools: Vec::new(),
+            ewfacquire_version: Some("ewfacquire 20231119"),
             calls: Mutex::new(Vec::new()),
             data,
             tmp,
@@ -218,6 +221,14 @@ impl Fake {
 impl SessionHost for Fake {
     fn find_tool(&self, program: &str) -> Option<PathBuf> {
         (!self.missing_tools.contains(&program)).then(|| PathBuf::from("/fake/bin").join(program))
+    }
+
+    fn tool_version(&self, program: &str) -> Option<String> {
+        self.call("tool_version");
+        match program {
+            "ewfacquire" => self.ewfacquire_version.map(String::from),
+            _ => Some(format!("{program} 1.0")),
+        }
     }
 
     fn probe_identity(&self, _path: &str) -> Result<SourceIdentity, String> {
@@ -797,6 +808,83 @@ async fn a_missing_tool_fails_before_anything_is_written_sent_or_started() {
     let mut fake = Fake::new();
     fake.missing_tools = vec!["ewfacquire", "ddrescue"];
     assert!(run_fake(&fake, fake.raw()).await.0.is_ok());
+}
+
+#[tokio::test]
+async fn retries_the_installed_ewfacquire_crashes_on_are_refused_before_anything_starts() {
+    // ewfacquire 20140807 (Ubuntu 22.04) crashes on any -r: another count
+    // than its default is a usage error (exit 2) before anything is written,
+    // sent to the source or recorded as started; check reports it too
+    let mut fake = Fake::new();
+    fake.ewfacquire_version = Some("ewfacquire 20140807");
+    let config = AcquisitionConfig {
+        error_retries: 3,
+        ..AcquisitionConfig::for_engine(EngineKind::Ewf, fake.out())
+    };
+    let (r, progress) = run_fake(&fake, config.clone()).await;
+    let e = r.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Usage, "{e}");
+    assert_eq!(e.exit_code(), 2);
+    assert!(
+        e.message.contains(
+            "3 read retries need ewfacquire's -r option, and the installed ewfacquire 20140807 crashes on -r"
+        ),
+        "{e}"
+    );
+    assert!(e.message.contains("leave out --retries"), "{e}");
+    assert!(!fake.out().exists());
+    assert_eq!(fake.calls(), ["tool_version"]);
+    assert!(
+        fake.records().is_empty(),
+        "no audit record: it never started"
+    );
+    assert!(matches!(progress.status, AcquisitionStatus::Failed(_)));
+    let check = check_with(&fake, fake.request(config.clone())).await;
+    assert!(!check.ready);
+    assert_eq!(check.problems.len(), 1, "{:?}", check.problems);
+    assert_eq!(check.problems[0].step, "tools");
+    assert_eq!(check.problems[0].kind, ErrorKind::Usage);
+    assert!(check.problems[0].message.contains("ewfacquire 20140807"));
+    assert_eq!(check.missing_tools, Some(Vec::new()));
+    assert_eq!(check.exit_code(), 2);
+    assert!(!fake.out().exists());
+
+    // The default count needs no -r: ready without asking for the version
+    let mut fake = Fake::new();
+    fake.ewfacquire_version = Some("ewfacquire 20140807");
+    let check = check_with(
+        &fake,
+        fake.request(AcquisitionConfig::for_engine(EngineKind::Ewf, fake.out())),
+    )
+    .await;
+    assert!(check.ready, "{:?}", check.problems);
+    assert!(
+        !fake.calls().contains(&"tool_version"),
+        "{:?}",
+        fake.calls()
+    );
+    // A release that takes -r, and an unknown one, are not refused
+    for version in [
+        Some("ewfacquire 20140816"),
+        Some("ewfacquire 20231119"),
+        None,
+    ] {
+        let mut fake = Fake::new();
+        fake.ewfacquire_version = version;
+        let check = check_with(&fake, fake.request(config.clone())).await;
+        assert!(check.ready, "{version:?}: {:?}", check.problems);
+        assert!(fake.calls().contains(&"tool_version"));
+    }
+    // Only the E01 engine gives ewfacquire -r (a rescue's -r is ddrescue's)
+    let mut fake = Fake::new();
+    fake.ewfacquire_version = Some("ewfacquire 20140807");
+    let rescue = AcquisitionConfig {
+        error_retries: 3,
+        rescue_to_e01: true,
+        ..AcquisitionConfig::rescue(fake.out())
+    };
+    let check = check_with(&fake, fake.request(rescue)).await;
+    assert!(check.ready, "{:?}", check.problems);
 }
 
 #[tokio::test]

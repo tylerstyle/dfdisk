@@ -191,6 +191,10 @@ impl SessionHost for FakeHost {
         Some(PathBuf::from("/fake/bin").join(program))
     }
 
+    fn tool_version(&self, program: &str) -> Option<String> {
+        Some(format!("{program} 20231119"))
+    }
+
     fn probe_identity(&self, path: &str) -> Result<SourceIdentity, String> {
         match &self.probe_error {
             Some(e) => Err(e.clone()),
