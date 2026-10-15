@@ -299,7 +299,7 @@ impl TuiBackend for Fake {
             let options = VerifyOptions {
                 write_addendum: true,
                 audit_log: log,
-                recorder: None,
+                ..Default::default()
             };
             dfdisk::engines::verify::verify_image(&image, &expected, &options, &stop, |e| {
                 let _ = events.send(e);

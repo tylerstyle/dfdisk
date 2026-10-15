@@ -2011,6 +2011,7 @@ impl App {
             split_size: self.conv.split,
             notes: self.conv.notes.clone(),
             source_report,
+            ..Default::default()
         };
         self.token += 1;
         let token = self.token;
