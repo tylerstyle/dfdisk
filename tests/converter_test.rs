@@ -994,6 +994,64 @@ async fn zero_filled_sectors_recorded_only_in_the_e01_notes_are_never_verified()
     );
 }
 
+/// C-5: a report the caller found next to the image (not the examiner's
+/// --report) that describes another image of the same base name is ignored
+/// with a note; the converter then finds the image's own report.
+#[tokio::test]
+async fn a_report_found_by_the_caller_for_another_image_is_ignored() {
+    if !have_libewf() {
+        return;
+    }
+    let f = fixture();
+    let content = data(1 << 20, 24);
+    let raw = f.src.join("x.raw");
+    std::fs::write(&raw, &content).unwrap();
+    // A rescue next to its E01 (as --rescue-to-e01 leaves it): x.info.json
+    // lists x.raw, x.conversion.info.json lists x.E01
+    let rescue_json = acquisition_report(&raw, &content, |r| {
+        r.engine = EngineKind::Rescue;
+        r.acquisition_hashes = HashResults::default();
+        r.verification.result = VerificationResult::NotPossible {
+            reason: "ddrescue computes no digest".into(),
+        };
+    });
+    let made = run(
+        &f.env,
+        request(&raw, ConversionTarget::E01, &f.src),
+        StopFlags::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(made.outcome, Outcome::CompleteUnverified);
+    let e01 = f.src.join("x.E01");
+
+    // As the CLI found it (`<stem>.info.json` next to the image)
+    let mut req = request(&e01, ConversionTarget::Raw, &f.out);
+    req.source_report = Some(rescue_json.clone());
+    req.source_report_auto = true;
+    let r = run(&f.env, req, StopFlags::new()).await.unwrap();
+    let used = r.source_report.as_ref().expect("the E01's own report");
+    assert!(
+        used.path.ends_with("x.conversion.info.json"),
+        "{}",
+        r.render_text()
+    );
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("x.info.json was not used: it does not list x.E01")),
+        "{:?}",
+        r.notes
+    );
+
+    // Given by the examiner: it must describe the image
+    let mut req = request(&e01, ConversionTarget::Raw, &f.root.join("given"));
+    req.source_report = Some(rescue_json);
+    let e = run(&f.env, req, StopFlags::new()).await.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Usage, "{e}");
+    assert!(e.message.contains("does not list x.E01"), "{e}");
+}
+
 #[tokio::test]
 async fn an_e01_missing_its_last_segment_is_never_converted_whole() {
     if !have_libewf() {

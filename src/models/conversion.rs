@@ -110,8 +110,14 @@ pub struct ConversionRequest {
     /// referenced in the conversion report (and its digests used for the
     /// comparison). `None`: `<base>.info.json` next to the source is used
     /// when it lists the source image. A given report that does not list
-    /// the source image is a usage error.
+    /// the source image is a usage error (unless `source_report_auto`).
     pub source_report: Option<PathBuf>,
+    /// `source_report` was found next to the source by the caller, not given
+    /// by the examiner: when it does not list the source image (or cannot be
+    /// read) it is ignored with a note and the converter looks for the
+    /// report itself, as it does without `source_report`. `false` (the
+    /// default): a given report must describe the image.
+    pub source_report_auto: bool,
     /// Accept a destination in memory (tmpfs/ramfs), as `--allow-tmpfs`
     pub allow_tmpfs: bool,
     /// E01 target: accept less free space than the source size (compression

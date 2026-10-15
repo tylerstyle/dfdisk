@@ -961,8 +961,9 @@ fn load_report(path: &Path) -> Result<(LoadedReport, Vec<String>), String> {
 }
 
 /// The report of `source`: the given one (must list the image, else a usage
-/// error), or `<base>.info.json` / `<base>.conversion.info.json` next to it
-/// when it lists the image (else ignored with a note).
+/// error; one the caller found itself, `source_report_auto`, is ignored with
+/// a note instead), or `<base>.info.json` / `<base>.conversion.info.json`
+/// next to it when it lists the image (else ignored with a note).
 fn find_report(
     req: &ConversionRequest,
     source: &Path,
@@ -974,22 +975,38 @@ fn find_report(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let lists = |names: &[String]| names.iter().any(|n| n.eq_ignore_ascii_case(&image));
+    let mut tried: Option<&Path> = None;
     if let Some(given) = &req.source_report {
-        let (loaded, names) = load_report(given).map_err(usage)?;
-        if !lists(&names) {
-            return Err(usage(format!(
-                "the report {} does not list {image} among its image files; it does not describe this image (convert without --report, or give the report of this image)",
-                given.display()
-            )));
+        match load_report(given) {
+            Ok((loaded, names)) if lists(&names) => return Ok(Some(loaded)),
+            // C-5: a report the caller found (not the examiner's choice)
+            // that describes another image is not this image's report
+            Ok(_) if req.source_report_auto => {
+                notes.push(format!(
+                    "{} was not used: it does not list {image} among its image files",
+                    given.display()
+                ));
+                tried = Some(given.as_path());
+            }
+            Err(e) if req.source_report_auto => {
+                notes.push(format!("{} was not used: {e}", given.display()));
+                tried = Some(given.as_path());
+            }
+            Ok(_) => {
+                return Err(usage(format!(
+                    "the report {} does not list {image} among its image files; it does not describe this image (convert without --report, or give the report of this image)",
+                    given.display()
+                )))
+            }
+            Err(e) => return Err(usage(e)),
         }
-        return Ok(Some(loaded));
     }
     let dir = parent_dir(source);
     for candidate in [
         dir.join(format!("{base}.info.json")),
         dir.join(format!("{base}{CONVERSION_STEM}.info.json")),
     ] {
-        if !candidate.is_file() {
+        if !candidate.is_file() || tried.is_some_and(|t| same_path(t, &candidate)) {
             continue;
         }
         match load_report(&candidate) {
@@ -1849,7 +1866,7 @@ fn check_destination(
             == primary
                 .file_name()
                 .map(|n| n.to_string_lossy().to_lowercase())
-            && same_dir(&parent_dir(&f.path), &plan.output_dir)
+            && same_path(&parent_dir(&f.path), &plan.output_dir)
         {
             return Err(AcquisitionError::refused(format!(
                 "the output {} would be the source {} itself",
@@ -1861,7 +1878,8 @@ fn check_destination(
     Ok((facts, notes))
 }
 
-fn same_dir(a: &Path, b: &Path) -> bool {
+/// The same file or directory (after resolving links), else the same path.
+fn same_path(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
