@@ -452,9 +452,15 @@ identify-class queries that the report records.
   the source or one of its partitions, or its disk or another device below it
   with a byte range that includes the source; mounts of such a loop device, and
   of its partitions that lie on the source, count as mounts of the source): a holder keeps the device open, so it has to be closed
-  first (there is no override). Unmounting is a separate, explicit, audited
-  action (`dfdisk unmount`, `--auto-unmount`) that refuses system mounts and
-  protected devices and never forces or lazily unmounts.
+  first (there is no override). A device-mapper or md device stacked on such a
+  loop device that covers more than the source (kpartx over
+  `losetup /dev/sdb` for a source `sdb2`) may or may not map the source, as
+  dfdisk does not read its mapping: its mounts refuse the acquisition as well,
+  but they are not called mounts of the source. Unmounting is a separate,
+  explicit, audited action (`dfdisk unmount`, `--auto-unmount`) that refuses
+  system mounts, protected devices and the mounts of such a device ("cannot
+  tell whether ... belongs to ..."; unmount them yourself) and never forces or
+  lazily unmounts.
 - **Exclusive open.** The source is opened with `O_EXCL` and held for the whole
   run, so the kernel refuses to mount it or to assemble device-mapper, LVM or md
   devices on it meanwhile (setting up a loop device needs no exclusive claim and

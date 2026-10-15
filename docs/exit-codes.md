@@ -56,7 +56,11 @@ source device, when for example:
 - the device is a system disk, is mounted (in dfdisk's mount namespace, also
   through a loop device set up over it or its partitions, or over its disk or a
   device below it with a byte range that includes the source, such as
-  `losetup -P /dev/sdb` for a partition source `sdb2`), holds active swap, or
+  `losetup -P /dev/sdb` for a partition source `sdb2`), or a device-mapper or
+  md device stacked on such a loop device that covers more than the source is
+  mounted (it may map the source; dfdisk does not read its mapping, so it
+  counts, but the refusal does not call it a mount of the source), holds
+  active swap, or
   has holders (device-mapper, LVM, md, LUKS, or such a loop device): a holder
   keeps the device open or writes to it, so it has to be closed first (there is
   no override);
@@ -81,7 +85,7 @@ source device, when for example:
 | `check` | 0 ready; otherwise the code of the first problem found: 2 usage, 3 refused, 4 a check could not run or a tool the engine runs is not installed; 8 interrupted. Writes nothing. |
 | `verify` | 0 every digest compared matches (expected digests, the digests an E01 stores, every piece of `--pieces`); 5 a digest or a piece differs; 4 the verification could not run or a requested digest was not computed (never reported as a pass); 9 nothing to compare against (no expected digest given, none in the report, none stored in the image, no `--pieces`); 2 the image or pieces file does not exist, an expected digest is not exactly 32 (MD5), 40 (SHA-1) or 64 (SHA-256) hex digits (also in a `--report`), or arguments are invalid; 8 aborted. |
 | `convert` | The conversion's verdict (0, 4–9; 7 when the source image holds zero-filled sectors of its acquisition); 2 for example a RAW size that is not a multiple of 512 bytes or missing case fields; 3 an output already exists or a destination check refused; 4 a tool could not run; 8 aborted before anything was written. |
-| `unmount` | 0 everything was unmounted and nothing remains mounted (or nothing was mounted); 2 usage (for example a regular file); 3 refused (system mount, protected device, active swap, unidentifiable device); 4 an unmount failed or a mount remained. |
+| `unmount` | 0 everything was unmounted and nothing remains mounted (or nothing was mounted); 2 usage (for example a regular file); 3 refused (system mount, protected device, active swap, unidentifiable device, a mount of a device that may or may not map the source); 4 an unmount failed or a mount remained. |
 | `list` | 0, or 4 when the device scan failed. |
 | `tui` (default) | 0 on a normal exit; the result's exit code when the TUI ends before the examiner acknowledged a result on screen (a run that finished after SIGHUP, or a quit by signal); 1 on a terminal failure or an internal error of the UI itself (a job still running then is aborted and has written its report and audit record, and an unmount still running has ended, before dfdisk exits, if they end within 6 minutes; otherwise dfdisk says so and exits without waiting for them, and the job's report and audit record may be missing); 4 when the signal handlers cannot be installed. A run that stops on an internal error of dfdisk (a panic inside the acquisition, conversion or verification) is shown as FAILED (INTERNAL ERROR), exit code 4. |
 

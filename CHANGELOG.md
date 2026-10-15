@@ -171,7 +171,11 @@ and when something was not done the report says so.
   the partition under a LUKS source) whose byte range (`loop/offset`,
   `loop/sizelimit`) includes part of the source, with those of its partitions
   that do (`losetup -P /dev/sdb; mount /dev/loop0p2` for a source `sdb2`); a
-  loop or md source's own partitions belong to it.
+  loop or md source's own partitions belong to it. A dm or md device stacked
+  on such a loop device that covers more than the source (kpartx over
+  `losetup /dev/sdb` for `sdb2`) may or may not map the source (its mapping
+  is not read): its mounts refuse the acquisition without being called mounts
+  of the source, and `dfdisk unmount` refuses to unmount them.
 - **H6** Audit trail gaps: (a) the export is per boot and never replaces another
   boot's chain; (b) refusals are recognised by type, not by message text;
   (c) the "finished" record always carries the outcome, the digests known and
