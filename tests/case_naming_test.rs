@@ -206,7 +206,7 @@ fn test_metadata_defaults_invent_nothing() {
 
 #[test]
 fn test_documented_naming_example() {
-    // README: `VG-2026/4192` + `01` + `SSD01` + `EXNVME0000004192F`
+    // README and docs/report-format.md: `VG-2026/4192` + `01` + `SSD01` + `EXS970A0004192E`
     let meta = CaseMetadata {
         case_number: "VG-2026/4192".to_string(),
         location_ea: "01".to_string(),
@@ -215,11 +215,11 @@ fn test_documented_naming_example() {
         ..Default::default()
     };
     assert_eq!(
-        meta.generate_filename("EXNVME0000004192F", "e01"),
-        "vg_2026_4192_ea01_ssd01_EXNVME0000004192F.e01"
+        meta.generate_filename("EXS970A0004192E", "e01"),
+        "vg_2026_4192_ea01_ssd01_EXS970A0004192E.e01"
     );
     assert_eq!(
-        meta.base_filename_checked("EXNVME0000004192F").unwrap(),
-        "vg_2026_4192_ea01_ssd01_EXNVME0000004192F"
+        meta.base_filename_checked("EXS970A0004192E").unwrap(),
+        "vg_2026_4192_ea01_ssd01_EXS970A0004192E"
     );
 }
