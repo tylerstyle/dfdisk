@@ -180,7 +180,8 @@ pub struct ListArgs {
 pub enum CliImageFormat {
     /// Expert Witness Format through ewfacquire (segments, compression, MD5 always)
     E01,
-    /// One RAW file written by dfdisk's native engine
+    /// One RAW file: acquire reads and writes it with dfdisk's own engine;
+    /// convert --to raw writes it with ewfexport (libewf)
     Raw,
 }
 

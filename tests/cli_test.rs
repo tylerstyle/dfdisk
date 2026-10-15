@@ -286,6 +286,16 @@ fn every_command_help_documents_its_flags_and_exit_codes() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn convert_help_names_the_tool_that_writes_raw() {
+    let (stdout, _) = text(&run(&["convert", "--help"]));
+    assert!(
+        stdout.contains("convert --to raw writes it with ewfexport"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("native engine"), "{stdout}");
+}
+
+#[test]
 fn missing_or_invalid_arguments_are_usage_errors() {
     // Required case fields and destination: no defaults
     let output = run(&["acquire", "/dev/null"]);
