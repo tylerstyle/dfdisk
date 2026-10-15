@@ -1,0 +1,36 @@
+{
+  "json_format_version": [
+    1,
+    0
+  ],
+  "smartctl": {
+    "version": [
+      7,
+      5
+    ],
+    "pre_release": false,
+    "platform_info": "x86_64-linux-7.2.8",
+    "build_info": "(local build)",
+    "argv": [
+      "smartctl",
+      "-j",
+      "-i",
+      "-H",
+      "-A",
+      "-l",
+      "error",
+      "img.bin"
+    ],
+    "messages": [
+      {
+        "string": "img.bin: Unable to detect device type",
+        "severity": "error"
+      }
+    ],
+    "exit_status": 1
+  },
+  "local_time": {
+    "time_t": 1792024591,
+    "asctime": "Thu Oct 15 02:36:31 2026 CEST"
+  }
+}

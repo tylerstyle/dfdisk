@@ -1,0 +1,4 @@
+hdparm v9.65
+smartctl 7.5 (build date Jan  1 1980) [x86_64-linux-7.2.8] (local build)
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
