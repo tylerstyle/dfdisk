@@ -11,13 +11,16 @@ use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 use std::path::{Path, PathBuf};
 
+use dfdisk::engines::preflight::DestinationFacts;
 use dfdisk::engines::session::{AcquisitionRequest, CheckReport};
+use dfdisk::models::capacity::{AtaCapacity, CapacityInfo};
 use dfdisk::models::case::CaseMetadata;
 use dfdisk::models::config::{EffectiveConfig, EngineKind};
 use dfdisk::models::device::{BlockDevice, DeviceSafety, Partition};
 use dfdisk::models::identity::{SourceIdentity, SourceKind};
-use dfdisk::models::info_report::{ForensicInfoReport, HashResults};
+use dfdisk::models::info_report::{AuditInfo, AuditStatus, ForensicInfoReport, HashResults};
 use dfdisk::models::outcome::{RangeKind, ReadErrorTable, VerificationResult};
+use dfdisk::models::protection::{RegistryPresence, WriteProtection};
 use dfdisk::models::telemetry::{AcquisitionStatus, ProgressTelemetry};
 use dfdisk::tui::app::{App, ConfirmState, ConfirmSubject, Job, JobKind, RunResult, Screen};
 use dfdisk::tui::confirm::ConfirmTarget;
@@ -304,7 +307,7 @@ fn buffer_to_svg(buffer: &Buffer, width_cells: u16, height_cells: u16) -> String
                     .replace(">", "&gt;");
 
                 svg.push_str(&format!(
-                    r#"  <text x="{}" y="{}" font-family="MesloLGS Nerd Font" font-size="13px"{} fill="{}" textLength="{}" lengthAdjust="spacing">{}</text>
+                    r#"  <text xml:space="preserve" x="{}" y="{}" font-family="MesloLGS Nerd Font" font-size="13px"{} fill="{}" textLength="{}" lengthAdjust="spacing">{}</text>
 "#,
                     span_cx,
                     cy + 12.0,
@@ -442,6 +445,21 @@ fn identity(dev: &BlockDevice) -> SourceIdentity {
     id
 }
 
+/// The case drive of the examples.
+fn sample_destination() -> DestinationFacts {
+    DestinationFacts {
+        output_dir: "/mnt/evidence/2026-0042".into(),
+        existing_ancestor: "/mnt/evidence".into(),
+        ancestor_is_dir: true,
+        mount_point: Some("/mnt/evidence".into()),
+        fs_type: Some("ext4".into()),
+        mount_source: Some("/dev/sdc1".into()),
+        read_only_mount: false,
+        free_bytes: Some(1_712_000_000_000),
+        backing_device: Some("8:33".into()),
+    }
+}
+
 fn confirm_app() -> App {
     let mut app = case_setup_app();
     let dev = app.source.clone().unwrap().device;
@@ -457,10 +475,29 @@ fn confirm_app() -> App {
         identity: Some(id.clone()),
         tool_source_path: Some("/dev/disk/by-diskseq/17".into()),
         effective_config: Some(EffectiveConfig::build(&config, Some(&id))),
-        write_protection: None,
+        write_protection: Some(WriteProtection {
+            sysfs_ro_before: Some(true),
+            exclusive_open: true,
+            dfnix_registry: RegistryPresence::Absent,
+            ..Default::default()
+        }),
         write_protection_plan: Some("nothing to set: every node is already read-only".into()),
-        destination: None,
-        capacity: None,
+        destination: Some(sample_destination()),
+        capacity: Some(CapacityInfo {
+            reported_bytes: dev.size_bytes,
+            probed_device: Some(dev.path.clone()),
+            ata: Some(AtaCapacity {
+                native_max_sectors: Some(dev.size_bytes / 512),
+                current_max_sectors: Some(dev.size_bytes / 512),
+                hpa_present: Some(false),
+                dco_real_max_sectors: Some(dev.size_bytes / 512),
+                dco_present: Some(false),
+                sector_bytes: Some(512),
+            }),
+            nvme: None,
+            method: "hdparm -N /dev/sdb; hdparm --dco-identify /dev/sdb".into(),
+            errors: Vec::new(),
+        }),
         smart: None,
         problems: Vec::new(),
         notes: Vec::new(),
@@ -470,7 +507,7 @@ fn confirm_app() -> App {
             request: Box::new(request),
             base_name: app.base_name_preview().unwrap_or_default(),
             check: Some(Box::new(check)),
-            destination: None,
+            destination: Some(Ok(sample_destination())),
         },
         token: 1,
         pending: false,
@@ -486,6 +523,7 @@ fn confirm_app() -> App {
 
 fn running_app() -> App {
     let mut app = case_setup_app();
+    let base = app.base_name_preview().unwrap_or_default();
     let t = ProgressTelemetry {
         status: AcquisitionStatus::Acquiring,
         total_bytes: 1_000_204_886_016,
@@ -510,7 +548,7 @@ fn running_app() -> App {
             ("Serial".into(), "WX41A8F2KD7Y (lsblk)".into()),
             (
                 "Destination".into(),
-                "/mnt/evidence/2026-0042/2026-0042_01_HDD01_WX41A8F2KD7Y.*".into(),
+                format!("/mnt/evidence/2026-0042/{base}.*"),
             ),
             ("Engine".into(), "E01 (ewfacquire)".into()),
         ],
@@ -546,6 +584,11 @@ fn result_app() -> App {
     facts.read_errors = errors;
     facts.verification = VerificationResult::Matched {
         method: "ewfverify".into(),
+    };
+    report.audit = AuditInfo {
+        anchor: Some("5d1f0c6e2b7a94e3c08f6a1d2e3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d".into()),
+        status: AuditStatus::Written,
+        export_file: Some("/mnt/evidence/2026-0042/audit-4f2a9c1e.jsonl".into()),
     };
     report.apply_facts(&facts);
     let text = report.render_text();
@@ -588,8 +631,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("wrote {}", svg_path.display());
         if png {
             let png_path = out.join(format!("{name}.png"));
+            // No metadata (dates, file names): the same screens give the same
+            // files
             let status = std::process::Command::new("magick")
                 .arg(&svg_path)
+                .args(["-strip", "-define", "png:exclude-chunk=date,time"])
                 .arg(&png_path)
                 .status()?;
             if !status.success() {

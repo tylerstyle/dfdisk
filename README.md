@@ -427,21 +427,24 @@ identify-class queries that the report records.
 
 ## Screenshots
 
-> The screenshots below show dfdisk 0.1.x and will be regenerated for 0.2.0
-> (the device table, case setup, confirmation sheet and result screen changed).
+Rendered from the TUI with invented example data by
+`cargo run --example render_screenshots -- assets/screenshots --png` (needs
+ImageMagick for the PNG files).
 
 <p align="center">
-  <img src="assets/screenshots/device_explorer.png" alt="dfdisk device explorer" width="95%">
+  <img src="assets/screenshots/device_explorer.png" alt="dfdisk device explorer with badges" width="95%">
 </p>
 <p align="center">
   <img src="assets/screenshots/case_setup.png" alt="dfdisk case setup" width="95%">
 </p>
 <p align="center">
-  <img src="assets/screenshots/system_disk_warning.png" alt="dfdisk system disk warning" width="48%">
-  <img src="assets/screenshots/unmount_safety.png" alt="dfdisk unmount prompt" width="48%">
+  <img src="assets/screenshots/confirmation.png" alt="dfdisk confirmation sheet" width="95%">
 </p>
 <p align="center">
-  <img src="assets/screenshots/image_converter.png" alt="dfdisk image converter" width="95%">
+  <img src="assets/screenshots/acquisition.png" alt="dfdisk acquisition progress" width="95%">
+</p>
+<p align="center">
+  <img src="assets/screenshots/result.png" alt="dfdisk result screen with the verdict first" width="95%">
 </p>
 
 ## Development

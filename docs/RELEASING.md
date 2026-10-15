@@ -99,5 +99,8 @@ in the dfnix repository and run its checks there.
 
 ## Screenshots
 
-`assets/screenshots/` is rendered by `examples/render_screenshots.rs`. Regenerate
-the screenshots when the TUI changes and check the README still describes them.
+`assets/screenshots/` is rendered by `examples/render_screenshots.rs`
+(`nix shell nixpkgs#imagemagick -c cargo run --example render_screenshots --
+assets/screenshots --png`, then keep only the PNG files). Regenerate them when
+the TUI changes and after the version bump (the TUI header shows the version),
+and check that the README still describes them.
