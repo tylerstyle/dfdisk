@@ -133,7 +133,8 @@ anything or sends anything to the device when a tool its engine runs is missing.
 | `smartctl` | `smartmontools` | `smartmontools` | SMART snapshots (`--smart`) |
 | `hdparm` | `hdparm` | `hdparm` | HPA/DCO detection (read-only queries) |
 | `nvme` | `nvme-cli` | `nvme-cli` | NVMe namespace capacity |
-| `lsblk`, `blockdev`, `umount` | `util-linux` | `util-linux` | device discovery, unmount |
+| `lsblk` | `util-linux` | `util-linux` | device discovery |
+| `umount` | `mount` | `util-linux` | `dfdisk unmount`, `--auto-unmount` |
 | `udevadm` | `udev` | `systemd` | device identity |
 | `timedatectl` (optional) | `systemd` | `systemd` | NTP state for the report's clock section |
 
@@ -179,7 +180,7 @@ sudo apt install "./dfdisk_${VERSION}-1_amd64.deb"
 ```
 
 The package depends on `ewf-tools`, `gddrescue`, `smartmontools`, `util-linux`,
-`udev`, `hdparm`, `nvme-cli` and the C library it was linked against.
+`mount`, `udev`, `hdparm`, `nvme-cli` and the C library it was linked against.
 
 ### Prebuilt binaries
 

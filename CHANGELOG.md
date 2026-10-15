@@ -14,6 +14,15 @@ and when something was not done the report says so.
 
 ### Breaking changes
 
+- **Required output directory.** `acquire` and `convert` require
+  `-o/--output-dir`; 0.1.10 wrote to the current directory (`.`) when it was
+  missing.
+- **Options for another engine are usage errors.** An option given explicitly
+  for an engine it does not apply to (for example `--compression`, `--split` or
+  `--retries` with `--format raw`, which 0.1.10 accepted and ignored; likewise
+  the new RAW-only and rescue-only options with another engine, and
+  `--compression`/`--split` with `convert --to raw`) exits 2, so a report never
+  shows a setting that was not applied.
 - **Required case fields.** `acquire` (and the TUI) require `--case`,
   `--evidence` and `--examiner`. The 0.1 placeholder defaults (`CASE001`, `cf01`,
   `Forensic Examiner`, `Law Enforcement / DFIR Unit`, `Physical Storage Media`)
@@ -57,7 +66,7 @@ and when something was not done the report says so.
 - **TUI keys.** Esc never aborts; aborting needs a y/N confirmation; Tab and
   Shift-Tab always move between fields and path completion has its own key.
 - **Packaging.** The .deb depends on `$auto, ewf-tools, gddrescue, smartmontools,
-  util-linux, udev, hdparm, nvme-cli`; the Arch and nixpkgs files under
+  util-linux, mount, udev, hdparm, nvme-cli`; the Arch and nixpkgs files under
   `packaging/` are gone (there is no AUR package). Minimum Rust version 1.88
   (`rust-version`).
 
