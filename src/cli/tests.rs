@@ -862,3 +862,36 @@ fn rescue_notes_carry_the_read_error_table() {
     let notes = rescue_notes(&rescue_report(Outcome::CompleteUnverified, 0), json);
     assert!(notes.join("\n").contains("none"), "{notes:?}");
 }
+
+#[test]
+fn the_selection_summary_is_sanitised() {
+    use crate::cli::resolve::ResolvedSource;
+    use crate::models::device::BlockDevice;
+    let dev = BlockDevice {
+        path: "/dev/sdx".into(),
+        model: Some("Evil\x1b[2JDisk".into()),
+        serial: Some("SER\nIAL".into()),
+        maj_min: Some("8:16".into()),
+        size_bytes: 1 << 30,
+        ..Default::default()
+    };
+    let source = ResolvedSource::Block {
+        path: "/dev/disk/by-id/usb-x".into(),
+        dev: (8, 16),
+    };
+    let lines = selection_lines(
+        &dev,
+        &source,
+        &crate::models::config::AcquisitionConfig::ewf("/cases/x"),
+        "c_ea01_e_SER_IAL",
+    )
+    .join("\n");
+    assert!(!lines.contains('\x1b'), "{lines}");
+    assert!(lines.contains("serial SER IAL"), "{lines}");
+    assert!(
+        lines.contains("given as    : /dev/disk/by-id/usb-x"),
+        "{lines}"
+    );
+    assert!(lines.contains("major:minor : 8:16"), "{lines}");
+    assert!(lines.contains("1073741824 bytes (1 GiB)"), "{lines}");
+}

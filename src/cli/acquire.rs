@@ -25,6 +25,7 @@ use crate::models::device::BlockDevice;
 use crate::models::identity::SourceKind;
 use crate::models::info_report::{ForensicInfoReport, INFO_JSON_SUFFIX, INFO_SUFFIX};
 use crate::models::outcome::{exit_code, Outcome, RangeKind};
+use crate::models::text::sanitize_line;
 use crate::signals::{AbortController, SignalAction, SignalListener};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -196,8 +197,9 @@ pub fn config_from_options(o: &AcquisitionOptions) -> Result<AcquisitionConfig, 
     Ok(c)
 }
 
-/// Every usage rule an acquisition is subject to, before anything touches
-/// the system: options, required case fields, file-name length.
+/// The usage rules an acquisition is subject to that need no device: the
+/// options and the required case fields (the file-name length is checked
+/// once the device, and so its serial, is known).
 pub fn validate_acquisition(
     config: &AcquisitionConfig,
     case: &CaseMetadata,
@@ -207,23 +209,27 @@ pub fn validate_acquisition(
     Ok(())
 }
 
-/// Lines describing the selected source and the plan (human text).
+/// Lines describing the selected source and the plan (human text; every
+/// value sanitised, firmware strings may hold control characters).
 pub fn selection_lines(
     device: &BlockDevice,
     source: &ResolvedSource,
     config: &AcquisitionConfig,
     base_name: &str,
 ) -> Vec<String> {
-    let mut lines = vec![format!("[+] Source      : {}", device.path)];
+    let mut lines = vec![format!("[+] Source      : {}", sanitize_line(&device.path))];
     if source.path() != Path::new(&device.path) {
-        lines.push(format!("    given as    : {}", source.path().display()));
+        lines.push(format!(
+            "    given as    : {}",
+            sanitize_line(&source.path().to_string_lossy())
+        ));
     }
     if device.kind != SourceKind::RegularFile {
         lines.push(format!(
             "    device      : {} ({}), serial {}",
-            device.display_name(),
+            sanitize_line(&device.display_name()),
             device.kind.label(),
-            device.serial.as_deref().unwrap_or("(none reported)")
+            sanitize_line(device.serial.as_deref().unwrap_or("(none reported)"))
         ));
         if let Some(mm) = &device.maj_min {
             lines.push(format!("    major:minor : {mm}"));
@@ -236,7 +242,10 @@ pub fn selection_lines(
         describe_bytes(device.size_bytes)
     ));
     lines.push(format!("[+] Engine      : {}", config.engine().label()));
-    lines.push(format!("[+] Destination : {}", config.output_dir.display()));
+    lines.push(format!(
+        "[+] Destination : {}",
+        sanitize_line(&config.output_dir.to_string_lossy())
+    ));
     lines.push(format!("    base name   : {base_name}"));
     lines
 }

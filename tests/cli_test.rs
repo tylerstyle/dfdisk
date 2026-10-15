@@ -805,3 +805,57 @@ fn convert_option_errors_are_usage_errors() {
     assert!(text(&output).1.contains("E01 target only"));
     assert!(!out.exists());
 }
+
+#[test]
+fn verify_pieces_finds_the_changed_piece() {
+    let tmp = scratch();
+    let image = tmp.path().join("pieces.raw");
+    let data = sample(3 << 20);
+    std::fs::write(&image, &data).unwrap();
+    let tsv = tmp.path().join("pieces.pieces.tsv");
+    let mut rows = String::from("index\toffset\tlength\tsha256\n");
+    for (i, chunk) in data.chunks(1 << 20).enumerate() {
+        rows.push_str(&format!(
+            "{i}\t{}\t{}\t{}\n",
+            i << 20,
+            chunk.len(),
+            hex::encode(Sha256::digest(chunk))
+        ));
+    }
+    std::fs::write(&tsv, rows).unwrap();
+    let sha256 = hex::encode(Sha256::digest(&data));
+    let verify = |extra: &[&str]| {
+        let mut args = vec![
+            "verify",
+            image.to_str().unwrap(),
+            "--pieces",
+            tsv.to_str().unwrap(),
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let o = run(&args);
+        let v: serde_json::Value = serde_json::from_str(&text(&o).0).unwrap();
+        (o.status.code(), v)
+    };
+    let (code, v) = verify(&[]);
+    if v["pieces_error"]["message"]
+        .as_str()
+        .is_some_and(|m| m.contains("not implemented"))
+    {
+        // This build has no piece checker yet: it must fail, never pass
+        assert_eq!(code, Some(4), "{v}");
+        return;
+    }
+    assert_eq!(code, Some(0), "the pieces were the comparison: {v}");
+    assert_eq!(v["pieces"]["pieces_checked"], 3, "{v}");
+    let (code, _) = verify(&["--sha256", &sha256]);
+    assert_eq!(code, Some(0));
+
+    // One changed byte in the second piece
+    let mut bad = data.clone();
+    bad[(1 << 20) + 5] ^= 0x55;
+    std::fs::write(&image, &bad).unwrap();
+    let (code, v) = verify(&[]);
+    assert_eq!(code, Some(5), "{v}");
+    assert_eq!(v["pieces"]["mismatches"][0]["index"], 1, "{v}");
+}
