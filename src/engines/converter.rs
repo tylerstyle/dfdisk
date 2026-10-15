@@ -1971,6 +1971,40 @@ impl Drop for ConversionAudit {
     }
 }
 
+/// T8: a refused conversion (before "conversion_started", nothing written)
+/// is in the audit log as "conversion_refused", as a refused acquisition is
+/// ("acquisition_refused"); usage errors and failures are not. Returns
+/// `err` unchanged.
+fn record_refusal(
+    env: &ConvertEnv,
+    req: &ConversionRequest,
+    plan: Option<&Plan>,
+    err: AcquisitionError,
+    sink: &ProgressSink,
+) -> AcquisitionError {
+    if err.kind != ErrorKind::Refused {
+        return err;
+    }
+    let mut details = Map::new();
+    details.insert("target_format".into(), json!(req.target));
+    details.insert("output_dir".into(), json!(req.output_dir.to_string_lossy()));
+    let (source, target) = match plan {
+        Some(p) => {
+            details.insert("base_name".into(), json!(p.base_name));
+            details.insert("source_files".into(), json!(p.source_files));
+            (p.source.clone(), p.primary_output())
+        }
+        None => (req.source.clone(), req.output_dir.clone()),
+    };
+    if let Err(reason) = audit::conversion_refused(&env.audit_log, &source, &target, &err, details)
+    {
+        sink.warn(format!(
+            "the refusal was not recorded in the audit log: {reason}"
+        ));
+    }
+    err
+}
+
 fn started_details(plan: &Plan, destination: &DestinationFacts) -> Map<String, Value> {
     let mut d = Map::new();
     d.insert("target_format".into(), json!(plan.target));
@@ -2945,9 +2979,12 @@ async fn run(
     let recorder = ProvenanceRecorder::new();
     sink.phase(AcquisitionStatus::Preparing, "Checking the conversion");
 
-    // 1-2: nothing is written before these pass
-    let plan = plan(env, req, stop, &recorder).await?;
-    let (destination, destination_notes) = check_destination(env, req, &plan)?;
+    // 1-2: nothing is written before these pass; a refusal is recorded
+    let plan = plan(env, req, stop, &recorder)
+        .await
+        .map_err(|e| record_refusal(env, req, None, e, sink))?;
+    let (destination, destination_notes) = check_destination(env, req, &plan)
+        .map_err(|e| record_refusal(env, req, Some(&plan), e, sink))?;
     if stop.is_aborted() {
         return Err(AcquisitionError::aborted(
             "the conversion was aborted before anything was written",
@@ -2955,7 +2992,8 @@ async fn run(
     }
 
     // 3: first write, then "conversion_started"
-    let mut output = preflight::prepare_output(&plan.output_dir, &plan.report_base(), false)?;
+    let mut output = preflight::prepare_output(&plan.output_dir, &plan.report_base(), false)
+        .map_err(|e| record_refusal(env, req, Some(&plan), e, sink))?;
     let target_path = plan.primary_output();
     let audit_info = match audit::conversion_started(
         &env.audit_log,

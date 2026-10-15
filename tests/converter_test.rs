@@ -379,7 +379,17 @@ async fn existing_output_is_refused_before_any_tool_runs() {
         b"earlier evidence"
     );
     assert_eq!(files_in(&f.out), vec!["X.e01"]);
-    assert!(audit_actions(&f.env.audit_log).is_empty());
+    // T8: the refusal is in the audit log, and nothing else
+    let records = audit_actions(&f.env.audit_log);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["action"], "conversion_refused");
+    assert_eq!(records[0]["outcome"], "refused");
+    assert_eq!(records[0]["details"]["exit_code"], 3);
+    assert_eq!(records[0]["details"]["base_name"], "x");
+    assert!(records[0]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Refusing to overwrite"));
 
     // E01 to RAW: an existing RAW (here the image the E01 was made from) refuses too
     let mut req = request(&raw, ConversionTarget::E01, &f.src);
@@ -1334,6 +1344,24 @@ async fn a_destination_in_memory_is_refused_unless_allowed() {
     assert_eq!(e.kind, ErrorKind::Refused);
     assert!(e.message.contains("--allow-tmpfs"), "{e}");
     assert!(!f.out.exists());
+    // T8: recorded as "conversion_refused" (no libewf needed)
+    let records = audit_actions(&env.audit_log);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["action"], "conversion_refused");
+    assert_eq!(records[0]["outcome"], "refused");
+    assert_eq!(records[0]["details"]["error_kind"], "refused");
+    assert!(records[0]["details"]["target"]
+        .as_str()
+        .unwrap()
+        .ends_with("x.E01"));
+    assert!(dfcore::audit::verify(&env.audit_log).is_ok());
+    // A usage error is not recorded
+    let mut req = ConversionRequest::new(&raw, ConversionTarget::E01, &f.out);
+    req.case = Some(case());
+    req.split_size = SplitSize::Custom(4096);
+    let e = run(&env, req, StopFlags::new()).await.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Usage, "{e}");
+    assert_eq!(audit_actions(&env.audit_log).len(), 1);
 }
 
 #[tokio::test]
