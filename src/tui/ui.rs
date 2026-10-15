@@ -277,7 +277,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 
 fn badge_style(b: Badge) -> Style {
     let color = match b {
-        Badge::System | Badge::Protected | Badge::HiddenArea => Color::Red,
+        Badge::System | Badge::Protected | Badge::HiddenArea | Badge::Dco => Color::Red,
         Badge::Mounted => Color::Yellow,
         Badge::ReadOnly => Color::Green,
         Badge::InUse => Color::Magenta,
@@ -1930,7 +1930,7 @@ fn help_lines(app: &App) -> Vec<String> {
             "Sources: every disk and partition can be selected; the selection follows the device's identity across refreshes.",
             "Enter/A acquire · U unmount (audited, asks) · H probe hidden areas (HPA/DCO) · R refresh",
             "C converter · V re-verify an image · L last result · Q quit",
-            "Badges: SYSTEM / PROTECTED / MOUNTED are refused; RO read-only; IN-USE has holders; HPA hidden area found.",
+            "Badges: SYSTEM / PROTECTED / MOUNTED are refused; RO read-only; IN-USE has holders; HPA / DCO hidden area found.",
         ],
         Screen::CaseSetup => &[
             "Case number, evidence number, examiner and destination are required; grey text is an example, never a value.",

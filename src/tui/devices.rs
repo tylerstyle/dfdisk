@@ -4,7 +4,8 @@
 //! and size), never by a list index, so a refresh or a hot-plug cannot move it
 //! to another device (§16, review C2).
 
-use crate::discovery::SafetyChecker;
+use crate::discovery::devices;
+use crate::discovery::safety::is_system_mount;
 use crate::models::capacity::CapacityInfo;
 use crate::models::device::{format_bytes, BlockDevice, DeviceSafety, Partition};
 use crate::models::identity::SourceKind;
@@ -94,8 +95,10 @@ pub enum Badge {
     ReadOnly,
     /// Has holders (dm, md, LVM on top)
     InUse,
-    /// A capacity probe found a host protected area or DCO
+    /// A capacity probe found a host protected area
     HiddenArea,
+    /// A capacity probe found a device configuration overlay
+    Dco,
 }
 
 impl Badge {
@@ -107,7 +110,22 @@ impl Badge {
             Badge::ReadOnly => "RO",
             Badge::InUse => "IN-USE",
             Badge::HiddenArea => "HPA",
+            Badge::Dco => "DCO",
         }
+    }
+
+    /// The badge of a label of [`devices::badges`].
+    pub fn from_label(label: &str) -> Option<Badge> {
+        Some(match label {
+            "SYSTEM" => Badge::System,
+            "PROTECTED" => Badge::Protected,
+            "MOUNTED" => Badge::Mounted,
+            "RO" => Badge::ReadOnly,
+            "IN-USE" => Badge::InUse,
+            "HPA" => Badge::HiddenArea,
+            "DCO" => Badge::Dco,
+            _ => return None,
+        })
     }
 
     /// Short form for narrow tables (the details pane and the help explain
@@ -120,6 +138,7 @@ impl Badge {
             Badge::ReadOnly => "RO",
             Badge::InUse => "HOLD",
             Badge::HiddenArea => "HPA",
+            Badge::Dco => "DCO",
         }
     }
 
@@ -239,9 +258,7 @@ pub fn partition_source(disk: &BlockDevice, part: &Partition) -> BlockDevice {
         physical_sector_size: disk.physical_sector_size,
         mountpoints: part.mountpoint.iter().cloned().collect(),
         safety: match &part.mountpoint {
-            Some(mp) if SafetyChecker::is_critical_mount(mp) => {
-                DeviceSafety::SystemDisk(vec![mp.clone()])
-            }
+            Some(mp) if is_system_mount(mp) => DeviceSafety::SystemDisk(vec![mp.clone()]),
             Some(mp) => DeviceSafety::Mounted(vec![mp.clone()]),
             None => DeviceSafety::Safe,
         },
@@ -270,25 +287,13 @@ pub fn source_rows(
             DeviceSafety::SystemDisk(m) => m.clone(),
             _ => Vec::new(),
         };
-        let mut badges = Vec::new();
-        if disk.safety.is_system() {
-            badges.push(Badge::System);
-        }
-        if disk.protected.is_some() {
-            badges.push(Badge::Protected);
-        }
-        if disk.safety.is_mounted() || !disk.mountpoints.is_empty() {
-            badges.push(Badge::Mounted);
-        }
-        if disk.is_read_only {
-            badges.push(Badge::ReadOnly);
-        }
-        if !disk.holders.is_empty() {
-            badges.push(Badge::InUse);
-        }
-        if capacity(&disk.name).is_some_and(|c| c.hidden_area() == Some(true)) {
-            badges.push(Badge::HiddenArea);
-        }
+        // The scan's badges (§16): SYSTEM, PROTECTED, MOUNTED, RO, IN-USE,
+        // and HPA / DCO once the examiner had the disk probed
+        let probed = capacity(&disk.name);
+        let badges: Vec<Badge> = devices::badges(disk, probed.as_ref())
+            .into_iter()
+            .filter_map(Badge::from_label)
+            .collect();
         rows.push(SourceRow {
             device: disk.clone(),
             key: SelectionKey::of(disk),
@@ -302,10 +307,7 @@ pub fn source_rows(
         for part in &disk.partitions {
             let device = partition_source(disk, part);
             let mut badges = Vec::new();
-            let critical = part
-                .mountpoint
-                .as_deref()
-                .is_some_and(SafetyChecker::is_critical_mount);
+            let critical = part.mountpoint.as_deref().is_some_and(is_system_mount);
             // A child of a system disk is shown as such: the session refuses
             // sources on the system disk
             if disk.safety.is_system() || critical {
@@ -457,8 +459,28 @@ mod tests {
         d.protected = Some("dfnix boot medium".into());
         d.is_read_only = true;
         d.holders = vec!["dm-0".into()];
-        let rows = source_rows(&[d], &|_| None);
+        // The scan lists the mounts of the disk's whole tree on the disk
+        d.mountpoints = vec!["/media/x".into()];
+        let rows = source_rows(std::slice::from_ref(&d), &|_| None);
         assert_eq!(rows[0].badge_text(), "SYSTEM PROTECTED MOUNTED RO IN-USE");
         assert!(rows[1].has(Badge::System) && rows[1].has(Badge::Protected));
+        // A probed disk: HPA and DCO are told apart
+        let probed = |_: &str| {
+            Some(CapacityInfo {
+                ata: Some(crate::models::capacity::AtaCapacity {
+                    hpa_present: Some(false),
+                    dco_present: Some(true),
+                    ..Default::default()
+                }),
+                ..CapacityInfo::not_probed(1 << 30, "test")
+            })
+        };
+        let rows = source_rows(&[d], &probed);
+        assert!(rows[0].has(Badge::Dco) && !rows[0].has(Badge::HiddenArea));
+        // A partition mounted at a dfcore system mount (e.g. the live ISO)
+        let mut iso = disk("sdc", "S2", 8);
+        iso.partitions[0].mountpoint = Some("/iso".into());
+        let rows = source_rows(&[iso], &|_| None);
+        assert!(rows[1].has(Badge::System), "{}", rows[1].badge_text());
     }
 }
