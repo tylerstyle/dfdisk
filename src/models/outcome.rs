@@ -130,7 +130,7 @@ impl Outcome {
                 "Not all of the source was acquired: the ddrescue map still lists areas that were not tried or not finished (untried, non-trimmed or non-scraped); run the rescue again on the same destination to resume and retry them, until then the image holds no source data for those areas."
             }
             (Outcome::CompletedWithReadErrors, EngineKind::Rescue) => {
-                "The full length of the source was written, but ddrescue could not read some sectors even after retries (bad sectors in the map) and they are zeros in the image; the digests describe the image including those substituted sectors, not the original medium."
+                "The full length of the source was written, but ddrescue marked some sectors as bad (\"-\" in the map: unreadable in every pass it made, including any retry passes that were requested) and they are zeros in the image; the digests describe the image including those substituted sectors, not the original medium."
             }
             (Outcome::CompleteUnverified, EngineKind::Rescue) => {
                 "ddrescue rescued every sector of the source, but it does not compute digests while reading, so the image digests are not confirmed against the source; acquire with --verify-source to compare them with a second read of the source."
@@ -776,6 +776,8 @@ mod tests {
         assert!(inc.contains("untried") && inc.contains("run the rescue again"));
         let rd = Outcome::CompletedWithReadErrors.explanation_for(EngineKind::Rescue);
         assert!(rd.contains("substituted sectors"));
+        // True with -r 0 as well: no claim that retries were made
+        assert!(!rd.contains("after retries"), "{rd}");
         assert!(Outcome::CompletedWithReadErrors
             .explanation()
             .contains("substituted sectors"));
