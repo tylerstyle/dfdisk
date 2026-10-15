@@ -148,8 +148,12 @@ anything or sends anything to the device when a tool its engine runs is missing.
 
 The Nix build runs the tool tests against libewf 20231119 and ddrescue 1.30, and
 the flake check `libewf-legacy` runs them again against libewf 20140816. Debian
-and Ubuntu ship that older release line (`ewf-tools` 20140807 on Ubuntu 22.04);
-CI also runs the tests against Ubuntu 22.04's `ewf-tools` and `gddrescue`.
+and Ubuntu ship that older release line (`ewf-tools` 20140807 on Ubuntu 22.04,
+20140814 on Ubuntu 24.04, 20140813 on Debian 12); CI also runs the tests against
+Ubuntu 22.04's `ewf-tools` 20140807 and `gddrescue` 1.23. ewfacquire 20140807
+crashes on any `-r` option: dfdisk leaves the default of 2 read retries to
+ewfacquire (no `-r`) and refuses another count with such a release (exit 2)
+before anything is written.
 
 ### Nix and NixOS
 
@@ -304,7 +308,7 @@ Acquisition options:
 | `--ea`, `--authority`, `--description`, `--notes`, `--seal`, `--seized-at`, `--seized-location` | optional case and chain-of-custody fields |
 | `--format e01\|raw` | engine (default `e01`) |
 | `--compression none\|fast\|best`, `--split none\|2G\|4G` | E01 only; `none` writes one segment (libewf's largest EnCase 6 segment size, 9223372036854775806 bytes) |
-| `-r, --retries <N>` | read retries of ewfacquire or ddrescue, 0 to 255 |
+| `-r, --retries <N>` | read retries of ewfacquire or ddrescue, 0 to 255 (default 2; E01: the default is ewfacquire's own, and another count needs an ewfacquire that takes `-r`, not 20140807) |
 | `--rescue` | GNU ddrescue engine; `--resume` continues an interrupted rescue of the same device |
 | `--rescue-to-e01` | after a rescue, convert the image to E01 |
 | `--on-read-error stop\|zero-fill` | RAW only (default `stop`) |

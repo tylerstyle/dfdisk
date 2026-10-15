@@ -268,6 +268,15 @@ and when something was not done the report says so.
   never a pass; `.Ex01` and `.E02` segment families are recognised as EWF; an
   expected digest that is not 32/40/64 hex digits is a usage error (exit 2)
   instead of a mismatch.
+- **E01 with Ubuntu's ewf-tools.** ewfacquire 20140807 (Ubuntu 22.04's
+  `ewf-tools`, which the .deb depends on) crashes on any `-r`, and 0.1.10
+  always gave `-r`, so it could not take an E01 there. dfdisk gives `-r` only
+  for a retry count other than ewfacquire's own default of 2 (the report states
+  "2 (ewfacquire's default; -r not given)"); another count with an ewfacquire
+  that crashes on `-r` (libewf 20101105 to 20140808 and 20141002 to 20200210,
+  by the version `ewfacquire -V` prints) is a usage error (exit 2), in `check`
+  too, before anything is written or sent to the source. CI runs the whole
+  test suite against Ubuntu 22.04's `ewf-tools` and `gddrescue` 1.23.
 - Low: `--split none` passes the largest segment size both libewf lines accept
   (9223372036854775806 bytes; 0.1.10 passed 7900 GiB, so a larger source got
   several segments); `-r` above 255 is a usage error instead of silently
@@ -329,6 +338,9 @@ and when something was not done the report says so.
   (the loop node is set read-only as the disk).
 - The flake check `libewf-legacy` builds and tests dfdisk against libewf
   20140816, the release line of the Debian/Ubuntu `ewf-tools` package.
+- `scripts/test-ubuntu.sh` runs the whole test suite in an Ubuntu 22.04
+  container (podman or docker) against its `ewf-tools` 20140807 and `gddrescue`
+  1.23, as a non-root user, like CI.
 
 ### Not in 0.2.0
 

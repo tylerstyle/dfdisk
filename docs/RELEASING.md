@@ -33,7 +33,9 @@ Start the Release workflow by hand (Actions → Release → Run workflow) on the
 commit to be tagged. It runs the version check (without a tag), the tests and
 every build, including the .deb installation test, and publishes nothing.
 Locally, `nix build .#default .#checks.x86_64-linux.libewf-legacy` builds and
-tests the package against both libewf release lines.
+tests the package against both libewf release lines, and
+`scripts/test-ubuntu.sh` runs the whole test suite against Ubuntu 22.04's tools
+(see below) in a podman or docker container as a non-root user, like CI.
 
 ## 4. Tag
 
@@ -54,6 +56,33 @@ git push origin v0.2.0
 Each tarball holds the binary, README.md, CHANGELOG.md, the license files and
 `docs/`. The .deb job checks that `Depends` names libc6 and every external tool,
 installs the package with apt on Ubuntu 22.04 and runs `dfdisk --version`.
+
+## libewf releases the E01 engine runs with
+
+The tests run against three libewf releases, and a release needs all three
+green: 20231119 (`nix build .#default`), 20140816
+(`.#checks.x86_64-linux.libewf-legacy`) and 20140807, Ubuntu 22.04's
+`ewf-tools`, which the .deb depends on (the CI and release test jobs on
+`ubuntu-22.04`, `scripts/test-ubuntu.sh`). 20140807 is not 20140816:
+
+- ewfacquire 20140807 crashes (SIGSEGV) on any `-r`: its option parser hands
+  the `-b` value to the retry setting. The same holds for every libewf from
+  20101105 to 20140808 and from 20141002 to 20200210 (libewf history; run with
+  the ewf-tools of Ubuntu 18.04, Debian 10, Debian 11, Ubuntu 20.04 and 22.04);
+  20140813 (Debian 12), 20140814 (Ubuntu 24.04), 20140816 and 20231119 take
+  `-r`. dfdisk therefore gives `-r` only for a retry count other than
+  ewfacquire's default of 2 (the report then states "2 (ewfacquire's default;
+  -r not given)"), and an E01 with another count and such a release (by the
+  version `ewfacquire -V` prints) is a usage error (exit 2) at the tools step,
+  in `check` too, before anything is written or sent to the source
+  (`ewf::retries_option_crashes`, `ewf::check_retries_option`).
+- ewfacquire 20140807 does not notice that the source's node disappeared after
+  a read error (its libsmdev has no such check): it zero-fills to the end and
+  reports SUCCESS, and dfdisk's presence check after the run reports "source
+  lost at offset X" instead of "source lost during the acquisition".
+
+Whatever changes how dfdisk runs a libewf tool (options, parsed output) has to
+pass `scripts/test-ubuntu.sh` before it is merged, not only the Nix builds.
 
 ## Pinned tools
 
