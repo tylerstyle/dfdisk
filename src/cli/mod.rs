@@ -78,9 +78,13 @@ async fn dispatch(
 
 /// Run `run` (a command or the TUI) and turn a panic into exit code 1
 /// (internal error) with a message on stderr, instead of Rust's 101 (T6).
-/// The panic hook has already printed where it happened; unwinding has run
-/// the audit guards ("acquisition_finished" with exit code 1) and the TUI's
-/// hook has restored the terminal.
+/// The panic hook has already printed where it happened; for a command,
+/// whose run is this future, unwinding has run the audit guards
+/// ("acquisition_finished" with exit code 1). The TUI catches a panic of its
+/// own UI itself, restores the terminal and, before it returns, aborts a
+/// running job and waits for its report and audit record and for a running
+/// unmount (`tui::finish_background_work`), since the process exits right
+/// after this returns.
 pub async fn exit_code_or_internal_error<F>(run: F) -> i32
 where
     F: std::future::Future<Output = i32>,

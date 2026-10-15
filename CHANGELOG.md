@@ -70,6 +70,9 @@ and when something was not done the report says so.
   0 otherwise, 1 on a terminal failure or an internal error of the UI itself,
   and 4 when the signal handlers cannot be installed. A run that stops on an
   internal error (a panic) is shown as FAILED (INTERNAL ERROR), exit code 4.
+  After an internal error of the UI itself, a job still running is aborted
+  and writes its report and audit record, and an unmount still running ends,
+  before dfdisk exits.
 - **TUI keys.** Esc never aborts; aborting needs a y/N confirmation; Tab and
   Shift-Tab always move between fields and path completion has its own key.
 - **Packaging.** The .deb depends on `$auto, ewf-tools, gddrescue, smartmontools,

@@ -794,6 +794,9 @@ pub struct App {
     pub verify: VerifyForm,
     verify_due: Option<Instant>,
 
+    /// Jobs and unmounts running in the background (I-N3: a panic of the UI
+    /// waits for them before dfdisk exits)
+    pub work: crate::tui::WorkTracker,
     pub notices: Vec<Notice>,
     notice_seq: u64,
     /// Ids of the notices the last frame drew (I-N4): Ctrl+X dismisses only
@@ -899,6 +902,7 @@ impl App {
             conv_due: None,
             verify: VerifyForm::default(),
             verify_due: None,
+            work: crate::tui::WorkTracker::default(),
             notices: Vec::new(),
             notice_seq: 0,
             notices_drawn: Vec::new(),
@@ -1096,6 +1100,23 @@ impl App {
                 false
             }
         }
+    }
+
+    /// [`spawn`](Self::spawn) for a job: counted in [`work`](Self::work)
+    /// while it runs.
+    fn spawn_job<F, P>(&mut self, fut: F, on_panic: P) -> bool
+    where
+        F: Future<Output = BgEvent> + Send + 'static,
+        P: FnOnce(String) -> BgEvent + Send + 'static,
+    {
+        let guard = self.work.enter();
+        self.spawn(
+            async move {
+                let _running = guard;
+                fut.await
+            },
+            on_panic,
+        )
     }
 
     /// Work that must finish before dfdisk may exit: a job (its report) or
@@ -1603,12 +1624,16 @@ impl App {
         let path = device.path.clone();
         self.unmounting = Some(path.clone());
         let (key2, path2) = (key.clone(), path.clone());
+        let guard = self.work.enter();
         if !self.spawn_blocking(
-            move || BgEvent::Unmount {
-                result: backend.unmount(&device),
-                key,
-                path,
-                then_setup,
+            move || {
+                let _running = guard;
+                BgEvent::Unmount {
+                    result: backend.unmount(&device),
+                    key,
+                    path,
+                    then_setup,
+                }
             },
             move |m| BgEvent::Unmount {
                 result: Err(AcquisitionError::failed(format!(
@@ -2084,7 +2109,7 @@ impl App {
         self.confirm = None;
         self.screen = Screen::Running;
         self.save_profile();
-        self.spawn(
+        self.spawn_job(
             async move { BgEvent::Acquired(Box::new(fut.await)) },
             |message| BgEvent::JobPanicked {
                 kind: JobKind::Acquisition,
@@ -2501,7 +2526,7 @@ impl App {
         });
         self.confirm = None;
         self.screen = Screen::Running;
-        self.spawn(
+        self.spawn_job(
             async move {
                 let result = match fut.await {
                     Ok(report) => {
@@ -2639,7 +2664,7 @@ impl App {
             force_requested: false,
         });
         self.screen = Screen::Running;
-        self.spawn(
+        self.spawn_job(
             async move {
                 let expected = match report {
                     None => Ok(ExpectedHashes::default()),

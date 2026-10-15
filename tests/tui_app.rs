@@ -1734,3 +1734,35 @@ fn offline_app_never_touches_the_host() {
     assert_eq!(app.rows.len(), 2);
     let _ = ProgressTelemetry::default();
 }
+
+/// I-N3: a panic of the UI drops the App; the job it started keeps running
+/// on the runtime and is counted, so the TUI aborts it and waits for its
+/// report before dfdisk exits (`process::exit` would cut it off).
+#[tokio::test]
+async fn a_job_outlives_a_dropped_ui_and_is_awaited_before_the_exit() {
+    let fake = Fake::new(vec![evidence()]);
+    fake.s().acquire = Acquire::UntilAborted;
+    let mut app = app_with(&fake);
+    to_case_setup(&mut app, "/mnt/case");
+    to_confirm(&mut app).await;
+    typ(&mut app, "kd7y");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen, Screen::Running);
+    let (controller, work) = (app.controller.clone(), app.work.clone());
+    assert_eq!(work.running(), 1, "the job is counted");
+    // The UI unwinds: the App goes, the job does not
+    drop(app);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(work.running(), 1, "the job still runs");
+    let said = dfdisk::tui::finish_background_work(
+        &controller,
+        &work,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(work.running(), 0, "{said:?}");
+    assert!(controller.is_aborted() && !controller.is_forced());
+    assert_eq!(fake.s().acquire_requests.len(), 1);
+    assert!(said.iter().any(|l| l.contains("ended")), "{said:?}");
+}
