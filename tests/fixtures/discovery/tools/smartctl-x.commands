@@ -1,0 +1,10 @@
+[ata-emul] HDIO_DRIVE_CMD cmd=0xb0 feat=0xd0 nsect=0x00
+[ata-emul] HDIO_DRIVE_CMD cmd=0xb0 feat=0xd1 nsect=0x01
+[ata-emul] HDIO_DRIVE_CMD cmd=0xb0 feat=0xd5 nsect=0x00
+[ata-emul] HDIO_DRIVE_CMD cmd=0xb0 feat=0xd5 nsect=0x01
+[ata-emul] HDIO_DRIVE_CMD cmd=0xb0 feat=0xd5 nsect=0x06
+[ata-emul] HDIO_DRIVE_CMD cmd=0xb0 feat=0xd5 nsect=0x09
+[ata-emul] HDIO_DRIVE_CMD cmd=0xb0 feat=0xd5 nsect=0xe0
+[ata-emul] HDIO_DRIVE_CMD cmd=0xec feat=0x00 nsect=0x00
+[ata-emul] HDIO_DRIVE_TASK cmd=0xb0 feat=0xda
+[ata-emul] ioctl 0x30d -> ENOTTY

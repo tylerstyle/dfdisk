@@ -1,4 +1,4 @@
-use crate::discovery::{safety::SafetyChecker, smart::SmartChecker};
+use crate::discovery::safety::SafetyChecker;
 use crate::models::device::{BlockDevice, Partition};
 use crate::models::identity::SourceKind;
 use serde_json::Value;
@@ -48,16 +48,14 @@ impl DeviceScanner {
         Ok(devices)
     }
 
-    /// Adds what lsblk does not report: udev serial fallback and device links,
-    /// and SMART health. Runs external tools against the device, so it is kept
-    /// apart from the pure JSON parsing that tests exercise.
+    /// Adds what lsblk does not report: udev serial fallback and device links.
+    /// No SMART in scans (§8, §14): SMART is an explicit, separate query.
     pub fn enrich_device(dev: &mut BlockDevice) {
         let (udev_serial, devlinks) = query_udev_props(&dev.path);
         if dev.serial.as_deref().is_none_or(|s| s.trim().is_empty()) {
             dev.serial = udev_serial;
         }
         dev.devlinks = devlinks;
-        dev.smart = SmartChecker::query_smart(&dev.path);
     }
 
     /// Parses a single block device from lsblk JSON, recursively traversing

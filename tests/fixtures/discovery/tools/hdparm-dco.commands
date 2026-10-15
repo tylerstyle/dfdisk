@@ -1,0 +1,1 @@
+[ata-emul] HDIO_DRIVE_CMD cmd=0xb1 feat=0xc2 nsect=0x00

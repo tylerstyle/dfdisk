@@ -1,8 +1,7 @@
-//! Pure parsing of captured lsblk / smartctl output; no tool is run against
+//! Pure parsing of captured lsblk output; no tool is run against
 //! this host's devices.
 
 use dfdisk::discovery::devices::DeviceScanner;
-use dfdisk::discovery::smart::SmartChecker;
 use dfdisk::models::device::DeviceSafety;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -127,81 +126,5 @@ fn test_active_vs_dormant_swap_detection() {
             );
         }
         _ => panic!("Expected SystemDisk fallback on swap"),
-    }
-}
-
-#[test]
-fn test_smart_diagnostics_permission_denied() {
-    let fixture_str = fs::read_to_string("tests/fixtures/smartctl_permission_denied.json")
-        .expect("Failed to read smartctl_permission_denied.json fixture");
-    let val: Value = serde_json::from_str(&fixture_str).unwrap();
-
-    let info = SmartChecker::parse_smart_json(&val);
-
-    // Permission denied must report passed: false and graceful diagnostic assessment
-    assert!(!info.passed);
-    assert_eq!(
-        info.assessment,
-        "UNKNOWN (Inaccessible / Permission Denied)"
-    );
-}
-
-#[test]
-fn test_smart_diagnostics_healthy_nvme() {
-    let fixture_str = fs::read_to_string("tests/fixtures/smartctl_healthy.json")
-        .expect("Failed to read smartctl_healthy.json fixture");
-    let val: Value = serde_json::from_str(&fixture_str).unwrap();
-
-    let info = SmartChecker::parse_smart_json(&val);
-
-    assert!(info.passed);
-    assert_eq!(info.assessment, "PASSED (Healthy)");
-    assert_eq!(info.power_on_hours, Some(3450));
-    assert_eq!(info.temperature_celsius, Some(38));
-    assert_eq!(info.wear_percentage, Some(0)); // NVMe percentage_used
-    assert_eq!(info.uncorrectable_errors, Some(0));
-}
-
-#[test]
-fn test_smart_diagnostics_failing_drive() {
-    let fixture_str = fs::read_to_string("tests/fixtures/smartctl_failing.json")
-        .expect("Failed to read smartctl_failing.json fixture");
-    let val: Value = serde_json::from_str(&fixture_str).unwrap();
-
-    let info = SmartChecker::parse_smart_json(&val);
-
-    assert!(!info.passed);
-    assert_eq!(info.assessment, "WARNING / FAILED");
-    assert_eq!(info.power_on_hours, Some(45210));
-    assert_eq!(info.temperature_celsius, Some(54));
-    assert_eq!(info.reallocated_sectors, Some(1584));
-    assert_eq!(info.pending_sectors, Some(320));
-    assert_eq!(info.uncorrectable_errors, Some(112));
-}
-
-#[test]
-fn test_smart_bitmask_error_variations() {
-    // smartctl exit status bit 1 (value 2): device open failed (e.g. permission denied)
-    let bitmask_cases = [
-        (2, None, "UNKNOWN (Inaccessible / Permission Denied)"),
-        (2, Some(true), "UNKNOWN (Inaccessible / Permission Denied)"), // Inaccessible overrides passed
-        (6, None, "UNKNOWN (Inaccessible / Permission Denied)"),       // bits 1 and 2 set
-        (1, None, "UNKNOWN (Inaccessible / Permission Denied)"), // non-zero with missing status
-        (0, Some(true), "PASSED (Healthy)"),
-        (0, Some(false), "WARNING / FAILED"),
-    ];
-
-    for (exit_code, smart_status, exp_assessment) in bitmask_cases {
-        let json_val = serde_json::json!({
-            "smartctl": { "exit_status": exit_code },
-            "smart_status": smart_status.map(|p| serde_json::json!({ "passed": p }))
-        });
-
-        let info = SmartChecker::parse_smart_json(&json_val);
-        assert_eq!(
-            info.assessment, exp_assessment,
-            "Failed for exit_code: {}, smart_status: {:?}",
-            exit_code, smart_status
-        );
     }
 }

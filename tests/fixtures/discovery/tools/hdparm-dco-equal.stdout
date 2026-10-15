@@ -1,0 +1,13 @@
+
+sdx:
+DCO Checksum verified.
+DCO Revision: 0x0002
+The following features can be selectively disabled via DCO:
+	Transfer modes:
+		 mdma0 mdma1 mdma2
+		 udma0 udma1 udma2 udma3 udma4 udma5 udma6
+	Real max sectors: 976773168
+	ATA command/feature sets:
+		 SMART self_test error_log security PUIS TCQ AAM HPA 48_bit
+	SATA command/feature sets:
+		 NCQ

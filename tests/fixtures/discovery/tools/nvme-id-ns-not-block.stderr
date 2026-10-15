@@ -1,0 +1,20 @@
+[1mUsage: nvme id-ns <device> [OPTIONS][0m
+
+Send an Identify Namespace command to the given device, returns properties of
+the specified namespace in either human-readable or binary format. Can also
+return binary vendor-specific namespace attributes.
+
+[1mOptions:[0m
+  [  --verbose, -v ]                    --- Increase output verbosity
+  [  --output-format=<FMT>, -o <FMT> ]  --- Output format: normal|json|binary
+  [  --namespace-id=<NUM>, -n <NUM> ]   --- identifier of desired namespace
+  [  --force ]                          --- Return this namespace, even if
+                                            not attached (1.2 devices only)
+  [  --vendor-specific, -V ]            --- dump binary vendor fields
+  [  --raw-binary, -b ]                 --- show identify in binary format
+  [  --human-readable, -H ]             --- show identify in readable format
+  [  --timeout=<NUM>, -t <NUM> ]        --- timeout value, in milliseconds
+  [  --dry-run ]                        --- show command instead of sending
+  [  --no-retries ]                     --- disable retry logic on errors
+                                            
+  [  --output-format-version=<NUM> ]    --- output format version: 1|2
