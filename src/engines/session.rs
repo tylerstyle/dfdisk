@@ -595,11 +595,12 @@ fn source_safety(
             write_protection.mounts_before.join(", ")
         )));
     }
-    // A holder (dm, LVM, md, bcache, LUKS) claims the source exclusively,
-    // so the exclusive open would refuse it anyway; there is no override
+    // A holder keeps the source open and may write to it: dm, LVM, md,
+    // bcache and LUKS claim it exclusively (the exclusive open would refuse
+    // it anyway), a loop device over it does not (L3). There is no override
     if !write_protection.holders.is_empty() {
         errors.push(AcquisitionError::refused(format!(
-            "devices are stacked on the source ({}): device-mapper, LVM, md or LUKS keep it open and may write to it. Close them first (for example cryptsetup close, vgchange -an, mdadm --stop), then acquire again",
+            "devices are stacked on the source ({}): device-mapper, LVM, md, LUKS or loop devices keep it open and may write to it. Close them first (for example cryptsetup close, vgchange -an, mdadm --stop, losetup -d), then acquire again",
             write_protection.holders.join(", ")
         )));
     }
