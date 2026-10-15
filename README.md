@@ -114,6 +114,7 @@ RAW engine re-reads with `O_DIRECT` where the filesystem supports it.
   read of the source (`--verify-source`) matched.
 - An acquisition survives a closed terminal (SIGHUP) but cannot be detached and
   re-attached; run it in tmux or screen when working over SSH.
+- Optical drives (`/dev/sr*`) are not listed and not acquired.
 - Linux only. Acquiring block devices needs root.
 - `cargo install --git` does not work: dfdisk builds against a sibling checkout
   of dfcore (see [Build from source](#build-from-source)).
