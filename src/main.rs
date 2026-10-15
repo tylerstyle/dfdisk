@@ -1,6 +1,7 @@
 use clap::Parser;
 use dfdisk::cli::{run_command, Cli, Commands};
 use dfdisk::models::outcome::exit_code;
+use dfdisk::signals::AbortController;
 use dfdisk::tui;
 use std::io::Write;
 
@@ -21,17 +22,37 @@ async fn main() {
             }
         }
         Ok(cli) => match cli.command {
-            Some(Commands::Tui) | None => match tui::run_tui().await {
-                Ok(()) => exit_code::VERIFIED,
-                Err(e) => {
-                    let _ = writeln!(std::io::stderr(), "Error: {e}");
-                    exit_code::INTERNAL_ERROR
-                }
-            },
+            Some(Commands::Tui) | None => run_tui().await,
             Some(command) => run_command(command).await,
         },
     };
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     std::process::exit(code);
+}
+
+/// The TUI with this process' abort controller and its one signal listener
+/// (installed once per process, §15/§16). Exit code: that of a result the
+/// examiner did not acknowledge on screen, else 0; 4 when the signal
+/// handlers cannot be installed (a SIGTERM would then end a run without its
+/// report), 1 for a terminal failure.
+async fn run_tui() -> i32 {
+    let controller = AbortController::new();
+    let listener = match controller.install() {
+        Ok(listener) => listener,
+        Err(e) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Error (FAILED): cannot install the signal handlers: {e}"
+            );
+            return exit_code::FAILED;
+        }
+    };
+    match tui::run_tui_with(controller, Some(listener)).await {
+        Ok(code) => code,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "Error: {e}");
+            exit_code::INTERNAL_ERROR
+        }
+    }
 }

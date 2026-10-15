@@ -2411,6 +2411,19 @@ impl App {
         }
     }
 
+    /// The process exit code when the TUI ends (§2): the exit code of a
+    /// result the examiner did not acknowledge on screen (a run that finished
+    /// headless, or a quit by signal before the result was seen), else 0.
+    pub fn exit_code(&self) -> i32 {
+        if self.result_acknowledged {
+            return crate::models::outcome::exit_code::VERIFIED;
+        }
+        self.result
+            .as_ref()
+            .map(RunResult::exit_code)
+            .unwrap_or(crate::models::outcome::exit_code::VERIFIED)
+    }
+
     /// One line for the terminal after the TUI closed, when a result was not
     /// acknowledged on screen.
     pub fn exit_summary(&self) -> Option<String> {

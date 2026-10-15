@@ -760,6 +760,12 @@ async fn results_and_errors_stay_until_acknowledged() {
     assert_eq!(r.label(), "REFUSED");
     assert_eq!(r.exit_code(), 3);
     assert!(r.lines().iter().any(|l| l.contains("in use")));
+    // Quitting now (e.g. by signal) exits with the unseen result's code
+    assert_eq!(app.exit_code(), 3);
+    assert!(app
+        .exit_summary()
+        .unwrap()
+        .contains("REFUSED (exit code 3)"));
     // It does not go away by itself
     for _ in 0..50 {
         app.tick();
@@ -770,6 +776,9 @@ async fn results_and_errors_stay_until_acknowledged() {
     app.handle_key(key(KeyCode::Char('q')));
     assert_eq!(app.screen, Screen::Result);
     app.handle_key(key(KeyCode::Enter));
+    // Acknowledged on screen: the TUI exits 0
+    assert_eq!(app.exit_code(), 0);
+    assert!(app.exit_summary().is_none());
     // A refused acquisition goes back to the case setup with the values kept
     assert_eq!(app.screen, Screen::CaseSetup);
     assert_eq!(app.case.evidence_number, "HDD01");

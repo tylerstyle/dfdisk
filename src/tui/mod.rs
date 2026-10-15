@@ -38,21 +38,15 @@ pub fn restore_terminal() {
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
 }
 
-/// Run the TUI with its own [`AbortController`] and signal listener (the
-/// listener is installed here, once for the process).
-pub async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
-    let controller = AbortController::new();
-    let listener = controller.install().ok();
-    run_tui_with(controller, listener).await
-}
-
-/// Run the TUI with the caller's controller and listener, for a `main` that
-/// installs the process' signal listener itself (two listeners would apply
-/// every signal twice: one SIGINT would count as abort and force).
+/// Run the TUI with the process' [`AbortController`] and its one signal
+/// listener (installed by `main`; two listeners would apply every signal
+/// twice: one SIGINT would count as abort and force). Returns the process
+/// exit code: that of a result the examiner did not acknowledge on screen,
+/// else 0. `Err` only for a terminal failure outside a running job.
 pub async fn run_tui_with(
     controller: AbortController,
     listener: Option<SignalListener>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<i32, Box<dyn std::error::Error>> {
     // Restore the terminal if a panic occurs
     let prev_hook = std::sync::Arc::new(std::panic::take_hook());
     let hook_clone = std::sync::Arc::clone(&prev_hook);
@@ -70,17 +64,19 @@ pub async fn run_tui_with(
     }
 
     // The terminal is ours again: say what was not acknowledged on screen
-    if let Some(line) = res? {
+    let (line, code) = res?;
+    if let Some(line) = line {
         eprintln!("{line}");
     }
-    Ok(())
+    Ok(code)
 }
 
-/// Runs the UI; returns a line for the terminal when a result was not seen.
+/// Runs the UI; returns a line for the terminal when a result was not seen,
+/// and the exit code.
 async fn run_tui_inner(
     controller: AbortController,
     mut listener: Option<SignalListener>,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
+) -> Result<(Option<String>, i32), Box<dyn std::error::Error>> {
     let mut app = App::with_controller(controller);
 
     enable_raw_mode()?;
@@ -138,11 +134,12 @@ async fn run_tui_inner(
             break;
         }
     }
+    let code = app.exit_code();
     if app.headless {
-        return Ok(None);
+        return Ok((None, code));
     }
     let _ = terminal.show_cursor();
-    Ok(app.exit_summary())
+    Ok((app.exit_summary(), code))
 }
 
 #[cfg(test)]
