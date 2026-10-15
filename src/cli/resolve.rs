@@ -153,7 +153,9 @@ pub fn partition_device(disk: &BlockDevice, part: &Partition) -> BlockDevice {
 }
 
 /// The scan entry (disk, or anything listed below a disk) with device number
-/// `dev`.
+/// `dev`. A stacked device listed below several disks (md RAID, an LVM
+/// volume over several disks) belongs to no single disk: it gets no disk's
+/// serial, WWN or model, and no parent.
 pub fn find_in_scan(scan: &[BlockDevice], dev: DevNum) -> Option<BlockDevice> {
     if let Some(d) = scan
         .iter()
@@ -161,12 +163,25 @@ pub fn find_in_scan(scan: &[BlockDevice], dev: DevNum) -> Option<BlockDevice> {
     {
         return Some(d.clone());
     }
-    scan.iter().find_map(|d| {
+    let mut found = scan.iter().filter_map(|d| {
         d.partitions
             .iter()
             .find(|p| parse_maj_min(p.maj_min.as_deref()) == Some(dev))
-            .map(|p| partition_device(d, p))
-    })
+            .map(|p| (d, p))
+    });
+    let (disk, part) = found.next()?;
+    let mut device = partition_device(disk, part);
+    if found.any(|(other, _)| other.path != disk.path) {
+        device.model = None;
+        device.vendor = None;
+        device.revision = None;
+        device.serial = None;
+        device.wwn = None;
+        device.serial_candidates.clear();
+        device.parent = None;
+        device.diskseq = None;
+    }
+    Some(device)
 }
 
 /// The selection for a regular file: its canonical path and size, and no
@@ -368,6 +383,33 @@ mod tests {
         assert_eq!(crypt.diskseq, None, "a dm device has its own diskseq");
 
         assert!(find_in_scan(&scan(), (8, 32)).is_none());
+
+        // An md array on two disks belongs to neither disk
+        let mut two = scan();
+        let mut second = two[0].clone();
+        second.name = "sdc".into();
+        second.path = "/dev/sdc".into();
+        second.serial = Some("OTHER".into());
+        second.maj_min = Some("8:32".into());
+        second.partitions = vec![Partition {
+            name: "md0".into(),
+            path: "/dev/md0".into(),
+            maj_min: Some("9:0".into()),
+            kind: Some("raid1".into()),
+            ..Default::default()
+        }];
+        two[0].partitions.push(second.partitions[0].clone());
+        two.push(second);
+        let md = find_in_scan(&two, (9, 0)).unwrap();
+        assert_eq!(md.path, "/dev/md0");
+        assert_eq!(md.serial, None, "no single disk's serial");
+        assert_eq!(md.parent, None);
+        assert_eq!(md.model, None);
+        // ... while a partition still carries its disk's identity
+        assert_eq!(
+            find_in_scan(&two, (8, 17)).unwrap().serial.as_deref(),
+            Some("SER")
+        );
     }
 
     #[test]
