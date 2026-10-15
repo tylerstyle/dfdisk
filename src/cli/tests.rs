@@ -490,7 +490,10 @@ async fn an_incomplete_rescue_is_not_converted() {
         v["acquisition"]["effective_config"]["settings"]["rescue"]["rescue_to_e01"], true,
         "{v}"
     );
-    assert!(!host.out().join(RESCUE_E01_SUBDIR).exists());
+    assert!(std::fs::read_dir(host.out())
+        .unwrap()
+        .flatten()
+        .all(|e| !e.file_name().to_string_lossy().contains(".conversion.")));
     assert!(stderr.contains("no conversion"), "{stderr}");
 }
 
@@ -694,7 +697,8 @@ fn every_new_flag_reaches_the_configuration() {
         E01Settings::from_options(&a.options),
         E01Settings {
             compression: CompressionLevel::Fast,
-            split_size: SplitSize::FourGb
+            split_size: SplitSize::FourGb,
+            ..Default::default()
         }
     );
 }
@@ -806,6 +810,8 @@ fn rescue_to_e01_converts_complete_rescues_only() {
     let e01 = E01Settings {
         compression: CompressionLevel::Best,
         split_size: SplitSize::FourGb,
+        allow_tmpfs: false,
+        allow_low_space: true,
     };
     for outcome in [
         Outcome::Verified,
@@ -814,7 +820,12 @@ fn rescue_to_e01_converts_complete_rescues_only() {
     ] {
         let req = plan_conversion(&rescue_report(outcome, 2), &case, e01).unwrap();
         assert_eq!(req.source, PathBuf::from("/cases/x/c_ea01_e_SER.raw"));
-        assert_eq!(req.output_dir, PathBuf::from("/cases/x/e01"));
+        assert_eq!(
+            req.output_dir,
+            PathBuf::from("/cases/x"),
+            "next to the rescue"
+        );
+        assert!(req.allow_low_space && !req.allow_tmpfs);
         assert_eq!(
             req.source_report,
             Some(PathBuf::from("/cases/x/c_ea01_e_SER.info.json"))
@@ -822,7 +833,7 @@ fn rescue_to_e01_converts_complete_rescues_only() {
         assert_eq!(req.compression, CompressionLevel::Best);
         assert_eq!(req.split_size, SplitSize::FourGb);
         assert!(req.case.is_some());
-        assert!(!req.notes.is_empty());
+        assert_eq!(req.notes.len(), 1, "the zero-filled ranges");
     }
     for outcome in [
         Outcome::Incomplete,
@@ -844,23 +855,23 @@ fn rescue_to_e01_converts_complete_rescues_only() {
 }
 
 #[test]
-fn rescue_notes_carry_the_read_error_table() {
+fn rescue_notes_list_the_zero_filled_ranges() {
+    // The converter states the source, the rescue verdict and the read-error
+    // summary itself; the CLI adds only the ranges
     let json = Path::new("/cases/x/c_ea01_e_SER.info.json");
     let notes = rescue_notes(&rescue_report(Outcome::CompletedWithReadErrors, 2), json);
-    let all = notes.join("\n");
-    assert!(all.contains("c_ea01_e_SER.raw"), "{all}");
-    assert!(all.contains("c_ea01_e_SER.info.json"), "{all}");
+    assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(
-        all.contains("COMPLETED WITH READ ERRORS (exit code 7)"),
-        "{all}"
+        notes[0].contains("ddrescue mapfile, 512 bytes each"),
+        "{notes:?}"
     );
-    assert!(all.contains("16 sectors"), "{all}");
-    assert!(all.contains("0-7, 2048-2055"), "{all}");
-
+    assert!(notes[0].contains("0-7, 2048-2055"), "{notes:?}");
     let notes = rescue_notes(&rescue_report(Outcome::CompletedWithReadErrors, 25), json);
-    assert!(notes.join("\n").contains("and 5 more ranges"), "{notes:?}");
-    let notes = rescue_notes(&rescue_report(Outcome::CompleteUnverified, 0), json);
-    assert!(notes.join("\n").contains("none"), "{notes:?}");
+    assert!(
+        notes[0].contains("and 5 more ranges (see c_ea01_e_SER.info.json)"),
+        "{notes:?}"
+    );
+    assert!(rescue_notes(&rescue_report(Outcome::CompleteUnverified, 0), json).is_empty());
 }
 
 #[test]

@@ -38,10 +38,6 @@ const PROGRESS_CHANNEL: usize = 256;
 /// rescue report lists all of them).
 const MAX_NOTE_RANGES: usize = 20;
 
-/// Directory below the output directory that receives the E01 of
-/// `--rescue-to-e01`, so its files and report never collide with the rescue's.
-pub const RESCUE_E01_SUBDIR: &str = "e01";
-
 /// Exit codes from most to least severe: what a run with two verdicts
 /// (`--rescue-to-e01`, `verify --pieces`) exits with.
 pub const SEVERITY_ORDER: [i32; 10] = [
@@ -250,11 +246,16 @@ pub fn selection_lines(
     lines
 }
 
-/// Settings of the E01 a `--rescue-to-e01` conversion writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Settings of the E01 a `--rescue-to-e01` conversion writes, and the
+/// destination allowances the examiner gave the acquisition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct E01Settings {
     pub compression: CompressionLevel,
     pub split_size: SplitSize,
+    /// `--allow-tmpfs`
+    pub allow_tmpfs: bool,
+    /// `--allow-low-space` (compression may make the E01 fit)
+    pub allow_low_space: bool,
 }
 
 impl E01Settings {
@@ -262,6 +263,8 @@ impl E01Settings {
         Self {
             compression: compression_of(o.compression),
             split_size: split_of(o.split),
+            allow_tmpfs: o.allow_tmpfs,
+            allow_low_space: o.allow_low_space,
         }
     }
 }
@@ -492,7 +495,12 @@ fn verdict_mark(outcome: Outcome) -> &'static str {
 
 /// The conversion `--rescue-to-e01` runs after `report`, or why it does
 /// not: only a complete rescue (VERIFIED, COMPLETE NOT VERIFIED, COMPLETED
-/// WITH READ ERRORS) is converted.
+/// WITH READ ERRORS) is converted. The E01 goes next to the rescue image in
+/// the same directory: the converter names its outputs `<base>.E01`, ... and
+/// `<base>.conversion.info(.json)`, which no rescue file is named like, and it
+/// refuses to overwrite anything. (A later `--resume` of the rescue refuses
+/// while those files are there: a resumed image would no longer be the one
+/// the E01 was made from.)
 pub fn plan_conversion(
     report: &ForensicInfoReport,
     case: &CaseMetadata,
@@ -522,87 +530,63 @@ pub fn plan_conversion(
     let dir = PathBuf::from(&report.output_dir);
     let report_json = dir.join(format!("{}{INFO_JSON_SUFFIX}", report.base_name));
     Ok(ConversionRequest {
-        source: PathBuf::from(image),
-        target: ConversionTarget::E01,
-        output_dir: dir.join(RESCUE_E01_SUBDIR),
         case: Some(case.clone()),
         compression: e01.compression,
         split_size: e01.split_size,
         notes: rescue_notes(report, &report_json),
         source_report: Some(report_json),
-        ..Default::default()
+        allow_tmpfs: e01.allow_tmpfs,
+        allow_low_space: e01.allow_low_space,
+        ..ConversionRequest::new(image, ConversionTarget::E01, dir)
     })
 }
 
-/// The E01 notes of a converted rescue: where it came from, the rescue's
-/// verdict and its read-error table (summary and the first ranges).
+/// E01 notes of a converted rescue beyond what the converter states itself
+/// (where the image came from, the rescue report's verdict and its
+/// read-error summary): the zero-filled sector ranges of the ddrescue map
+/// (the first ones; the rescue report lists all). Empty without bad sectors.
 pub fn rescue_notes(report: &ForensicInfoReport, report_json: &Path) -> Vec<String> {
     let name = |p: &Path| {
         p.file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| p.display().to_string())
     };
-    let image = report
-        .image_files
-        .first()
-        .map(|i| name(Path::new(i)))
-        .unwrap_or_default();
-    let mut notes = vec![
-        format!(
-            "Converted from the GNU ddrescue rescue image {image}; rescue report {}",
-            name(report_json)
-        ),
-        format!(
-            "Rescue verdict: {} (exit code {})",
-            report.outcome.label(),
-            report.exit_code
-        ),
-    ];
     let table = &report.read_errors;
-    match table.summary(RangeKind::Substituted) {
-        None => notes.push(format!(
-            "Read errors of the rescue ({}): none",
-            if table.source.is_empty() {
-                "ddrescue mapfile"
-            } else {
-                table.source.as_str()
-            }
-        )),
-        Some(summary) => {
-            notes.push(format!(
-                "Read errors of the rescue ({}): {summary} were unreadable and are zero-filled in this image",
-                table.source
-            ));
-            let sector = u64::from(table.effective_sector_size());
-            let ranges: Vec<String> = table
-                .ranges
-                .iter()
-                .filter(|r| r.kind == RangeKind::Substituted)
-                .map(|r| {
-                    format!(
-                        "{}-{}",
-                        r.offset / sector,
-                        (r.end().saturating_sub(1)) / sector
-                    )
-                })
-                .collect();
-            let shown = ranges.len().min(MAX_NOTE_RANGES);
-            let mut line = format!(
-                "Zero-filled sectors ({} bytes each): {}",
-                sector,
-                ranges[..shown].join(", ")
-            );
-            if ranges.len() > shown {
-                line.push_str(&format!(
-                    " and {} more ranges (see {})",
-                    ranges.len() - shown,
-                    name(report_json)
-                ));
-            }
-            notes.push(line);
-        }
+    let sector = u64::from(table.effective_sector_size());
+    let ranges: Vec<String> = table
+        .ranges
+        .iter()
+        .filter(|r| r.kind == RangeKind::Substituted)
+        .map(|r| {
+            format!(
+                "{}-{}",
+                r.offset / sector,
+                (r.end().saturating_sub(1)) / sector
+            )
+        })
+        .collect();
+    if ranges.is_empty() {
+        return Vec::new();
     }
-    notes
+    let shown = ranges.len().min(MAX_NOTE_RANGES);
+    let mut line = format!(
+        "Zero-filled sectors of the rescue ({}, {} bytes each): {}",
+        if table.source.is_empty() {
+            "ddrescue mapfile"
+        } else {
+            table.source.as_str()
+        },
+        sector,
+        ranges[..shown].join(", ")
+    );
+    if ranges.len() > shown {
+        line.push_str(&format!(
+            " and {} more ranges (see {})",
+            ranges.len() - shown,
+            name(report_json)
+        ));
+    }
+    vec![line]
 }
 
 fn print_conversion_step(
@@ -650,12 +634,19 @@ fn print_conversion_step(
             e.message
         )],
         ConversionStep::Done(r) => {
-            let mut l = vec![format!(
-                "[{}] --rescue-to-e01: E01 conversion {} (exit code {})",
-                verdict_mark(r.outcome),
-                r.outcome.label(),
-                r.exit_code()
-            )];
+            let mark = verdict_mark(r.outcome);
+            let mut l: Vec<String> = r
+                .verdict_lines()
+                .into_iter()
+                .enumerate()
+                .map(|(i, line)| {
+                    if i == 0 {
+                        format!("[{mark}] --rescue-to-e01: E01 conversion {line}")
+                    } else {
+                        format!("[{mark}] {line}")
+                    }
+                })
+                .collect();
             for f in &r.output_files {
                 l.push(format!("    image  : {}", f.display()));
             }

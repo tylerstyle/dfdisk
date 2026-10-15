@@ -513,16 +513,14 @@ pub async fn handle_convert(
     if let Ok(text) = std::fs::read_to_string(&report.report_file) {
         console.data(&text);
     }
-    console.data(&format!(
-        "[{}] {} (exit code {})",
-        if report.outcome == Outcome::Verified {
-            "+"
-        } else {
-            "!"
-        },
-        report.outcome.label(),
-        report.exit_code()
-    ));
+    let mark = if report.outcome == Outcome::Verified {
+        "+"
+    } else {
+        "!"
+    };
+    for line in report.verdict_lines() {
+        console.data(&format!("[{mark}] {line}"));
+    }
     for f in &report.output_files {
         console.data(&format!("    image  : {}", f.display()));
     }

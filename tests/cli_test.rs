@@ -9,6 +9,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod support;
+
 const BIN: &str = env!("CARGO_BIN_EXE_dfdisk");
 
 /// Scratch directory of this test binary for the audit log and registry.
@@ -903,4 +905,119 @@ fn verify_pieces_finds_the_changed_piece() {
             .contains("4 bytes after the last piece"),
         "{v}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// --rescue-to-e01 with the real GNU ddrescue and libewf
+// ---------------------------------------------------------------------------
+
+/// A clean rescue with --verify-source converted to E01 in the same
+/// directory: both verdicts VERIFIED (exit 0), the conversion report names
+/// the rescue report by path and digest, no file of the rescue is touched.
+/// A second run refuses (never overwrites), and so does a resume while the
+/// E01 of the earlier image is there.
+#[test]
+fn rescue_to_e01_converts_next_to_the_rescue() {
+    if !support::tool_available(&["ddrescue", "ewfacquire", "ewfverify", "ewfinfo"]) {
+        return;
+    }
+    let tmp = scratch();
+    let src = tmp.path().join("evidence.bin");
+    std::fs::write(&src, sample(1 << 20)).unwrap();
+    let out = tmp.path().join("out");
+    let rescue = |extra: &[&str]| {
+        let mut args = vec![
+            "acquire",
+            src.to_str().unwrap(),
+            "--rescue",
+            "--rescue-to-e01",
+            "--verify-source",
+            "-o",
+            out.to_str().unwrap(),
+            "-C",
+            "CLI-1",
+            "-E",
+            "R2E",
+            "--examiner",
+            "Tester",
+            "--allow-tmpfs",
+            "--allow-low-space",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        dfdisk().args(&args).output().unwrap()
+    };
+    let o = rescue(&[]);
+    let (stdout, stderr) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{stderr}\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["acquisition"]["outcome"], "verified", "{v}");
+    assert_eq!(v["conversion"]["outcome"], "verified", "{v}");
+    assert_eq!(v["exit_code"], 0);
+    let base = v["acquisition"]["base_name"].as_str().unwrap().to_string();
+
+    // Everything in one directory, nothing in a subdirectory
+    let names: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    for suffix in [
+        ".raw",
+        ".map",
+        ".info",
+        ".info.json",
+        ".identity.json",
+        ".E01",
+        ".conversion.info",
+        ".conversion.info.json",
+    ] {
+        assert!(
+            names.contains(&format!("{base}{suffix}")),
+            "{base}{suffix} missing: {names:?}"
+        );
+    }
+    assert!(
+        std::fs::read_dir(&out)
+            .unwrap()
+            .flatten()
+            .all(|e| e.path().is_file()),
+        "{names:?}"
+    );
+
+    // The conversion report references the rescue report by path and digest
+    let rescue_json = out.join(format!("{base}.info.json"));
+    let conv: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join(format!("{base}.conversion.info.json"))).unwrap(),
+    )
+    .unwrap();
+    let reference = &conv["source_report"];
+    assert_eq!(
+        reference["path"],
+        rescue_json.to_string_lossy().as_ref(),
+        "{conv}"
+    );
+    assert_eq!(
+        reference["sha256"],
+        hex::encode(Sha256::digest(std::fs::read(&rescue_json).unwrap())),
+        "{conv}"
+    );
+    assert_eq!(reference["engine"], "rescue", "{conv}");
+    // The rescue's image digest is what the E01 holds
+    let image = std::fs::read(out.join(format!("{base}.raw"))).unwrap();
+    assert_eq!(image, sample(1 << 20));
+    assert_eq!(
+        conv["output_hashes"]["md5"].as_str().map(str::to_lowercase),
+        Some(hex::encode(Md5::digest(&image))),
+        "{conv}"
+    );
+
+    // Never overwritten: the same run again is refused
+    let o = rescue(&[]);
+    assert_eq!(o.status.code(), Some(3), "{:?}", text(&o));
+    // A resume would change the image the E01 was made from: refused while
+    // the conversion's files are there
+    let o = rescue(&["--resume"]);
+    assert_eq!(o.status.code(), Some(3), "{:?}", text(&o));
+    assert!(text(&o).1.contains(".E01"), "{:?}", text(&o));
 }

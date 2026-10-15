@@ -349,10 +349,9 @@ impl RunResult {
                 report.verdict_lines().into_iter().skip(1).collect()
             }
             RunResult::Conversion { report, .. } => {
-                let mut l = vec![
-                    report.outcome.explanation().to_string(),
-                    format!("Verification: {}.", report.verification.describe()),
-                ];
+                // The conversion's own banner (its explanations speak of the
+                // source image and the output, not of a medium read)
+                let mut l: Vec<String> = report.verdict_lines().into_iter().skip(1).collect();
                 l.extend(report.notes.iter().cloned());
                 l
             }
