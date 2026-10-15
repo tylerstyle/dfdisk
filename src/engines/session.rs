@@ -362,6 +362,10 @@ fn validate(request: &AcquisitionRequest) -> Result<Validated, AcquisitionError>
         return Err(AcquisitionError::usage("no output directory was given"));
     }
     request.config.validate().map_err(AcquisitionError::usage)?;
+    // E01 holds whole 512-byte sectors only (the identity check pins this size)
+    if request.engine() == EngineKind::Ewf {
+        ewf::check_source_size(request.device.size_bytes).map_err(AcquisitionError::usage)?;
+    }
     let base_name = request
         .case
         .base_filename_checked(&request.device.display_serial())

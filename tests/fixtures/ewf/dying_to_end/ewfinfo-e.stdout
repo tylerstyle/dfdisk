@@ -1,0 +1,6 @@
+ewfinfo 20231119
+
+Read errors during acquiry:
+	total number: 1
+	at sector(s): 2048 - 8191 (number: 6144)
+

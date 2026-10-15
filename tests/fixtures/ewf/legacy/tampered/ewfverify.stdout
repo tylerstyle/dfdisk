@@ -1,0 +1,21 @@
+ewfverify 20140816
+
+Verify started at: Oct 15, 2026 02:32:34
+This could take a while.
+
+Verify completed at: Oct 15, 2026 02:32:34
+
+Read: 4.0 MiB (4194304 bytes) in 0 second(s).
+
+Sector validation errors:
+	total number: 1
+	at sector(s): 3840 - 3903 (number: 64) in segment file(s): tampered/img.E01
+
+MD5 hash stored in file:		c0ed3b46644cbdf9322e6028c84f82fc
+MD5 hash calculated over data:		39e3e79d4cd13af280b604534c2abb2c
+SHA1 hash stored in file:		1dbbb00f9daaaab78905d7f61ef1f1865f601117
+SHA1 hash calculated over data:		07c3d67cb180b5c0bae8c47ad24b6660d43e50f3
+SHA256 hash stored in file:		N/A
+SHA256 hash calculated over data:	e9f5392936b27d7650703740e67ea5ae3d9934a97e34a55007e29467941ecfcd
+
+ewfverify: FAILURE

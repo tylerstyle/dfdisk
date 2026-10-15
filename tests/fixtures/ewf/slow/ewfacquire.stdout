@@ -1,0 +1,30 @@
+ewfacquire 20231119
+
+Device information:
+Bus type:				
+Vendor:					
+Model:					
+Serial:					
+
+Storage media information:
+Type:					Device
+Media type:				Fixed
+Media size:				4.1 MB (4194304 bytes)
+Bytes per sector:			512
+
+Acquiry started at: Oct 15, 2026 01:12:42
+This could take a while.
+
+Status: at 42.1%
+        acquired 1.7 MiB (1769472 bytes) of total 4.0 MiB (4194304 bytes)
+        completion in 5 second(s) with 455 KiB/s (466033 bytes/second)
+
+Status: at 94.5%
+        acquired 3.8 MiB (3964928 bytes) of total 4.0 MiB (4194304 bytes)
+        completion in 0 second(s) with 512 KiB/s (524288 bytes/second)
+
+Acquiry completed at: Oct 15, 2026 01:12:50
+
+Written: 4.0 MiB (4195620 bytes) in 8 second(s) with 512 KiB/s (524452 bytes/second)
+MD5 hash calculated over data:		c0ed3b46644cbdf9322e6028c84f82fc
+ewfacquire: SUCCESS

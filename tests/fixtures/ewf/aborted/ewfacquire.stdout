@@ -1,0 +1,19 @@
+ewfacquire 20231119
+
+Device information:
+Bus type:				
+Vendor:					
+Model:					
+Serial:					
+
+Storage media information:
+Type:					Device
+Media type:				Fixed
+Media size:				4.1 MB (4194304 bytes)
+Bytes per sector:			512
+
+Acquiry started at: Oct 15, 2026 01:12:39
+This could take a while.
+
+Acquiry aborted at: Oct 15, 2026 01:12:42
+ewfacquire: ABORTED

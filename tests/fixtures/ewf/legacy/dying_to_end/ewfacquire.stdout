@@ -1,0 +1,26 @@
+ewfacquire 20140816
+
+Device information:
+Bus type:				
+Vendor:					
+Model:					
+Serial:					
+
+Storage media information:
+Type:					Device
+Media type:				Fixed
+Media size:				4.1 MB (4194304 bytes)
+Bytes per sector:			512
+
+Acquiry started at: Oct 15, 2026 02:32:22
+This could take a while.
+
+Acquiry completed at: Oct 15, 2026 02:32:22
+
+Written: 4.0 MiB (4196228 bytes) in 0 second(s).
+Errors reading device:
+	total number: 1
+	at sector(s): 2048 - 8192 number: 6144 (offset: 0x00100000 of size: 3145728)
+
+MD5 hash calculated over data:		64db095913c7413116bc8a0121e175b4
+ewfacquire: SUCCESS

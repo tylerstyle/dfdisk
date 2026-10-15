@@ -1,0 +1,8 @@
+ewfinfo 20231119
+
+Read errors during acquiry:
+	total number: 3
+	at sector(s): 2048 - 2055 (number: 8)
+	at sector(s): 4096 - 4103 (number: 8)
+	at sector(s): 6400 - 6543 (number: 144)
+
