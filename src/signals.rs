@@ -382,10 +382,9 @@ mod tests {
         // SIGHUP only: SIGINT/SIGTERM would stay caught for the whole test binary
         // SAFETY: sending a signal to our own process
         unsafe { libc::kill(libc::getpid(), libc::SIGHUP) };
-        let got = tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
-            .await
-            .expect("signal delivered");
-        assert_eq!(got, Some((SignalKind::Hangup, SignalAction::Headless)));
+        // Other tests of this binary may send SIGHUP too: wait for ours
+        let got = next_of(&mut listener, SignalKind::Hangup).await;
+        assert_eq!(got.1, SignalAction::Headless);
         assert!(c.is_headless());
         assert!(!c.is_aborted());
 
@@ -393,10 +392,26 @@ mod tests {
         // that would end the process without a report
         // SAFETY: sending a signal to our own process (caught by the listener)
         unsafe { libc::kill(libc::getpid(), libc::SIGQUIT) };
-        let got = tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
-            .await
-            .expect("signal delivered");
-        assert_eq!(got, Some((SignalKind::Quit, SignalAction::Abort)));
+        let got = next_of(&mut listener, SignalKind::Quit).await;
+        assert_eq!(got.1, SignalAction::Abort);
         assert!(c.is_aborted());
+    }
+
+    /// The next event of `kind` (5 s at most), skipping others.
+    async fn next_of(
+        listener: &mut SignalListener,
+        kind: SignalKind,
+    ) -> (SignalKind, SignalAction) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match listener.recv().await {
+                    Some(event) if event.0 == kind => return event,
+                    Some(_) => continue,
+                    None => panic!("listener ended"),
+                }
+            }
+        })
+        .await
+        .expect("signal delivered")
     }
 }
