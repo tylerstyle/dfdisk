@@ -5,7 +5,9 @@
 //! - **abort** (graceful): engines stop their tool (SIGINT, grace period,
 //!   escalation), keep every output, and the session still writes the report
 //!   and the audit "finished" record (outcome Aborted, exit 8). Set by the
-//!   first SIGINT, by SIGTERM, or by the UI after a y/N confirmation.
+//!   first SIGINT, by SIGTERM or SIGQUIT (`Ctrl+\` would otherwise end dfdisk
+//!   without a report, its tool running on), or by the UI after a y/N
+//!   confirmation.
 //! - **force**: a second SIGINT; external tools are killed at once
 //!   (`engines::process::StopControl::force`). The report is still written.
 //! - **headless**: SIGHUP (terminal gone). The acquisition keeps running to
@@ -73,6 +75,8 @@ pub enum SignalKind {
     Terminate,
     /// SIGHUP (terminal closed)
     Hangup,
+    /// SIGQUIT (`Ctrl+\`): handled like SIGTERM
+    Quit,
 }
 
 impl SignalKind {
@@ -81,6 +85,7 @@ impl SignalKind {
             SignalKind::Interrupt => "SIGINT",
             SignalKind::Terminate => "SIGTERM",
             SignalKind::Hangup => "SIGHUP",
+            SignalKind::Quit => "SIGQUIT",
         }
     }
 
@@ -89,6 +94,7 @@ impl SignalKind {
             SignalKind::Interrupt => 1,
             SignalKind::Terminate => 2,
             SignalKind::Hangup => 3,
+            SignalKind::Quit => 4,
         }
     }
 
@@ -97,6 +103,7 @@ impl SignalKind {
             1 => Some(SignalKind::Interrupt),
             2 => Some(SignalKind::Terminate),
             3 => Some(SignalKind::Hangup),
+            4 => Some(SignalKind::Quit),
             _ => None,
         }
     }
@@ -207,8 +214,8 @@ impl AbortController {
     }
 
     /// Apply a signal: SIGINT aborts gracefully, a second SIGINT forces;
-    /// SIGTERM aborts gracefully; SIGHUP switches to headless and keeps the
-    /// run going.
+    /// SIGTERM and SIGQUIT abort gracefully; SIGHUP switches to headless and
+    /// keeps the run going.
     pub fn handle(&self, signal: SignalKind) -> SignalAction {
         self.last_signal.store(signal.code(), Ordering::SeqCst);
         match signal {
@@ -219,7 +226,7 @@ impl AbortController {
                     SignalAction::Abort
                 }
             }
-            SignalKind::Terminate => self.request_abort(),
+            SignalKind::Terminate | SignalKind::Quit => self.request_abort(),
             SignalKind::Hangup => {
                 if self.headless.swap(true, Ordering::SeqCst) {
                     SignalAction::Unchanged
@@ -238,7 +245,7 @@ impl AbortController {
         self.last_signal.store(0, Ordering::SeqCst);
     }
 
-    /// Listen for SIGINT, SIGTERM and SIGHUP and apply them with
+    /// Listen for SIGINT, SIGTERM, SIGHUP and SIGQUIT and apply them with
     /// [`handle`](Self::handle). Every signal and its action is also sent to
     /// the returned listener, so the CLI/TUI can tell the examiner. Must be
     /// called inside a tokio runtime. Dropping the listener stops listening,
@@ -248,6 +255,7 @@ impl AbortController {
         let mut int = signal(Tk::interrupt())?;
         let mut term = signal(Tk::terminate())?;
         let mut hup = signal(Tk::hangup())?;
+        let mut quit = signal(Tk::quit())?;
         let (tx, rx) = mpsc::unbounded_channel();
         let controller = self.clone();
         let task = tokio::spawn(async move {
@@ -256,6 +264,7 @@ impl AbortController {
                     Some(()) = int.recv() => SignalKind::Interrupt,
                     Some(()) = term.recv() => SignalKind::Terminate,
                     Some(()) = hup.recv() => SignalKind::Hangup,
+                    Some(()) = quit.recv() => SignalKind::Quit,
                     else => break,
                 };
                 let action = controller.handle(kind);
@@ -321,6 +330,18 @@ mod tests {
     }
 
     #[test]
+    fn quit_aborts_gracefully_like_terminate() {
+        let c = AbortController::new();
+        assert_eq!(c.handle(SignalKind::Quit), SignalAction::Abort);
+        assert!(c.is_aborted() && !c.is_forced() && !c.is_headless());
+        assert_eq!(c.handle(SignalKind::Quit), SignalAction::Unchanged);
+        assert_eq!(c.last_signal(), Some(SignalKind::Quit));
+        assert!(SignalAction::Abort
+            .message(SignalKind::Quit)
+            .starts_with("SIGQUIT: stopping the acquisition gracefully"));
+    }
+
+    #[test]
     fn hangup_keeps_running_headless() {
         let c = AbortController::new();
         assert_eq!(c.handle(SignalKind::Hangup), SignalAction::Headless);
@@ -367,5 +388,15 @@ mod tests {
         assert_eq!(got, Some((SignalKind::Hangup, SignalAction::Headless)));
         assert!(c.is_headless());
         assert!(!c.is_aborted());
+
+        // SIGQUIT is caught too: a graceful abort, not the default core dump
+        // that would end the process without a report
+        // SAFETY: sending a signal to our own process (caught by the listener)
+        unsafe { libc::kill(libc::getpid(), libc::SIGQUIT) };
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), listener.recv())
+            .await
+            .expect("signal delivered");
+        assert_eq!(got, Some((SignalKind::Quit, SignalAction::Abort)));
+        assert!(c.is_aborted());
     }
 }

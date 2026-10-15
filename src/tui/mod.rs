@@ -5,8 +5,8 @@
 //! (text stays selectable for copying hashes), restored on every exit path
 //! including panics. Signals (installed once per process): SIGHUP continues
 //! headless (nothing more is drawn) until the running job has written its
-//! report; SIGTERM / SIGINT abort a running job gracefully and quit once its
-//! report is written; idle, they quit at once.
+//! report; SIGTERM / SIGINT / SIGQUIT abort a running job gracefully and quit
+//! once its report is written; idle, they quit at once.
 
 pub mod app;
 pub mod autocomplete;

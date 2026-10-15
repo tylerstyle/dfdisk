@@ -2382,7 +2382,7 @@ impl App {
 
     /// A signal arrived (the [`AbortController`] already applied it to the
     /// flags). SIGHUP: continue headless and quit after the report; SIGTERM /
-    /// SIGINT: graceful abort of a running job, then quit; idle: quit.
+    /// SIGINT / SIGQUIT: graceful abort of a running job, then quit; idle: quit.
     pub fn on_signal(&mut self, kind: SignalKind, action: SignalAction) {
         match kind {
             SignalKind::Hangup => {
@@ -2393,7 +2393,7 @@ impl App {
                     self.should_quit = true;
                 }
             }
-            SignalKind::Interrupt | SignalKind::Terminate => {
+            SignalKind::Interrupt | SignalKind::Terminate | SignalKind::Quit => {
                 if let Some(job) = &mut self.job {
                     job.abort_requested = true;
                     if action == SignalAction::Force {
