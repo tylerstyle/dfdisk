@@ -1580,9 +1580,20 @@ async fn plan(
                     rr.outcome_reason
                 ));
             }
-            Outcome::Mismatch | Outcome::VerificationFailed => notes.push(format!(
-                "the source image's {what}; this conversion compares the image with the report's digests again"
-            )),
+            // C-3: a matching conversion of such an image is no verified
+            // copy of the medium
+            Outcome::Mismatch => {
+                inherited_unverified = Some(format!(
+                    "the source image is not confirmed to reproduce its medium: {what} (a digest of the image or of a second read of the source differed: {})",
+                    rr.outcome_reason
+                ));
+            }
+            Outcome::VerificationFailed => {
+                inherited_unverified = Some(format!(
+                    "the source image is not confirmed to reproduce its medium: {what} (its verification could not run or complete: {})",
+                    rr.outcome_reason
+                ));
+            }
             Outcome::Verified | Outcome::CompletedWithReadErrors => {}
         }
         if rr.hashes.is_empty() {

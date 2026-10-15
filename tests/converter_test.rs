@@ -554,6 +554,46 @@ async fn read_errors_and_verdicts_of_the_source_acquisition_are_inherited() {
         r.outcome_reason
     );
 
+    // C-3: an acquisition whose verification found a mismatch or failed:
+    // a matching conversion is not a verified copy of the medium
+    for (n, result) in [
+        VerificationResult::Mismatched {
+            method: "second read of the source".into(),
+            details: "source changed or unstable: MD5 differs".into(),
+        },
+        VerificationResult::Failed {
+            reason: "the second source read failed: EIO".into(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let label = match &result {
+            VerificationResult::Mismatched { .. } => "HASH MISMATCH",
+            _ => "VERIFICATION FAILED",
+        };
+        acquisition_report(&raw, &content, |r| r.verification.result = result);
+        let r = run(
+            &f.env,
+            request(&raw, ConversionTarget::E01, &f.root.join(format!("c3-{n}"))),
+            StopFlags::new(),
+        )
+        .await
+        .unwrap();
+        let text = r.render_text();
+        assert_eq!(r.outcome, Outcome::CompleteUnverified, "{text}");
+        assert_eq!(r.exit_code, exit_code::UNVERIFIED);
+        assert!(r.comparisons[0].result.is_matched(), "{text}");
+        assert!(
+            r.outcome_reason
+                .contains("not confirmed to reproduce its medium"),
+            "{}",
+            r.outcome_reason
+        );
+        assert!(r.outcome_reason.contains(label), "{}", r.outcome_reason);
+        assert!(!text.contains("ALL COMPARED DIGESTS MATCH"), "{text}");
+    }
+
     // An incomplete acquisition: the converted image is incomplete too
     acquisition_report(&raw, &content, |r| {
         r.expected_bytes = 4 << 20;

@@ -344,7 +344,7 @@ pub fn conversion_explanation(outcome: Outcome) -> &'static str {
             "The whole source image was converted, and the digests recomputed from the written output match independent digests of the source image (its acquisition report, the digests stored in the E01, or dfdisk's own hash of the image)."
         }
         Outcome::CompleteUnverified => {
-            "The whole source image was converted, but the output could not be compared with independent digests of the source image, or the source image itself was never verified against its medium, so the output is not confirmed to reproduce the medium's data."
+            "The whole source image was converted, but the output could not be compared with independent digests of the source image, or the source image itself was never verified against its medium (or its verification failed or found a mismatch), so the output is not confirmed to reproduce the medium's data."
         }
         Outcome::CompletedWithReadErrors => {
             "The whole source image was converted, but its acquisition could not read some sectors of the medium and the image holds zeros there; the output reproduces those zeros, so its digests describe the image including the substituted sectors, not the original medium."
