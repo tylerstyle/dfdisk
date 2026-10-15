@@ -643,8 +643,9 @@ pub struct ConvertArgs {
     pub split: Option<CliSplitSize>,
 
     /// The dfdisk report of the acquisition the source came from; referenced in
-    /// the conversion report and its digests compared [default: <base>.info.json
-    /// next to the source, when it exists]
+    /// the conversion report and its digests compared; it must list the source
+    /// image [default: <base>.info.json next to the source, used when it lists
+    /// the image, else ignored with a note]
     #[arg(long, value_name = "INFO_JSON")]
     pub report: Option<PathBuf>,
 

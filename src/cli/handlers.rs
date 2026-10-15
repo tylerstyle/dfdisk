@@ -427,7 +427,12 @@ pub fn report_next_to(image: &Path) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// The conversion the flags describe.
+/// The conversion the flags describe. Only an explicit `--report` becomes
+/// the request's `source_report` (and must list the source image); a report
+/// next to the source is found by the converter itself, which uses it when
+/// it lists the image and otherwise ignores it with a note (C-5: the
+/// `<base>.info.json` of a rescue lists `<base>.raw`, not the `<base>.E01`
+/// made from it).
 pub fn conversion_request(args: &ConvertArgs) -> Result<ConversionRequest, AcquisitionError> {
     let target = match args.to {
         CliImageFormat::E01 => ConversionTarget::E01,
@@ -477,7 +482,7 @@ pub fn conversion_request(args: &ConvertArgs) -> Result<ConversionRequest, Acqui
         case,
         compression: compression_of(args.compression),
         split_size: split_of(args.split),
-        source_report: args.report.clone().or_else(|| report_next_to(&args.source)),
+        source_report: args.report.clone(),
         allow_tmpfs: args.allow_tmpfs,
         allow_low_space: args.allow_low_space,
         ..ConversionRequest::new(args.source.clone(), target, output_dir)
@@ -501,8 +506,16 @@ pub async fn handle_convert(
         },
         req.output_dir.display()
     ));
-    if let Some(r) = &req.source_report {
-        console.say(&format!("    source report: {}", r.display()));
+    match &req.source_report {
+        Some(r) => console.say(&format!("    source report: {}", r.display())),
+        None => {
+            if let Some(r) = report_next_to(&req.source) {
+                console.say(&format!(
+                    "    source report: {} (used if it lists the source image)",
+                    r.display()
+                ));
+            }
+        }
     }
     let (tx, rx) = mpsc::channel(256);
     let mut printer = ProgressPrinter::new(console, false);
@@ -627,10 +640,23 @@ mod tests {
             "case fields come from the source report"
         );
         assert!(req.output_dir.is_absolute());
+        // C-5: a report next to the source is not "given": the converter
+        // finds it and ignores it with a note when it does not list the
+        // image; only --report is strict
+        assert!(req.source_report.is_none(), "{:?}", req.source_report);
         assert_eq!(
-            req.source_report.as_deref(),
+            report_next_to(&src).as_deref(),
             Some(tmp.path().join("c_ea01_e1_SER.info.json").as_path())
         );
+        let given = tmp.path().join("c_ea01_e1_SER.info.json");
+        let req = conversion_request(&parse(&[
+            "--to",
+            "e01",
+            "--report",
+            given.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert_eq!(req.source_report.as_deref(), Some(given.as_path()));
         let req = conversion_request(&parse(&[
             "--to", "e01", "-C", "K1", "-E", "E2", "-e", "Exa", "--split", "none",
         ]))

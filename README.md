@@ -316,7 +316,10 @@ reasons and badges.
 `dfdisk verify` recognises EWF segment families (`.E01`, `.Ex01`, `.E02`, …),
 RAW images and split RAW images (`.001`, `.002`, …). A requested digest that was
 not computed is a failure, never a pass. `dfdisk convert` takes the case fields
-from `<source>.info.json` when it exists and requires them otherwise; it refuses
+from `<source>.info.json` when it exists and lists the source image (a report
+that does not list it, such as the rescue report next to a `--rescue-to-e01`
+E01, is ignored with a note; only a report given with `--report` must list the
+image) and requires them otherwise; it refuses
 RAW images whose size is not a multiple of 512 bytes (as an E01 of a source
 without whole 512-byte sectors is refused) and never overwrites an existing
 output. Its report is `<base>.conversion.info` / `.conversion.info.json`.

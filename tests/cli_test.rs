@@ -1059,4 +1059,38 @@ fn rescue_to_e01_converts_next_to_the_rescue() {
     let o = rescue(&["--resume"]);
     assert_eq!(o.status.code(), Some(3), "{:?}", text(&o));
     assert!(text(&o).1.contains(".E01"), "{:?}", text(&o));
+
+    // C-5: the E01 back to RAW. The rescue report next to it lists
+    // <base>.raw, not <base>.E01: found automatically it is ignored with a
+    // note (not a usage error); given with --report it is refused
+    let e01 = out.join(format!("{base}.E01"));
+    let back = tmp.path().join("back");
+    let convert = |extra: &[&str]| {
+        let mut args = vec![
+            "convert",
+            e01.to_str().unwrap(),
+            "--to",
+            "raw",
+            "-o",
+            back.to_str().unwrap(),
+            "--allow-tmpfs",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        dfdisk().args(&args).output().unwrap()
+    };
+    let o = convert(&["--report", rescue_json.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(2), "{:?}", text(&o));
+    assert!(text(&o).1.contains("does not list"), "{:?}", text(&o));
+    let o = convert(&[]);
+    let (stdout, stderr) = text(&o);
+    assert_ne!(o.status.code(), Some(2), "{stderr}\n{stdout}");
+    let conv: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        conv["notes"].as_array().unwrap().iter().any(|n| n
+            .as_str()
+            .unwrap()
+            .contains("was not used: it does not list")),
+        "{conv}"
+    );
 }
