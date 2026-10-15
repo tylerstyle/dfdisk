@@ -201,6 +201,25 @@ stop or the identity change); a VERIFIED rescue says that its image digests
 equal a second, independent read of the source; an ABORTED or INCOMPLETE run
 says "its digests cover only what was acquired" only when digests exist.
 
+## Other JSON output (`--json`)
+
+With `--json` every command prints one pretty-printed JSON document on stdout
+(progress and messages go to stderr). Check `schema_version` before reading it.
+
+| Command | Document |
+|---------|----------|
+| `acquire --json` | the report `<base>.info.json` (schema 2, above) |
+| `acquire --rescue-to-e01 --json` | `{schema_version: 1, acquisition, conversion, conversion_error, conversion_skipped, exit_code}`: `acquisition` is the rescue report; `conversion` the conversion report or null; `conversion_error` the `error` object below or null (a conversion that could not start); `conversion_skipped` the reason (string) or null; `exit_code` the combined exit code |
+| `convert --json` | the conversion report `<base>.conversion.info.json` (its own `schema_version`) |
+| `list --json` | `schema_version` 1: registry state, active swap, scan notes, `devices` with partitions and stacked devices nested in `children` |
+| `check --json` | `schema_version` 1, `ready` (bool), `device`, `engine`, `output_dir`, `base_name`, `identity` (as `source` in the report), `tool_source_path`, `effective_config`, `write_protection` (as found), `write_protection_plan` (string), `destination` (facts), `capacity`, `smart`, `problems` (`[{step, kind, message}]`; `step` is `request`, `identity`, `source safety`, `exclusive open`, `destination`, `tools` or `capacity`; `kind` is `usage`, `refused` or `failed`), `notes`. Fields that were not reached are null |
+| `verify --json` | `{schema_version: 1, verification, exit_code}`; `verification`: `image`, `read_path`, `segments`, `format` (`ewf`, `raw`), `method`, `computed`, `stored` (digests an EWF image stores), `expected` (`md5`, `sha1`, `sha256`, `source`, `report_image_files`, `report_outcome`, `report_pieces`), `checks` (`[{algorithm, expected, computed, status, reference}]`, `status` `match`, `mismatch` or `not_computed`), `pieces` (or null), `result` (as `verification.result` above), `exit_code`, `started_at`, `ended_at`, `elapsed_seconds`, `clock`, `addendum`, `addendum_sha256`, `audit_record`, `warnings` |
+| `unmount --json` | `schema_version` 1, `device`, `mounts_before`, `unmounted`, `holders`, `audit_record` (hash of the `unmount` record or null), `audit_error`, `notes` |
+| any command that ends with an error | `{schema_version: 1, error: {kind, exit_code, message}}`, `kind` one of `usage`, `refused`, `failed`, `aborted` |
+
+Paths in these documents are absolute (the name as typed, made absolute; not
+resolved through symlinks).
+
 ## Piecewise hashes (`<base>.pieces.tsv`)
 
 Written by the RAW engine while it reads the source: the SHA-256 of every piece

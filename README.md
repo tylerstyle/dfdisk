@@ -313,7 +313,9 @@ dfdisk convert <image.raw|image.E01> --to e01|raw -o <dir> [case fields]
 `dfdisk list --json` prints one object (`schema_version` 1): the registry state,
 active swap areas, scan notes and every disk with its partitions and stacked
 devices nested in `children`, each with its identity, mounts, holders, system
-reasons and badges.
+reasons and badges. `check`, `verify` and `unmount` with `--json`, and the error
+object of any command, are versioned the same way (`schema_version` 1) and
+described in [docs/report-format.md](docs/report-format.md#other-json-output---json).
 
 `dfdisk verify` recognises EWF segment families (`.E01`, `.Ex01`, `.E02`, …),
 RAW images and split RAW images (`.001`, `.002`, …). A requested digest that was

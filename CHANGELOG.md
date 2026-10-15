@@ -194,7 +194,9 @@ and when something was not done the report says so.
 - **F5** `<base>.info.json`, tool versions and command lines, kernel, host and
   dfnix revision, dfdisk and dfcore git revisions (`dfdisk --version`), clock and
   NTP state with the RTC offset, documented exit codes, `dfdisk check` (dry run),
-  `acquire --json`, `list --json`.
+  `acquire --json`, `list --json`; `check`, `verify` and `unmount` with
+  `--json` and the error object carry `schema_version` 1 and are documented in
+  docs/report-format.md.
 - **F6** Re-verification as an audited addendum (`dfdisk verify`, TUI re-verify
   screen, `--report`, `--pieces`) and an optional second read of the source
   (`--verify-source`).

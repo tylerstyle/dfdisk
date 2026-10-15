@@ -583,6 +583,7 @@ fn json_output_is_the_report_and_nothing_else() {
     assert_eq!(output.status.code(), Some(2));
     let (stdout, stderr) = text(&output);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["schema_version"], 1, "{v}");
     assert_eq!(v["error"]["kind"], "usage");
     assert_eq!(v["error"]["exit_code"], 2);
     assert!(stderr.contains("Error (USAGE ERROR)"), "{stderr}");
@@ -621,6 +622,7 @@ fn check_writes_nothing_and_reports_readiness() {
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["schema_version"], 1, "{v}");
     assert_eq!(v["ready"], true, "{v}");
     assert_eq!(v["problems"], serde_json::json!([]));
     assert_eq!(v["base_name"], "k_ea01_e1_NOSERIAL");
@@ -732,6 +734,7 @@ fn verify_exit_codes() {
     let json = run(&["verify", img, "--sha256", &sha256, "--json"]);
     assert_eq!(json.status.code(), Some(0));
     let v: serde_json::Value = serde_json::from_str(&text(&json).0).unwrap();
+    assert_eq!(v["schema_version"], 1, "{v}");
     assert_eq!(v["exit_code"], 0);
     assert_eq!(v["verification"]["result"]["status"], "matched");
     assert!(v["verification"]["pieces"].is_null());
@@ -1076,6 +1079,7 @@ fn rescue_to_e01_converts_next_to_the_rescue() {
     let (stdout, stderr) = text(&o);
     assert_eq!(o.status.code(), Some(0), "{stderr}\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["schema_version"], 1, "{v}");
     assert_eq!(v["acquisition"]["outcome"], "verified", "{v}");
     assert_eq!(v["conversion"]["outcome"], "verified", "{v}");
     assert_eq!(v["exit_code"], 0);

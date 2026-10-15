@@ -570,13 +570,13 @@ fn print_conversion_step(
                 json!(reason),
             ),
         };
-        let doc = json!({
+        let doc = crate::cli::with_schema_version(json!({
             "acquisition": acquisition,
             "conversion": conversion,
             "conversion_error": error,
             "conversion_skipped": skipped,
             "exit_code": code,
-        });
+        }));
         console.data(&serde_json::to_string_pretty(&doc).unwrap_or_default());
     }
     let lines: Vec<String> = match step {
@@ -631,15 +631,16 @@ fn print_conversion_step(
     }
 }
 
-/// `{"error": {"kind", "exit_code", "message"}}` for `--json` output.
+/// `{"schema_version": 1, "error": {"kind", "exit_code", "message"}}` for
+/// `--json` output.
 pub fn error_json(e: &AcquisitionError) -> serde_json::Value {
-    json!({
+    crate::cli::with_schema_version(json!({
         "error": {
             "kind": e.kind,
             "exit_code": e.exit_code(),
             "message": e.message,
         }
-    })
+    }))
 }
 
 /// `dfdisk check`: the dry run (§4, §15). Usage errors of the options are
@@ -676,9 +677,13 @@ pub async fn handle_check(
         }
     };
     if console.json() {
-        console.data(&serde_json::to_string_pretty(&report).map_err(|e| {
+        let value = serde_json::to_value(&report).map_err(|e| {
             AcquisitionError::failed(format!("cannot serialise the check report: {e}"))
-        })?);
+        })?;
+        console.data(
+            &serde_json::to_string_pretty(&crate::cli::with_schema_version(value))
+                .unwrap_or_default(),
+        );
     } else {
         console.data(&report.render_text());
     }

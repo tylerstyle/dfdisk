@@ -197,6 +197,20 @@ pub fn device_table(devices: &[BlockDevice], with_smart: bool) -> String {
 // unmount
 // ---------------------------------------------------------------------------
 
+/// The `unmount --json` document (schema 1, docs/report-format.md).
+pub fn unmount_json(device: &str, result: &safety::UnmountResult) -> serde_json::Value {
+    json!({
+        "schema_version": crate::cli::CLI_JSON_SCHEMA_VERSION,
+        "device": device,
+        "mounts_before": result.mounts_before,
+        "unmounted": result.unmounted,
+        "holders": result.holders,
+        "audit_record": result.audit_hash,
+        "audit_error": result.audit_error,
+        "notes": result.notes,
+    })
+}
+
 /// `dfdisk unmount <device>`: the audited unmount of the source tree (§10).
 pub async fn handle_unmount(args: UnmountArgs, console: &Console) -> Result<i32, AcquisitionError> {
     let source = resolve_argument(&args.device)?;
@@ -222,16 +236,7 @@ pub async fn handle_unmount(args: UnmountArgs, console: &Console) -> Result<i32,
         .map_err(|e| AcquisitionError::failed(format!("the unmount stopped: {e}")))??;
     if console.json() {
         console.data(
-            &serde_json::to_string_pretty(&json!({
-                "device": device,
-                "mounts_before": result.mounts_before,
-                "unmounted": result.unmounted,
-                "holders": result.holders,
-                "audit_record": result.audit_hash,
-                "audit_error": result.audit_error,
-                "notes": result.notes,
-            }))
-            .unwrap_or_default(),
+            &serde_json::to_string_pretty(&unmount_json(&device, &result)).unwrap_or_default(),
         );
         for n in &result.notes {
             console.note(&format!("[!] {}", sanitize_line(n)));
@@ -388,6 +393,7 @@ pub async fn handle_verify(
     if console.json() {
         console.data(
             &serde_json::to_string_pretty(&json!({
+                "schema_version": crate::cli::CLI_JSON_SCHEMA_VERSION,
                 "verification": v,
                 "exit_code": code,
             }))
@@ -631,6 +637,25 @@ mod tests {
         );
         assert!(t.contains("1 GiB"), "{t}");
         assert_eq!(badges(&BlockDevice::default()), "-");
+    }
+
+    #[test]
+    fn json_documents_carry_their_schema_version() {
+        // I7: every JSON document of the CLI is versioned
+        let v = unmount_json(
+            "/dev/sdx",
+            &safety::UnmountResult {
+                unmounted: vec!["/mnt/x".into()],
+                mounts_before: vec!["/mnt/x".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["device"], "/dev/sdx");
+        assert_eq!(v["unmounted"][0], "/mnt/x");
+        let e = crate::cli::acquire::error_json(&AcquisitionError::refused("x"));
+        assert_eq!(e["schema_version"], 1);
+        assert_eq!(e["error"]["exit_code"], 3);
     }
 
     #[test]

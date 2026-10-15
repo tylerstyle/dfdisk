@@ -20,6 +20,24 @@ use crate::engines::AcquisitionError;
 use crate::signals::AbortController;
 use console::Console;
 
+/// `schema_version` of the JSON documents the CLI prints besides the
+/// reports: `check --json`, `verify --json`, `unmount --json`, the error
+/// object and the `acquire --rescue-to-e01 --json` document
+/// (docs/report-format.md, "Other JSON output").
+pub const CLI_JSON_SCHEMA_VERSION: u32 = 1;
+
+/// `value` (an object) with `schema_version` set to
+/// [`CLI_JSON_SCHEMA_VERSION`].
+pub fn with_schema_version(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = value.as_object_mut() {
+        map.insert(
+            "schema_version".into(),
+            serde_json::json!(CLI_JSON_SCHEMA_VERSION),
+        );
+    }
+    value
+}
+
 /// Run one command (not the TUI) and return its exit code. Acquire, check,
 /// verify and convert listen for SIGINT/SIGTERM/SIGHUP (once per process,
 /// §15); list and unmount keep the default signal behaviour.
