@@ -792,4 +792,52 @@ mod tests {
         assert!(info.errors[0].contains("aborted"));
         assert!(r.calls().is_empty());
     }
+
+    /// virtio disks (the dfnix CFTT VM) and dm mappings over them: no
+    /// identify-class command applies; the result says so, hides nothing
+    /// and claims nothing (the session neither refuses nor fails on it).
+    #[tokio::test]
+    async fn virtio_disks_and_dm_over_them_are_not_probed_and_say_why() {
+        const VIRTIO: &str = "pci0000:00/0000:00:05.0/virtio2";
+        let f = FakeSysfs::new();
+        f.add_disk(VIRTIO, "vdb", (252, 16), 131_072);
+        let runner = ScriptedRunner::new();
+        let node = |p: &Path| (p.file_name()?.to_str()? == "vdb").then_some((252, 16));
+        let env = ProbeEnv {
+            sys: f.root(),
+            dev_dir: "/dev".into(),
+            node_dev: &node,
+            runner: &runner,
+        };
+        let disk = SourceIdentity {
+            path: "/dev/vdb".into(),
+            kernel_name: "vdb".into(),
+            kind: SourceKind::Disk,
+            size_bytes: 131_072 * 512,
+            transport: Some("virtio".into()),
+            ..Default::default()
+        };
+        let dm = SourceIdentity {
+            path: "/dev/mapper/lin".into(),
+            kernel_name: "dm-2".into(),
+            kind: SourceKind::DeviceMapper {
+                crypt_plaintext: false,
+            },
+            parent_disks: vec!["/dev/vdb".into()],
+            size_bytes: 131_072 * 512,
+            ..Default::default()
+        };
+        for id in [&disk, &dm] {
+            let info = probe_with(&env, id, &StopControl::none(), None).await;
+            assert_eq!(info.hidden_area(), None, "{info:?}");
+            assert!(info.ata.is_none() && info.nvme.is_none());
+            assert_eq!(info.reported_bytes, id.size_bytes);
+            assert!(
+                info.summary().contains("/dev/vdb is neither"),
+                "{}",
+                info.summary()
+            );
+        }
+        assert!(runner.calls().is_empty(), "nothing was sent to the disk");
+    }
 }

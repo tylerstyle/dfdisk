@@ -768,4 +768,59 @@ mod tests {
             ]]
         );
     }
+
+    /// smartctl cannot talk to a virtio disk: the snapshot is UNKNOWN with
+    /// smartctl's message, for the disk and for a dm mapping over it (the
+    /// query goes to the disk, R6), never FAILED and never an error.
+    #[tokio::test]
+    async fn virtio_disks_and_dm_over_them_are_unknown() {
+        const VIRTIO: &str = "pci0000:00/0000:00:05.0/virtio2";
+        let f = FakeSysfs::new();
+        f.add_disk(VIRTIO, "vdb", (252, 16), 131_072);
+        let out = r#"{"json_format_version":[1,0],"smartctl":{"version":[7,4],"svn_revision":"5530","exit_status":1,"messages":[{"string":"/dev/vdb: Unable to detect device type","severity":"error"}]}}"#;
+        let argv = [
+            "smartctl", "-j", "-i", "-H", "-A", "-l", "error", "/dev/vdb",
+        ];
+        let runner = ScriptedRunner::new().respond(&argv, ToolRun::exited(&argv, 1, out, ""));
+        let node = |p: &Path| (p.file_name()?.to_str()? == "vdb").then_some((252, 16));
+        let env = ProbeEnv {
+            sys: f.root(),
+            dev_dir: "/dev".into(),
+            node_dev: &node,
+            runner: &runner,
+        };
+        let req = SmartRequest {
+            policy: SmartPolicy::Basic,
+            json_file: None,
+            standby_check: false,
+        };
+        let disk = SourceIdentity {
+            path: "/dev/vdb".into(),
+            kernel_name: "vdb".into(),
+            kind: SourceKind::Disk,
+            ..Default::default()
+        };
+        let dm = SourceIdentity {
+            path: "/dev/mapper/lin".into(),
+            kernel_name: "dm-2".into(),
+            kind: SourceKind::DeviceMapper {
+                crypt_plaintext: false,
+            },
+            parent_disks: vec!["/dev/vdb".into()],
+            ..Default::default()
+        };
+        for id in [&disk, &dm] {
+            let snap = snapshot_with(&env, id, req, &StopControl::none(), None)
+                .await
+                .unwrap();
+            assert_eq!(snap.summary.health, SmartHealth::Unknown, "{snap:?}");
+            assert_eq!(snap.exit_status, Some(1));
+            assert_eq!(snap.device_serial, None);
+        }
+        assert_eq!(runner.calls().len(), 2);
+        assert!(runner
+            .calls()
+            .iter()
+            .all(|c| c.last().unwrap() == "/dev/vdb"));
+    }
 }

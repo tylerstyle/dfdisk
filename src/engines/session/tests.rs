@@ -7,7 +7,7 @@ use super::*;
 use crate::discovery::sysfs::fake::FakeSysfs;
 use crate::models::capacity::AtaCapacity;
 use crate::models::config::OnReadError;
-use crate::models::device::SmartInfo;
+use crate::models::device::{SmartHealth, SmartInfo};
 use crate::models::identity::SourceKind;
 use crate::models::info_report::{sha256_file, sha256_hex};
 use crate::models::outcome::{Outcome, RangeKind};
@@ -1487,4 +1487,29 @@ fn descriptor_must_be_the_probed_file() {
         e.message.contains("no longer refers to the probed device"),
         "{e}"
     );
+}
+
+#[tokio::test]
+async fn unprobeable_capacity_and_unknown_smart_never_refuse_or_fail() {
+    // A virtio disk (or a dm mapping over one): no HPA/DCO query applies and
+    // smartctl cannot read it. Even with --refuse-hidden-areas the run goes
+    // on; the report states what could not be established.
+    let mut fake = Fake::new();
+    fake.capacity = CapacityInfo::not_probed(
+        SIZE,
+        "HPA/DCO probing applies to ATA disks (hdparm) and NVMe namespaces (nvme-cli); /dev/vdb is neither",
+    );
+    let config = AcquisitionConfig {
+        refuse_hidden_areas: true,
+        ..fake.raw()
+    };
+    let (r, _) = run_fake(&fake, config).await;
+    let report = r.unwrap();
+    assert_eq!(report.outcome, Outcome::Verified, "{:?}", report.notes);
+    let capacity = report.capacity.as_ref().unwrap();
+    assert_eq!(capacity.hidden_area(), None);
+    assert!(capacity.summary().contains("/dev/vdb is neither"));
+    let smart = report.smart_before.as_ref().unwrap();
+    assert_eq!(smart.summary.health, SmartHealth::Unknown);
+    assert!(report.render_text().contains("/dev/vdb is neither"));
 }
