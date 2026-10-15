@@ -106,3 +106,6 @@ jobs:
 
       - name: Build package (runs the test suite with libewf and ddrescue, DFDISK_REQUIRE_TOOLS=1)
         run: nix build -L .#default
+
+      - name: The same against libewf-legacy (20140816, the Debian/Ubuntu ewf-tools line)
+        run: nix build -L .#checks.x86_64-linux.libewf-legacy

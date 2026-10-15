@@ -28,8 +28,14 @@
         };
 
         # `nix flake check` builds the package, which runs the test suite with
-        # the real libewf and ddrescue (DFDISK_REQUIRE_TOOLS=1)
-        checks.default = dfdisk;
+        # the real libewf and ddrescue (DFDISK_REQUIRE_TOOLS=1); the same
+        # build again against libewf 20140816 (libewf-legacy), the release
+        # line of the Debian/Ubuntu ewf-tools package the .deb depends on
+        # (Ubuntu 22.04: 20140807), whose tool output differs
+        checks = {
+          default = dfdisk;
+          libewf-legacy = dfdisk.override { libewf = pkgs.libewf-legacy; };
+        };
 
         apps = {
           default = flake-utils.lib.mkApp {

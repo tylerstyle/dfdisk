@@ -13,7 +13,7 @@ release:
 	cargo build --release
 
 test:
-	cargo test
+	cargo test --locked
 
 clean:
 	cargo clean

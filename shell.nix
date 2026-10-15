@@ -10,6 +10,8 @@ pkgs.mkShell {
     libewf
     smartmontools
     ddrescue
+    hdparm
+    nvme-cli
     dcfldd
     dc3dd
   ];
