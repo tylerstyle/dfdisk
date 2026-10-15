@@ -1136,24 +1136,34 @@ impl ImageFlush {
         if self.not_durable.is_empty() {
             return image;
         }
+        let flush = format!(
+            "the image could not be flushed durably to the destination: {}",
+            self.not_durable.join("; ")
+        );
         match image {
             VerificationResult::Mismatched { .. } => image,
-            _ => VerificationResult::Failed {
-                reason: format!(
-                    "the image could not be flushed durably to the destination: {}",
-                    self.not_durable.join("; ")
-                ),
+            // The image's own failure stays named next to the flush's
+            VerificationResult::Failed { reason } => VerificationResult::Failed {
+                reason: format!("{flush}; {reason}"),
             },
+            _ => VerificationResult::Failed { reason: flush },
         }
     }
 }
+
+/// Why a second source read has nothing to be compared with: no digest was
+/// computed while reading the source (ddrescue) and the image could not be
+/// hashed.
+pub const NOTHING_TO_COMPARE: &str = "nothing to compare with: no digest was computed while reading the source, and the image could not be hashed";
 
 /// The second read of the source compared with what the acquisition
 /// measured, labelled by what was compared (R-4): with acquisition digests,
 /// a difference means the source changed or reads unstably; without them
 /// (ddrescue), the second read is compared with the image, and a difference
 /// means the image differs from the source as read again (a damaged image,
-/// or a changed or unstable source).
+/// or a changed or unstable source). A digest missing on the side it is
+/// compared with makes the comparison not possible: the second read itself
+/// succeeded (N2).
 pub fn compare_second_read(
     selection: HashSelection,
     acquisition: &HashResults,
@@ -1161,6 +1171,11 @@ pub fn compare_second_read(
     reread: &HashResults,
 ) -> VerificationResult {
     const METHOD: &str = "second read of the source";
+    if acquisition.is_empty() && image.is_empty() {
+        return VerificationResult::NotPossible {
+            reason: NOTHING_TO_COMPARE.into(),
+        };
+    }
     let (result, cause) = if acquisition.is_empty() {
         (
             compare_digest_sets(selection, ("image", image), ("second read", reread), METHOD),
@@ -1182,34 +1197,50 @@ pub fn compare_second_read(
             method,
             details: format!("{cause}: {details}"),
         },
+        VerificationResult::Failed { reason } => VerificationResult::NotPossible {
+            reason: format!("nothing to compare with: {reason}"),
+        },
         other => other,
     }
 }
 
 /// The image verification combined with the second source read: a
 /// differing second read is a mismatch (as [`compare_second_read`] labelled
-/// it); a requested second read that failed fails the verification; a
-/// matching second read verifies an acquisition whose engine had no stream
-/// digest.
+/// it; a failed image re-read is named with it); an image that failed its
+/// verification keeps its own reason, with the second read's result
+/// appended (N2); otherwise a second read that failed (`Failed` comes only
+/// from the read itself) fails the verification, and a matching second
+/// read verifies an acquisition whose engine had no stream digest.
 pub fn combine_verification(
     image: VerificationResult,
     source_reread: Option<&VerificationResult>,
 ) -> VerificationResult {
-    match source_reread {
-        None | Some(VerificationResult::NotPossible { .. }) => image,
-        Some(mismatch @ VerificationResult::Mismatched { .. }) => mismatch.clone(),
-        Some(VerificationResult::Failed { reason }) => match image {
-            VerificationResult::Mismatched { .. } => image,
-            _ => VerificationResult::Failed {
-                reason: format!("the second source read failed: {reason}"),
-            },
+    let Some(reread) = source_reread else {
+        return image;
+    };
+    match (image, reread) {
+        (
+            VerificationResult::Failed { reason },
+            VerificationResult::Mismatched { method, details },
+        ) => VerificationResult::Mismatched {
+            method: method.clone(),
+            details: format!("{details}; the image verification also failed: {reason}"),
         },
-        Some(VerificationResult::Matched { method }) => match image {
-            VerificationResult::NotPossible { .. } => VerificationResult::Matched {
+        (_, mismatch @ VerificationResult::Mismatched { .. }) => mismatch.clone(),
+        (image @ VerificationResult::Mismatched { .. }, _) => image,
+        (VerificationResult::Failed { reason }, reread) => VerificationResult::Failed {
+            reason: format!("{reason}; second source read: {}", reread.describe()),
+        },
+        (image, VerificationResult::NotPossible { .. }) => image,
+        (_, VerificationResult::Failed { reason }) => VerificationResult::Failed {
+            reason: format!("the second source read failed: {reason}"),
+        },
+        (VerificationResult::NotPossible { .. }, VerificationResult::Matched { method }) => {
+            VerificationResult::Matched {
                 method: method.clone(),
-            },
-            other => other,
-        },
+            }
+        }
+        (image, VerificationResult::Matched { .. }) => image,
     }
 }
 
@@ -1469,6 +1500,12 @@ async fn acquire_phase(
         Some(VerificationResult::NotPossible {
             reason: "the source changed or disappeared during the acquisition".into(),
         })
+    } else if out.acquisition_hashes.is_empty() && image_hashes.is_empty() {
+        // N2: a second read would have nothing to be compared with; the
+        // source (perhaps a failing drive) is not read again for nothing
+        Some(VerificationResult::NotPossible {
+            reason: format!("{NOTHING_TO_COMPARE}, so the source was not read a second time"),
+        })
     } else {
         sink.phase(
             AcquisitionStatus::SourceReread,
@@ -1497,6 +1534,7 @@ async fn acquire_phase(
         !out.image_files.is_empty(),
         &flush,
     );
+    let image_verification = image_result.clone();
     let verification = combine_verification(image_result, source_reread.as_ref());
 
     // 13: SMART after a rescue
@@ -1577,6 +1615,7 @@ async fn acquire_phase(
         result: verification.clone(),
         method,
         source_reread,
+        image: Some(image_verification),
     };
     report.piecewise = out.piecewise.clone();
     report.image_files = out

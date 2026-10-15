@@ -13,6 +13,7 @@
 //! confirmation sheet (converter), the progress and the result screens.
 
 use crate::discovery::safety::UnmountResult;
+use crate::engines::converter;
 use crate::engines::preflight::{self, DestinationFacts, MIN_FREE_BYTES};
 use crate::engines::session::{AcquisitionRequest, CheckReport};
 use crate::engines::verify::{ExpectedHashes, ImageVerification, VerifyEvent};
@@ -233,6 +234,9 @@ pub enum ConfirmSubject {
         request: Box<ConversionRequest>,
         facts: Option<Box<SourceFacts>>,
         destination: Option<Result<DestinationFacts, String>>,
+        /// The case values the conversion will record, with their sources
+        /// (I-N1); None while it is determined
+        case: Option<Result<Box<converter::CasePreview>, String>>,
     },
 }
 
@@ -615,6 +619,7 @@ enum BgEvent {
         token: u64,
         facts: SourceFacts,
         destination: Result<DestinationFacts, String>,
+        case: Result<Box<converter::CasePreview>, String>,
     },
     Completion {
         token: u64,
@@ -676,32 +681,42 @@ fn find_rescue_map(dir: &Path, base: &str) -> Option<PathBuf> {
         .filter(|p| std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false))
 }
 
-/// Facts about a converter source: existence, size, its dfdisk report.
+/// Facts about a converter source: existence, size, its dfdisk report. The
+/// report is the one a conversion uses (I-N2: `converter::find_image_report`,
+/// next to the image and listing it), so the form is never pre-filled, and
+/// the confirmation never asks for a serial, from a report the conversion
+/// ignores.
 pub fn probe_source(path: &Path) -> SourceFacts {
     let meta = std::fs::metadata(path).ok().filter(|m| m.is_file());
-    let report = report_candidate(path)
-        .filter(|p| p.is_file())
-        .and_then(|p| {
-            let text = std::fs::read_to_string(&p).ok()?;
-            let r = ForensicInfoReport::from_json(&text).ok()?;
-            Some(SourceReport {
-                device: format!(
+    let (found, report_notes) = converter::find_image_report(path);
+    let report = found.map(|r| {
+        // The acquired device: only an acquisition report names one
+        let acquired = (r.kind == "acquisition")
+            .then(|| std::fs::read_to_string(&r.path).ok())
+            .flatten()
+            .and_then(|text| ForensicInfoReport::from_json(&text).ok());
+        SourceReport {
+            device: match &acquired {
+                Some(a) => format!(
                     "{} ({})",
-                    r.source.display_name(),
-                    r.source.serial_with_provenance()
+                    a.source.display_name(),
+                    a.source.serial_with_provenance()
                 ),
-                serial: r.source.serial.clone(),
-                case: r.case_metadata.clone(),
-                outcome: r.outcome.label().to_string(),
-                path: p,
-            })
-        });
+                None => format!("(a {} report names no device)", r.kind),
+            },
+            serial: acquired.and_then(|a| a.source.serial),
+            case: r.case,
+            outcome: r.outcome.label().to_string(),
+            path: r.path,
+        }
+    });
     SourceFacts {
         path: path.to_path_buf(),
         is_ewf: meta.is_some() && crate::engines::verify::is_ewf_image_file(path),
         exists: meta.is_some(),
         size: meta.map(|m| m.len()),
         report,
+        report_notes,
     }
 }
 
@@ -779,10 +794,14 @@ pub struct App {
     pub verify: VerifyForm,
     verify_due: Option<Instant>,
 
+    /// Jobs and unmounts running in the background (I-N3: a panic of the UI
+    /// waits for them before dfdisk exits)
+    pub work: crate::tui::WorkTracker,
     pub notices: Vec<Notice>,
     notice_seq: u64,
-    /// Terminal size of the last frame drawn: which notices were shown
-    pub frame_size: (u16, u16),
+    /// Ids of the notices the last frame drew (I-N4): Ctrl+X dismisses only
+    /// these; none on the "terminal too small" screen
+    pub notices_drawn: Vec<u64>,
     pub profile: CaseProfile,
     pub profile_path: Option<PathBuf>,
     pub ssh_warning: Option<String>,
@@ -883,9 +902,10 @@ impl App {
             conv_due: None,
             verify: VerifyForm::default(),
             verify_due: None,
+            work: crate::tui::WorkTracker::default(),
             notices: Vec::new(),
             notice_seq: 0,
-            frame_size: (MIN_WIDTH, MIN_HEIGHT),
+            notices_drawn: Vec::new(),
             profile: CaseProfile::default(),
             profile_path: None,
             ssh_warning: None,
@@ -1007,16 +1027,11 @@ impl App {
         (height as usize / 4).max(NOTICE_MIN_LINES)
     }
 
-    /// Acknowledge the notices shown (Ctrl+X); the ones that did not fit
-    /// stay and move up.
+    /// Acknowledge the notices shown (Ctrl+X): those the last frame drew.
+    /// The ones that did not fit, arrived after it or were never drawn (the
+    /// "terminal too small" screen) stay.
     pub fn dismiss_notices(&mut self) {
-        let (w, h) = self.frame_size;
-        let ids: Vec<u64> = self
-            .notice_page(w as usize, Self::notice_lines_max(h))
-            .shown
-            .iter()
-            .map(|(n, _)| n.id)
-            .collect();
+        let ids = std::mem::take(&mut self.notices_drawn);
         self.notices.retain(|n| !ids.contains(&n.id));
     }
 
@@ -1085,6 +1100,23 @@ impl App {
                 false
             }
         }
+    }
+
+    /// [`spawn`](Self::spawn) for a job: counted in [`work`](Self::work)
+    /// while it runs.
+    fn spawn_job<F, P>(&mut self, fut: F, on_panic: P) -> bool
+    where
+        F: Future<Output = BgEvent> + Send + 'static,
+        P: FnOnce(String) -> BgEvent + Send + 'static,
+    {
+        let guard = self.work.enter();
+        self.spawn(
+            async move {
+                let _running = guard;
+                fut.await
+            },
+            on_panic,
+        )
     }
 
     /// Work that must finish before dfdisk may exit: a job (its report) or
@@ -1592,12 +1624,16 @@ impl App {
         let path = device.path.clone();
         self.unmounting = Some(path.clone());
         let (key2, path2) = (key.clone(), path.clone());
+        let guard = self.work.enter();
         if !self.spawn_blocking(
-            move || BgEvent::Unmount {
-                result: backend.unmount(&device),
-                key,
-                path,
-                then_setup,
+            move || {
+                let _running = guard;
+                BgEvent::Unmount {
+                    result: backend.unmount(&device),
+                    key,
+                    path,
+                    then_setup,
+                }
             },
             move |m| BgEvent::Unmount {
                 result: Err(AcquisitionError::failed(format!(
@@ -2073,7 +2109,7 @@ impl App {
         self.confirm = None;
         self.screen = Screen::Running;
         self.save_profile();
-        self.spawn(
+        self.spawn_job(
             async move { BgEvent::Acquired(Box::new(fut.await)) },
             |message| BgEvent::JobPanicked {
                 kind: JobKind::Acquisition,
@@ -2418,11 +2454,13 @@ impl App {
         };
         self.token += 1;
         let token = self.token;
+        let preview_request = request.clone();
         self.confirm = Some(ConfirmState {
             subject: ConfirmSubject::Conversion {
                 request: Box::new(request),
                 facts: None,
                 destination: None,
+                case: None,
             },
             token,
             pending: true,
@@ -2439,6 +2477,7 @@ impl App {
                 token,
                 facts: probe_source(&source_path),
                 destination: backend.destination(&dir),
+                case: backend.conversion_case(&preview_request).map(Box::new),
             },
             move |message| BgEvent::Internal {
                 token: Some(token),
@@ -2487,7 +2526,7 @@ impl App {
         });
         self.confirm = None;
         self.screen = Screen::Running;
-        self.spawn(
+        self.spawn_job(
             async move {
                 let result = match fut.await {
                     Ok(report) => {
@@ -2625,7 +2664,7 @@ impl App {
             force_requested: false,
         });
         self.screen = Screen::Running;
-        self.spawn(
+        self.spawn_job(
             async move {
                 let expected = match report {
                     None => Ok(ExpectedHashes::default()),
@@ -3145,6 +3184,7 @@ impl App {
                 token,
                 facts,
                 destination,
+                case,
             } => {
                 let Some(c) = &mut self.confirm else {
                     return;
@@ -3157,17 +3197,23 @@ impl App {
                     request,
                     facts: slot,
                     destination: dslot,
+                    case: cslot,
                 } = &mut c.subject
                 {
                     let serial = facts.report.as_ref().and_then(|r| r.serial.clone());
-                    let evidence = request
-                        .case
-                        .as_ref()
-                        .map(|cm| cm.evidence_number.clone())
-                        .unwrap_or_default();
+                    // The evidence number the conversion records
+                    let evidence = match &case {
+                        Ok(p) => p.case.evidence_number.clone(),
+                        Err(_) => request
+                            .case
+                            .as_ref()
+                            .map(|cm| cm.evidence_number.clone())
+                            .unwrap_or_default(),
+                    };
                     c.target = Some(ConfirmTarget::new(serial.as_deref(), &evidence));
                     *slot = Some(Box::new(facts));
                     *dslot = Some(destination);
+                    *cslot = Some(case);
                 }
             }
             BgEvent::Completion {
@@ -3346,6 +3392,7 @@ mod tests {
         app.tick();
         assert_eq!(app.notices.len(), 1);
         assert_eq!(app.notices[0].text, "error");
+        draw(&mut app, 80, 24);
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         assert!(app.notices.is_empty());
     }
@@ -3384,21 +3431,47 @@ mod tests {
         );
     }
 
+    fn draw(app: &mut App, w: u16, h: u16) {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        t.draw(|f| crate::tui::ui::render(f, app)).unwrap();
+    }
+
     #[test]
     fn ctrl_x_dismisses_only_the_notices_shown() {
         let mut app = App::with_devices(Vec::new());
         for i in 0..4 {
             app.notify(Level::Error, long_error(i));
         }
-        app.frame_size = (80, 24);
+        draw(&mut app, 80, 24);
         let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
         app.handle_key(ctrl_x);
         // The two shown are gone; the two that did not fit stay, unread
         let left: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
         assert_eq!(left.len(), 2, "{left:?}");
         assert!(left[0].starts_with("error number 0") && left[1].starts_with("error number 1"));
+        // Not drawn since: a second Ctrl+X dismisses nothing
+        app.handle_key(ctrl_x);
+        assert_eq!(app.notices.len(), 2);
+        draw(&mut app, 80, 24);
         app.handle_key(ctrl_x);
         assert!(app.notices.is_empty());
+    }
+
+    #[test]
+    fn ctrl_x_never_dismisses_notices_that_were_not_drawn() {
+        // I-N4: on the "terminal too small" screen no notice is drawn
+        let mut app = App::with_devices(Vec::new());
+        app.notify(Level::Error, "the destination is full");
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        draw(&mut app, MIN_WIDTH - 1, MIN_HEIGHT);
+        app.handle_key(ctrl_x);
+        assert_eq!(app.notices.len(), 1, "never shown, so never dismissed");
+        // A notice that arrived after the last frame stays as well
+        draw(&mut app, 80, 24);
+        app.notify(Level::Error, "the source disappeared");
+        app.handle_key(ctrl_x);
+        let left: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(left, ["the source disappeared"]);
     }
 
     #[test]

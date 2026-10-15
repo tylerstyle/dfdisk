@@ -576,7 +576,11 @@ pub struct SourceFacts {
     pub size: Option<u64>,
     /// The file carries an EWF signature
     pub is_ewf: bool,
+    /// The report a conversion of this image uses (the converter's rule:
+    /// next to the image and listing it)
     pub report: Option<SourceReport>,
+    /// Reports next to the image that a conversion would not use, and why
+    pub report_notes: Vec<String>,
 }
 
 /// The converter form.

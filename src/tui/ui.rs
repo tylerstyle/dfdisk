@@ -65,12 +65,13 @@ fn block(title: impl Into<String>, color: Color) -> Block<'static> {
 /// Draw the whole screen.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    app.frame_size = (area.width, area.height);
+    app.notices_drawn.clear();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_too_small(frame, area);
         return;
     }
-    let notice_lines = notice_lines(app, area.width as usize, area.height);
+    let (notice_lines, drawn) = notice_lines(app, area.width as usize, area.height);
+    app.notices_drawn = drawn;
     let [header, notices, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(notice_lines.len() as u16),
@@ -196,8 +197,10 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 /// Notification lines: errors first, then warnings, then information,
 /// newest first, each wrapped in full ([`App::notice_page`]); a last line
 /// counts the notices that did not fit, errors among them.
-fn notice_lines(app: &App, width: usize, height: u16) -> Vec<Line<'static>> {
+/// The notification area's lines and the ids of the notices in them.
+fn notice_lines(app: &App, width: usize, height: u16) -> (Vec<Line<'static>>, Vec<u64>) {
     let page = app.notice_page(width, App::notice_lines_max(height));
+    let drawn = page.shown.iter().map(|(n, _)| n.id).collect();
     let mut lines = Vec::new();
     for (n, text) in &page.shown {
         let color = match n.level {
@@ -233,7 +236,7 @@ fn notice_lines(app: &App, width: usize, height: u16) -> Vec<Line<'static>> {
             },
         )));
     }
-    lines
+    (lines, drawn)
 }
 
 pub(crate) fn footer_hints(app: &App) -> String {
@@ -1148,6 +1151,7 @@ pub fn sheet_lines(app: &App) -> Vec<Line<'static>> {
             request,
             facts,
             destination,
+            case,
         } => {
             out.push(Line::raw(""));
             out.push(section("SOURCE IMAGE"));
@@ -1173,9 +1177,13 @@ pub fn sheet_lines(app: &App) -> Vec<Line<'static>> {
                     }
                     None => out.push(sheet_row(
                         "Report",
-                        "none found next to the image",
+                        "none found next to the image that lists it",
                         Style::default().fg(Color::Yellow),
                     )),
+                }
+                // Reports next to the image the conversion does not use
+                for n in &f.report_notes {
+                    out.push(sheet_row("Note", n, Style::default().fg(Color::Yellow)));
                 }
             }
             out.push(Line::raw(""));
@@ -1215,11 +1223,41 @@ pub fn sheet_lines(app: &App) -> Vec<Line<'static>> {
                 ));
             }
             out.push(Line::raw(""));
-            out.push(section("CASE"));
-            if let Some(case) = &request.case {
-                for (k, v) in case.report_rows() {
-                    out.push(sheet_row(k, &v, white));
+            // I-N1: what the conversion will record (E01 header < source
+            // report < the form), each value with where it comes from
+            out.push(section("CASE (as recorded)"));
+            match case {
+                Some(Ok(preview)) => {
+                    for (k, v, origin) in preview.rows() {
+                        let text = match origin {
+                            Some(from) => format!("{v}  [{from}]"),
+                            None => v,
+                        };
+                        out.push(sheet_row(k, &text, white));
+                    }
+                    for n in &preview.notes {
+                        out.push(sheet_row("Note", n, Style::default().fg(Color::Yellow)));
+                    }
                 }
+                Some(Err(e)) => {
+                    out.push(sheet_row(
+                        "Case",
+                        &format!(
+                            "the values the conversion records could not be determined ({e}); the form's values follow, the conversion may add values from the image's report or E01 header"
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                    if let Some(given) = &request.case {
+                        for (k, v) in given.report_rows() {
+                            out.push(sheet_row(k, &v, white));
+                        }
+                    }
+                }
+                None => out.push(sheet_row(
+                    "Case",
+                    "determining the values the conversion records...",
+                    white,
+                )),
             }
             for n in &request.notes {
                 out.push(sheet_row("Note", n, Style::default().fg(Color::Yellow)));

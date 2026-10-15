@@ -1990,6 +1990,156 @@ fn verification_and_second_read_combine() {
         combine_verification(mismatched.clone(), Some(&failed)),
         VerificationResult::Mismatched { .. }
     ));
+
+    // N2: a second read that failed is named so only when it was the read
+    assert_eq!(
+        combine_verification(matched("img"), Some(&failed)),
+        VerificationResult::Failed {
+            reason: "the second source read failed: io".into()
+        }
+    );
+    // An image that failed its verification keeps its own reason, with the
+    // second read's result appended, whatever that was
+    let image_failed = VerificationResult::Failed {
+        reason: "read error in the image at byte offset 1048576".into(),
+    };
+    for (reread, appended) in [
+        (&failed, "; second source read: FAILED: io"),
+        (&not_possible, "; second source read: not possible: rescue"),
+        (&matched("re"), "; second source read: matched (re)"),
+    ] {
+        assert_eq!(
+            combine_verification(image_failed.clone(), Some(reread)),
+            VerificationResult::Failed {
+                reason: format!("read error in the image at byte offset 1048576{appended}")
+            }
+        );
+    }
+    // A differing second read is still a mismatch, and names the image's failure
+    let VerificationResult::Mismatched { details, .. } =
+        combine_verification(image_failed.clone(), Some(&mismatched))
+    else {
+        panic!()
+    };
+    assert_eq!(
+        details,
+        "MD5 differs; the image verification also failed: read error in the image at byte offset 1048576"
+    );
+    // Missing image digests: nothing to compare with, not a failed read
+    assert_eq!(
+        compare_second_read(
+            sel,
+            &HashResults::default(),
+            &HashResults::default(),
+            &hashes(b"a")
+        ),
+        VerificationResult::NotPossible {
+            reason: NOTHING_TO_COMPARE.into()
+        }
+    );
+    let partial = HashResults {
+        sha1: None,
+        ..hashes(b"a")
+    };
+    let VerificationResult::NotPossible { reason } =
+        compare_second_read(sel, &partial, &hashes(b"a"), &hashes(b"a"))
+    else {
+        panic!()
+    };
+    assert_eq!(
+        reason,
+        "nothing to compare with: SHA-1 was not computed during the acquisition"
+    );
+}
+
+#[tokio::test]
+async fn an_image_that_cannot_be_re_read_keeps_its_own_failure() {
+    // N2: a rescue image that cannot be hashed (read error on the
+    // destination) has no digests; --verify-source has nothing to compare a
+    // second read with, so the source is not read again, and the verdict and
+    // the report name the image's read error, not a second-read failure
+    const IMAGE_ERROR: &str =
+        "read error in the image b.raw at byte offset 1048576: Input/output error (os error 5)";
+    let mut fake = Fake::new();
+    fake.engine = Some(rescue_engine(fake.data.clone()));
+    fake.verify = Some(Box::new(|_, _| {
+        (
+            VerificationResult::Failed {
+                reason: IMAGE_ERROR.into(),
+            },
+            HashResults::default(),
+        )
+    }));
+    fake.reread = Some(Ok(hashes(&fake.data)));
+    let config = AcquisitionConfig {
+        verify_source: true,
+        smart: SmartPolicy::Off,
+        ..AcquisitionConfig::rescue(fake.out())
+    };
+    let report = run_fake(&fake, config).await.0.unwrap();
+    assert_eq!(report.outcome, Outcome::VerificationFailed);
+    assert_eq!(report.exit_code, 4);
+    assert!(!fake.calls().contains(&"reread"), "{:?}", fake.calls());
+    let second = report.verification.source_reread.clone().unwrap();
+    let VerificationResult::NotPossible { reason } = &second else {
+        panic!("{second:?}")
+    };
+    assert!(reason.starts_with(NOTHING_TO_COMPARE), "{reason}");
+    assert!(reason.ends_with("so the source was not read a second time"));
+    let VerificationResult::Failed { reason } = &report.verification.result else {
+        panic!("{:?}", report.verification.result)
+    };
+    assert!(reason.starts_with(IMAGE_ERROR), "{reason}");
+    assert!(
+        reason.contains("; second source read: not possible: nothing to compare with"),
+        "{reason}"
+    );
+    assert!(!reason.contains("second source read failed"), "{reason}");
+    assert!(!reason.contains("has no image digest"), "{reason}");
+    assert_eq!(
+        report.verification.image,
+        Some(VerificationResult::Failed {
+            reason: IMAGE_ERROR.into()
+        })
+    );
+    let banner = report.verdict_lines().join("\n");
+    assert!(banner.contains(IMAGE_ERROR), "{banner}");
+    let (text, _) = read_report(&fake);
+    assert!(
+        text.contains(&format!(
+            "  (none: the image re-read failed: {IMAGE_ERROR})"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("the image was not re-read"), "{text}");
+    assert!(!text.contains("second source read failed"), "{text}");
+
+    // The same with acquisition digests (RAW): the second read is compared
+    // with them and its result is appended to the image's failure
+    let mut fake = Fake::new();
+    fake.verify = Some(Box::new(|_, _| {
+        (
+            VerificationResult::Failed {
+                reason: IMAGE_ERROR.into(),
+            },
+            HashResults::default(),
+        )
+    }));
+    let config = AcquisitionConfig {
+        verify_source: true,
+        ..fake.raw()
+    };
+    let report = run_fake(&fake, config).await.0.unwrap();
+    assert_eq!(report.outcome, Outcome::VerificationFailed);
+    assert!(fake.calls().contains(&"reread"));
+    let VerificationResult::Failed { reason } = &report.verification.result else {
+        panic!("{:?}", report.verification.result)
+    };
+    assert!(reason.starts_with(IMAGE_ERROR), "{reason}");
+    assert!(
+        reason.contains("; second source read: matched (second read of the source)"),
+        "{reason}"
+    );
 }
 
 #[test]

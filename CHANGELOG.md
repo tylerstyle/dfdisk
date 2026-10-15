@@ -49,8 +49,9 @@ and when something was not done the report says so.
   refusals, per-boot audit export, `DeviceIdentity::same_attachment`).
 - **Stricter refusals.** Mounted sources are refused (unmounting is the explicit
   `dfdisk unmount` / `--auto-unmount`), as are sources with holders
-  (device-mapper, LVM, md, or a loop device set up over the source; they have
-  to be closed first), sources with active swap, sources in use (`O_EXCL`), tmpfs
+  (device-mapper, LVM, md, or a loop device set up over the source, or over its
+  disk with a byte range that includes the source; they have to be closed
+  first), sources with active swap, sources in use (`O_EXCL`), tmpfs
   destinations (unless `--allow-tmpfs`), E01 destinations with less free space
   than the source (unless `--allow-low-space`) and empty sources (size 0: no
   medium, or the size is unknown).
@@ -69,6 +70,9 @@ and when something was not done the report says so.
   0 otherwise, 1 on a terminal failure or an internal error of the UI itself,
   and 4 when the signal handlers cannot be installed. A run that stops on an
   internal error (a panic) is shown as FAILED (INTERNAL ERROR), exit code 4.
+  After an internal error of the UI itself, a job still running is aborted
+  and writes its report and audit record, and an unmount still running ends,
+  before dfdisk exits.
 - **TUI keys.** Esc never aborts; aborting needs a y/N confirmation; Tab and
   Shift-Tab always move between fields and path completion has its own key.
 - **Packaging.** The .deb depends on `$auto, ewf-tools, gddrescue, smartmontools,
@@ -93,12 +97,17 @@ and when something was not done the report says so.
   shows a confirmation sheet. An E01 acquisition of a source that ends before
   its size while it stays attached no longer waits forever: after 60 s without
   progress dfdisk checks the source and, when it is gone or smaller, stops
-  ewfacquire (INCOMPLETE, "source lost at offset X").
+  ewfacquire (INCOMPLETE, "source lost at offset X"). When ewfacquire
+  zero-filled to the end of the medium and the source is gone or smaller
+  afterwards (presence and size are checked), those zeros are listed as not
+  acquired ("source lost at offset X"); only a source still present with its
+  full size makes them read errors of the medium.
 - **H1** The TUI hid the verdict: the result screen starts with the verdict
   banner, coloured by outcome, shows the key numbers and paths, scrolls the full
   report and stays until acknowledged; errors no longer expire. Notices are
   wrapped instead of cut at the terminal width, the ones that do not fit are
-  counted, and Ctrl+X dismisses only the notices shown.
+  counted, and Ctrl+X dismisses only the notices shown (none on the "terminal
+  too small" screen, none that arrived after the last screen was drawn).
 - **H2** No signal handling: SIGINT, SIGTERM and SIGQUIT abort gracefully
   (SIGINT to the tool's process group, grace period, then SIGTERM and SIGKILL),
   a second SIGINT kills at once, SIGHUP lets the run finish headless; every
@@ -130,12 +139,26 @@ and when something was not done the report says so.
   or the same attachment, not by the bridge's serial; a refused resume leaves
   the previous report as `<base>.info`. After every ddrescue run dfdisk writes
   zeros over the bad-sector areas of the map, so they are zeros in the image
-  also after an interrupted session was resumed. The verdict explanation
+  also after an interrupted session was resumed; sectors there that held data
+  (left by a session killed before ddrescue saved its map, also sectors a retry
+  pass read) are first copied to `<base>.zeroed-N.bin`, with their image
+  offsets and SHA-256 in `<base>.zeroed-N.tsv` (N: the rescue session; created
+  new and fsynced before the first zero, never overwritten), and both are
+  listed with the report's files. The verdict explanation
   follows what happened: a rescue is INCOMPLETE "because the map lists
   unfinished areas" only when it does and nothing else stopped it, a VERIFIED
   rescue names the second read of the source it was compared with, and a second
   read that differs is labelled by what was compared (acquisition digests or
-  the image).
+  the image). An image that cannot be re-read keeps its own read error as the
+  reason of VERIFICATION FAILED (also next to a failed flush), with the second
+  read's result appended, and
+  the report's HASHES section says that the re-read failed and why; a rescue
+  image without digests is not compared with a second read ("nothing to compare
+  with"; the source is not read again), and "the second source read failed"
+  names only a second read that failed itself. An INCOMPLETE run that has every
+  byte of the source in its image but did not end cleanly (for example ddrescue
+  ending with an error status after a complete run) no longer calls its image
+  partial.
 - **H5** Write protection was not checked or recorded: the read-only state of
   the source and its partitions, holders, mounts and the exclusive open are
   recorded; BLKROSET is set by default on the source, its partitions, the nodes
@@ -143,7 +166,11 @@ and when something was not done the report says so.
   md source) and its disk with every partition; a node that has to stay
   writable because of another mount is named in the report. A loop device set
   up over the source or its partitions is a holder and its mounts are mounts
-  of the source; a loop or md source's own partitions belong to it.
+  of the source; so is a loop device over a device below the source (its disk,
+  the partition under a LUKS source) whose byte range (`loop/offset`,
+  `loop/sizelimit`) includes part of the source, with those of its partitions
+  that do (`losetup -P /dev/sdb; mount /dev/loop0p2` for a source `sdb2`); a
+  loop or md source's own partitions belong to it.
 - **H6** Audit trail gaps: (a) the export is per boot and never replaces another
   boot's chain; (b) refusals are recognised by type, not by message text;
   (c) the "finished" record always carries the outcome, the digests known and
@@ -170,7 +197,11 @@ and when something was not done the report says so.
   scrolling device table that keeps the serial visible, abort with confirmation.
   The confirmation sheet shows the settings the run uses and says "refused"
   only for a refusal (a missing tool is named); nothing starts while a run or
-  an unmount is in progress.
+  an unmount is in progress. A conversion's sheet shows the case values the
+  conversion records (E01 header < source report < form), each with where it
+  comes from; the TUI takes an image's report by the converter's rule (it must
+  list the image), so a report of another image pre-fills nothing and never
+  chooses the typed confirmation.
 - **H9** Exit codes: see Breaking changes; errors are printed once; a panic
   exits 1 (internal error) with a message instead of Rust's 101; a tool the
   engine runs that is not installed fails the run (exit 4) before anything is
@@ -229,7 +260,7 @@ and when something was not done the report says so.
 - **M12** `dfdisk verify`: a requested digest that was not computed is a failure,
   never a pass; `.Ex01` and `.E02` segment families are recognised as EWF; an
   expected digest that is not 32/40/64 hex digits is a usage error (exit 2)
-  instead of a HASH MISMATCH with an addendum.
+  instead of a mismatch.
 - Low: `--split none` passes the largest segment size both libewf lines accept
   (9223372036854775806 bytes; 0.1.10 passed 7900 GiB, so a larger source got
   several segments); `-r` above 255 is a usage error instead of silently
@@ -255,7 +286,8 @@ and when something was not done the report says so.
   with the RTC offset, documented exit codes, `dfdisk check` (dry run),
   `acquire --json`, `list --json`; `check`, `verify` and `unmount` with
   `--json` and the error object carry `schema_version` 1 and are documented in
-  docs/report-format.md.
+  docs/report-format.md. With `--json` an argument error (an unknown option, a
+  malformed digest) is printed as that error object too.
 - **F6** Re-verification as an audited addendum (`dfdisk verify`, TUI re-verify
   screen, `--report`, `--pieces`) and an optional second read of the source
   (`--verify-source`).
@@ -282,6 +314,12 @@ and when something was not done the report says so.
   device-mapper (dm-linear, dm-crypt, LVM), md and loop devices carry their own
   facts and the hardware identity of the one disk they are stored on; the
   virtio-blk serial is read from sysfs, so a virtio disk matches its selection.
+  A device stored on a loop device (a LUKS or kpartx mapping of an image file,
+  a partition of a loop device) has no hardware identity: the walk down to the
+  disk stops at the loop device, so the host disk that holds the image file
+  never lends its serial, model or WWN to the report, the file names or
+  `--expect-serial`, and SMART, `hdparm`, `nvme` and BLKROSET never reach it
+  (the loop node is set read-only as the disk).
 - The flake check `libewf-legacy` builds and tests dfdisk against libewf
   20140816, the release line of the Debian/Ubuntu `ewf-tools` package.
 

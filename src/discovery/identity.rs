@@ -192,12 +192,13 @@ impl<'a> Prober<'a> {
         } else {
             SourceKind::Other
         };
+        // S-N1: down to a loop device, never to the disk that holds its
+        // backing file (that disk is the host's, not the evidence)
         id.parent_disks = match &id.kind {
             SourceKind::Disk | SourceKind::Other => Vec::new(),
             SourceKind::Partition => vec![format!("/dev/{disk}")],
             _ => sys
-                .topology()
-                .backing_disks(&kname)
+                .storage_disks(&kname)
                 .into_iter()
                 .filter(|d| d != &kname)
                 .map(|d| format!("/dev/{d}"))
@@ -224,12 +225,17 @@ impl<'a> Prober<'a> {
             block_size("queue/physical_block_size").unwrap_or(id.logical_sector_size);
 
         // Hardware identity: the disk itself, or the one disk under a
-        // partition or dm/md target. A loop device has none: the disk that
-        // holds its backing file is not the evidence
+        // partition or dm/md target. A loop device has none, also under a
+        // partition or dm/md target: the disk that holds its backing file is
+        // not the evidence
+        let single_loop = match id.parent_disks.as_slice() {
+            [one] => Some(one.trim_start_matches("/dev/").to_string()).filter(|d| sys.is_loop(d)),
+            _ => None,
+        };
         let hw = match &id.kind {
             SourceKind::Disk => Some(kname.clone()),
             SourceKind::Other | SourceKind::Loop { .. } => None,
-            _ if id.parent_disks.len() == 1 => {
+            _ if id.parent_disks.len() == 1 && single_loop.is_none() => {
                 Some(id.parent_disks[0].trim_start_matches("/dev/").to_string())
             }
             _ => None,
@@ -243,6 +249,14 @@ impl<'a> Prober<'a> {
             id.probe_notes.push(format!(
                 "loop device over {}: no hardware model or serial number applies",
                 backing_file.as_deref().unwrap_or("an unknown backing file")
+            ));
+        } else if let Some(lo) = &single_loop {
+            id.probe_notes.push(format!(
+                "stored on the loop device /dev/{lo} over {}: no hardware model or serial number applies",
+                sys.attr(lo, "loop/backing_file")
+                    .and_then(|v| sanitize_opt(&v))
+                    .as_deref()
+                    .unwrap_or("an unknown backing file")
             ));
         } else if !matches!(id.kind, SourceKind::Other) {
             id.probe_notes.push(format!(
@@ -260,7 +274,7 @@ impl<'a> Prober<'a> {
                 if id.dm_name.is_none() {
                     id.dm_name = props.get("DM_NAME").and_then(|v| sanitize_opt(v));
                 }
-                if hw.as_deref() == Some(kname.as_str()) || is_partition {
+                if hw.as_deref() == Some(kname.as_str()) || (is_partition && hw.is_some()) {
                     apply_hw_udev(&mut id, &props);
                 }
             }
@@ -690,6 +704,154 @@ mod tests {
             .iter()
             .any(|n| n.contains("/images/suspect.img")));
         assert_eq!(by_diskseq_name(&id).as_deref(), Some("9"));
+    }
+
+    /// A file whose `st_dev` is a real block device number (major != 0):
+    /// dfcore resolves a loop device backed by it to that device. A file in
+    /// the temporary directory, else this crate's manifest; `None` when both
+    /// live on a filesystem with an anonymous device (tmpfs, btrfs).
+    fn file_on_a_block_device(tmp: &Path) -> Option<(PathBuf, DevNum)> {
+        use std::os::unix::fs::MetadataExt;
+        let image = tmp.join("evidence.dd");
+        std::fs::write(&image, b"an image file on the host's disk").unwrap();
+        [
+            image,
+            PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")),
+        ]
+        .into_iter()
+        .find_map(|p| {
+            let dev = std::fs::metadata(&p).ok()?.dev() as libc::dev_t;
+            let dev = (libc::major(dev) as u32, libc::minor(dev) as u32);
+            (dev.0 != 0).then_some((p, dev))
+        })
+    }
+
+    #[test]
+    fn a_mapping_over_a_loop_device_never_takes_the_host_disk_identity() {
+        // S-N1: an evidence image file on the host's own disk (nvme0n1),
+        // opened as loop0, with a LUKS mapping (dm-0), a kpartx partition
+        // (dm-1) and a loop partition (loop0p1) over it. None of them may
+        // take the host disk's identity, and nothing may be sent to it
+        let tmp = tempfile::tempdir().unwrap();
+        let (backing, st_dev) = file_on_a_block_device(tmp.path())
+            .unwrap_or_else(|| (tmp.path().join("evidence.dd"), (259, 1)));
+        // Device numbers of the fake tree, none equal to the file's
+        let mut minor = 200u32;
+        let mut fresh = |major: u32| loop {
+            minor += 1;
+            if (major, minor) != st_dev {
+                break (major, minor);
+            }
+        };
+        let (host_disk, loop_dev, dm0, dm1, loop_part) = (
+            fresh(st_dev.0),
+            fresh(7),
+            fresh(254),
+            fresh(254),
+            fresh(259),
+        );
+        let f = FakeSysfs::new();
+        f.add_disk(NVME, "nvme0n1", host_disk, 1_000_000);
+        f.set_hw(NVME, "serial", "HOST-SYSTEM-SSD");
+        f.set_hw(NVME, "model", "Host NVMe");
+        f.set("nvme0n1", "wwid", "eui.00000000000000aa");
+        f.add_partition("nvme0n1", "nvme0n1p1", st_dev, 1, 2048, 900_000);
+        f.add_loop("loop0", loop_dev, 4096, &backing.to_string_lossy());
+        f.add_partition("loop0", "loop0p1", loop_part, 1, 2048, 1024);
+        f.add_virtual("dm-0", dm0, 2000);
+        f.set("dm-0", "dm/uuid", "CRYPT-LUKS2-abc-evidence");
+        f.stack("dm-0", "loop0");
+        f.add_virtual("dm-1", dm1, 1024);
+        f.set("dm-1", "dm/name", "loop0p2");
+        f.stack("dm-1", "loop0");
+        let sys = f.root();
+        if file_on_a_block_device(tmp.path()).is_some() {
+            // dfcore follows the loop device to the host disk (the
+            // destination check needs that); the identity must not
+            assert_eq!(
+                sys.topology()
+                    .backing_disks("dm-0")
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                ["nvme0n1"]
+            );
+        }
+        assert_eq!(
+            sys.storage_disks("dm-0").into_iter().collect::<Vec<_>>(),
+            ["loop0"]
+        );
+
+        let runner = crate::discovery::runner::ScriptedRunner::new();
+        let node_dev = |_: &Path| Some(host_disk);
+        let env = crate::discovery::runner::ProbeEnv {
+            sys: f.root(),
+            dev_dir: PathBuf::from("/nonexistent-dev"),
+            node_dev: &node_dev,
+            runner: &runner,
+        };
+        for (path, kname, dev) in [
+            ("/dev/dm-0", "dm-0", dm0),
+            ("/dev/mapper/loop0p2", "dm-1", dm1),
+            ("/dev/loop0p1", "loop0p1", loop_part),
+        ] {
+            let id = Prober::sysfs_only(f.root()).probe_block(path, dev).unwrap();
+            assert_eq!(id.kernel_name, kname);
+            assert_eq!(id.parent_disks, ["/dev/loop0"], "{kname}");
+            assert_eq!(id.hardware_of, None, "{kname}");
+            assert_eq!(id.serial, None, "{kname}");
+            assert!(id.serial_candidates.is_empty(), "{kname}");
+            assert_eq!(id.model, None, "{kname}");
+            assert_eq!(id.wwn, None, "{kname}");
+            if kname != "loop0p1" {
+                assert!(
+                    id.probe_notes
+                        .iter()
+                        .any(|n| n.starts_with("stored on the loop device /dev/loop0 over ")),
+                    "{kname}: {:?}",
+                    id.probe_notes
+                );
+            }
+            // No physical disk: capacity and SMART probes send nothing
+            let err = crate::discovery::runner::physical_disk(&env, &id).unwrap_err();
+            assert!(err.contains("loop device /dev/loop0"), "{kname}: {err}");
+            // Write protection: the loop node (the "disk") and the source,
+            // never the host disk or its partitions
+            let mi = format!(
+                "22 1 {}:{} / / rw - ext4 /dev/nvme0n1p1 rw\n",
+                st_dev.0, st_dev.1
+            );
+            let inputs = crate::discovery::writeprotect::decision_inputs(&sys, &id, &mi);
+            assert_eq!(
+                inputs
+                    .disks
+                    .iter()
+                    .map(|d| d.node.as_str())
+                    .collect::<Vec<_>>(),
+                ["loop0"],
+                "{kname}"
+            );
+            let decision = crate::discovery::writeprotect::decide(
+                crate::models::config::WriteProtectPolicy::Auto,
+                &inputs,
+            );
+            let crate::discovery::writeprotect::WriteProtectDecision::Set { nodes, .. } = decision
+            else {
+                panic!("{kname}: {decision:?}")
+            };
+            assert!(nodes.contains(&"loop0".to_string()), "{kname}: {nodes:?}");
+            assert!(nodes.contains(&kname.to_string()), "{kname}: {nodes:?}");
+            assert!(
+                !nodes.iter().any(|n| n.starts_with("nvme")),
+                "{kname}: {nodes:?}"
+            );
+        }
+        assert!(runner.calls().is_empty());
+
+        // The loop device itself names no disk either
+        let id = Prober::sysfs_only(f.root())
+            .probe_block("/dev/loop0", loop_dev)
+            .unwrap();
+        assert!(id.parent_disks.is_empty(), "{:?}", id.parent_disks);
     }
 
     #[test]

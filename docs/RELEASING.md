@@ -94,7 +94,9 @@ Everything else in that recipe is maintained by hand and has to follow
   dfdisk directory) so that `path = "../dfcore"` resolves.
 
 The job prints a warning for every runtime tool the recipe does not mention.
-Update the recipe in nur-packages before or right after pushing the tag.
+Push the recipe changes to nur-packages before the tag: the job's guard fails
+on a recipe without `DFDISK_GIT_REV`. If update-nur fails, fix the recipe and
+re-run the job.
 
 ## dfnix
 

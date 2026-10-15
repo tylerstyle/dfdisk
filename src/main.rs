@@ -14,6 +14,14 @@ use std::io::Write;
 async fn main() {
     let code = match Cli::try_parse() {
         Err(e) => {
+            if e.use_stderr() {
+                // --json: the usage error as the one JSON document on stdout
+                let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+                if let Some(doc) = dfdisk::cli::usage_error_document(&args, &e.render().to_string())
+                {
+                    println!("{doc}");
+                }
+            }
             let _ = e.print();
             if e.use_stderr() {
                 exit_code::USAGE

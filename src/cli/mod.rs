@@ -78,9 +78,13 @@ async fn dispatch(
 
 /// Run `run` (a command or the TUI) and turn a panic into exit code 1
 /// (internal error) with a message on stderr, instead of Rust's 101 (T6).
-/// The panic hook has already printed where it happened; unwinding has run
-/// the audit guards ("acquisition_finished" with exit code 1) and the TUI's
-/// hook has restored the terminal.
+/// The panic hook has already printed where it happened; for a command,
+/// whose run is this future, unwinding has run the audit guards
+/// ("acquisition_finished" with exit code 1). The TUI catches a panic of its
+/// own UI itself, restores the terminal and, before it returns, aborts a
+/// running job and waits for its report and audit record and for a running
+/// unmount (`tui::finish_background_work`), since the process exits right
+/// after this returns.
 pub async fn exit_code_or_internal_error<F>(run: F) -> i32
 where
     F: std::future::Future<Output = i32>,
@@ -135,6 +139,46 @@ async fn unmount_to_the_end<T>(
             )),
         }
     }
+}
+
+/// Whether the command line asks for JSON output (I-J1), read without the
+/// parser (for an argument error, which the parser could not turn into a
+/// command): `--json` before a `--`, or for `list` its short `-j`, also in a
+/// group of short flags.
+pub fn wants_json(args: &[std::ffi::OsString]) -> bool {
+    let args: Vec<String> = args
+        .iter()
+        .skip(1)
+        .take_while(|a| a.as_os_str() != "--")
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let list = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        == Some("list");
+    args.iter().any(|a| {
+        a == "--json"
+            || (list
+                && a.len() > 1
+                && a.starts_with('-')
+                && !a.starts_with("--")
+                && a[1..].chars().all(|c| c.is_ascii_alphabetic())
+                && a.contains('j'))
+    })
+}
+
+/// The JSON error document of an argument error (`kind` usage, exit code 2)
+/// for a command line that asked for JSON: every command prints one JSON
+/// document with `--json`, an argument error included.
+pub fn usage_error_document(args: &[std::ffi::OsString], message: &str) -> Option<String> {
+    if !wants_json(args) {
+        return None;
+    }
+    let message = message.trim();
+    let message = message.strip_prefix("error: ").unwrap_or(message);
+    let e = AcquisitionError::usage(crate::models::text::sanitize_line(message));
+    serde_json::to_string_pretty(&acquire::error_json(&e)).ok()
 }
 
 /// The exit code of a command's result; an error is printed once (stderr,

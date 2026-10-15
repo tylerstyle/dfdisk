@@ -40,6 +40,7 @@ case-insensitively (exFAT, NTFS and FAT destinations).
 | `<base>.map` | rescue engine | GNU ddrescue mapfile |
 | `<base>.identity.json` | rescue engine | identity of the source at the first start; a resume requires the same device |
 | `<base>.info.session-N`, `<base>.info.session-N.json` | rescue engine | the reports of an earlier session, kept when a rescue is resumed |
+| `<base>.zeroed-N.bin`, `<base>.zeroed-N.tsv` | rescue engine, session N, only when needed | the bytes that sectors of bad-sector (`-`) areas held before dfdisk wrote zeros over them (data a session killed before ddrescue saved its map left there, also sectors a retry pass read): `.bin` holds them concatenated, `.tsv` one line per run of sectors with the tab-separated header `image_offset`, `length`, `bin_offset`, `sha256` (byte offset in the image, length in bytes, byte offset in the `.bin` file, SHA-256 of those bytes). Created new, fsynced with the directory before the first zero is written, never overwritten; listed as auxiliary files with their SHA-256 and named in the notes. Nothing is written when no bad-sector area held data |
 | `<base>.smart-before.json` | acquisitions with `--smart basic` or `full` | raw `smartctl -j` output before the acquisition |
 | `<base>.smart-after.json` | rescue | raw `smartctl -j` output after the rescue |
 | `<base>.smart-before-N.json`, `<base>.smart-after-N.json` | resumed rescue | later SMART snapshots never overwrite earlier ones |
@@ -98,7 +99,7 @@ bidirectional overrides) become a space. Missing case values read
 | ACQUISITION SETTINGS (APPLIED) | only what the engine applied: engine, format, digests (E01 always includes MD5), compression and segments (E01 only), retries, read-error policy, error granularity, media type, piece size, second source read, SMART and write-protection policy |
 | TIMESTAMPS & CLOCK | start and end (UTC, labelled "host system time, NOT synchronized" unless NTP synchronisation was confirmed), elapsed time from the monotonic clock, average speed, time zone and UTC offset, NTP state, RTC offset |
 | READ ERRORS | summaries per kind, then the ranges (offset and length in bytes, sectors, status): the first 200 ranges, all of them in the JSON report; which tool the list comes from; sector size |
-| HASHES | "Acquisition stream (computed while reading the source)" and "Image re-read (recomputed from the written image)" |
+| HASHES | "Acquisition stream (computed while reading the source)" and "Image re-read (recomputed from the written image)"; an image without digests says why: "the image was not re-read", "the image re-read failed: <reason>" or the reason it was not possible (an abort) |
 | VERIFICATION | result, method, second source read, piecewise SHA-256 file. "VERIFIED - ALL HASHES MATCH" appears only for verdict VERIFIED; otherwise the result is followed by "(overall verdict: …)" |
 | FILES | image files; auxiliary files with SHA-256 |
 | TOOL PROVENANCE | dfdisk and dfcore version and git revision, dfnix revision, kernel, host name, versions of the external tools used, every command run (argv, start, end, exit status) |
@@ -161,7 +162,7 @@ report prints "(not provided)").
 | `read_errors` | object | `sector_size`, `ranges` (`[{offset, length, kind}]`), `source` (see below) |
 | `acquisition_hashes` | object | `md5`, `sha1`, `sha256` (string or null), computed while reading the source |
 | `image_hashes` | object | the same digests recomputed from the written image |
-| `verification` | object | `result`, `method`, `source_reread` (see below) |
+| `verification` | object | `result`, `method`, `source_reread`, `image` (see below) |
 | `piecewise` | object or null | `piece_size`, `file`, `file_sha256`, `count` |
 | `image_files` | array of string | the image file(s) |
 | `auxiliary_files` | array | `[{path, sha256}]` |
@@ -188,8 +189,11 @@ byte, sorted, non-overlapping, with adjacent ranges of the same kind merged:
 
 ### Verification result
 
-`verification.result` and `verification.source_reread` (the second read of the
-source with `--verify-source`; null when there was none) are tagged objects:
+`verification.result` (the verification as a whole), `verification.image` (the
+written image alone, before the second read was taken into account; missing in
+reports of earlier versions) and `verification.source_reread` (the second read
+of the source with `--verify-source`; null when there was none) are tagged
+objects:
 
 ```json
 {"status": "matched", "method": "ewfverify -d md5"}
@@ -197,6 +201,14 @@ source with `--verify-source`; null when there was none) are tagged objects:
 {"status": "not_possible", "reason": "..."}
 {"status": "failed", "reason": "..."}
 ```
+
+An image that failed its verification keeps its own reason in
+`verification.result`, followed by "; second source read: " and the second
+read's result. "the second source read failed: …" names only a second read that
+failed itself. A second read with nothing to compare with (a rescue image that
+could not be hashed, so neither stream nor image digests exist) is
+`not_possible` ("nothing to compare with: …"), and the source is then not read a
+second time.
 
 A second source read that differs makes the verdict MISMATCH, labelled by what
 was compared: with acquisition digests (E01, RAW) "the source changed or reads
@@ -210,7 +222,13 @@ lists areas that were not tried or not finished" only when the map has such
 areas and nothing else stopped the run (otherwise the explanation names the
 stop or the identity change); a VERIFIED rescue says that its image digests
 equal a second, independent read of the source; an ABORTED or INCOMPLETE run
-says "its digests cover only what was acquired" only when digests exist.
+says "its digests cover only what was acquired" only when digests exist; an
+INCOMPLETE run that has every byte of the source in its image and no unread
+area, but did not end cleanly (ddrescue's exit status, an image that could not
+be fsynced, …), says "every byte of the source is in the image, but the run did
+not end cleanly (the reason follows), so it is not counted as complete" (with
+bad sectors: "the image covers the whole source (its unreadable sectors are
+zeros in it)") instead of calling the image partial.
 
 ## Other JSON output (`--json`)
 
@@ -226,7 +244,7 @@ With `--json` every command prints one pretty-printed JSON document on stdout
 | `check --json` | `schema_version` 1, `ready` (bool), `device`, `engine`, `output_dir`, `base_name`, `identity` (as `source` in the report), `tool_source_path`, `effective_config`, `write_protection` (as found), `write_protection_plan` (string), `destination` (facts), `capacity`, `smart`, `missing_tools` (the programs the engine runs that are not installed, `[]` when none is missing), `problems` (`[{step, kind, message}]`; `step` is `request`, `identity`, `source safety`, `exclusive open`, `destination`, `tools` or `capacity`; `kind` is `usage`, `refused` or `failed`), `notes`. Fields that were not reached are null |
 | `verify --json` | `{schema_version: 1, verification, exit_code}`; `verification`: `image`, `read_path`, `segments`, `format` (`ewf`, `raw`), `method`, `computed`, `stored` (digests an EWF image stores), `expected` (`md5`, `sha1`, `sha256`, `source`, `report_image_files`, `report_outcome`, `report_pieces`), `checks` (`[{algorithm, expected, computed, status, reference}]`, `status` `match`, `mismatch` or `not_computed`), `pieces` (or null), `result` (as `verification.result` above), `exit_code`, `started_at`, `ended_at`, `elapsed_seconds`, `clock`, `addendum`, `addendum_sha256`, `audit_record`, `warnings` |
 | `unmount --json` | `schema_version` 1, `device`, `mounts_before`, `unmounted`, `holders`, `audit_record` (hash of the `unmount` record or null), `audit_error`, `notes` |
-| any command that ends with an error | `{schema_version: 1, error: {kind, exit_code, message}}`, `kind` one of `usage`, `refused`, `failed`, `aborted` |
+| any command that ends with an error | `{schema_version: 1, error: {kind, exit_code, message}}`, `kind` one of `usage`, `refused`, `failed`, `aborted`. An argument error the parser reports (an unknown option, a malformed digest) is this document too (`usage`, exit code 2) when the command line has `--json` (or `list`'s `-j`) before any `--`; the parser's message also goes to stderr |
 
 Paths in these documents are absolute (the name as typed, made absolute; not
 resolved through symlinks).

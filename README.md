@@ -55,7 +55,7 @@ registry and writes to the hash-chained dfnix audit log.
 |--------|---------------|--------|---------|--------------------|
 | E01 | `--format e01` (default) | `<base>.E01`, `.E02`, … written by `ewfacquire` (compression and segment size selectable) | MD5 always, SHA-1 and SHA-256 selectable; verified with `ewfverify` | ewfacquire replaces them with zeros; dfdisk takes the exact ranges from the error list stored in the image (`ewfinfo -e`) and from ewfacquire's output. A source that ends before its size while ewfacquire waits for it (60 s without progress, and the source is gone or smaller) is stopped by dfdisk: INCOMPLETE, "source lost at offset X" |
 | RAW | `--format raw` | `<base>.raw`, one file | MD5, SHA-1, SHA-256 computed by dfdisk while reading, plus a piecewise SHA-256 per `--piece-size` (default 1 GiB); the image is re-read and hashed again | `--on-read-error stop` (default): stop at the first unreadable sector, report its exact offset, verdict INCOMPLETE; `--on-read-error zero-fill`: replace each unreadable sector by zeros, record every range, continue |
-| Rescue | `--rescue` | `<base>.raw` and the ddrescue mapfile `<base>.map` | computed from the image after the rescue; `--verify-source` reads the source a second time and compares | taken from the ddrescue map: bad sectors are zeros in the image (after every ddrescue run dfdisk writes the zeros itself, so data an interrupted earlier session left there does not stay), untried or unfinished areas make the run INCOMPLETE; a rescue can be resumed on the same device |
+| Rescue | `--rescue` | `<base>.raw` and the ddrescue mapfile `<base>.map` | computed from the image after the rescue; `--verify-source` reads the source a second time and compares | taken from the ddrescue map: bad sectors are zeros in the image (after every ddrescue run dfdisk writes the zeros itself, so data an interrupted session left there does not stay; such data is first kept in `<base>.zeroed-N.bin` with its offsets and SHA-256 in `<base>.zeroed-N.tsv`), untried or unfinished areas make the run INCOMPLETE; a rescue can be resumed on the same device |
 
 `--rescue-to-e01` converts a finished rescue image into an E01 next to it. The
 read-error summary of the rescue goes into the E01 notes, with its zero-filled
@@ -249,15 +249,21 @@ until it is acknowledged; when the TUI ends before a result was acknowledged
 shows the keys of the current screen. Esc goes back and never aborts an
 acquisition; aborting asks for confirmation. The TUI also converts images,
 re-verifies an image against its report, resumes a rescue, and remembers
-examiner, authority and the last destination in
+examiner, authority, the last destination and the last case and evidence
+numbers (offered as suggestions for the next case) in
 `$XDG_CONFIG_HOME/dfdisk/profile.toml`. The converter fills its empty case
 number, evidence number, examiner and description fields from the image's
-`.info.json` and names the fields it took; when the source changes, the values
-taken from the earlier image's report that were not edited are emptied. Case
-values the converter form has no field for (EA, authority, seal number, seizure
-time and place) come from the report the converter uses. Notices are wrapped
+report (the one the conversion uses: `<base>.info.json` or
+`<base>.conversion.info.json` next to the image, only when it lists the image)
+and names the fields it took; when the source changes, the values taken from
+the earlier image's report that were not edited are emptied. Case values the
+converter form has no field for (EA, authority, seal number, seizure time and
+place) come from that report. The conversion's confirmation sheet shows the
+case values the conversion records (E01 header < report < form), each with
+where it comes from, and names a report next to the image that describes
+another image and is not used. Notices are wrapped
 rather than cut, the ones that do not fit are counted, and Ctrl+X dismisses only
-the notices shown.
+the notices shown on the screen (none while the terminal is too small).
 
 ### Command line
 
@@ -443,8 +449,9 @@ identify-class queries that the report records.
   a device with mounted filesystems (in dfdisk's mount namespace; a mount in
   another namespace makes the exclusive open below fail) or active swap, and a
   device with holders (dm-crypt, LVM, md, or a loop device whose backing file is
-  the source or one of its partitions; mounts of such a loop device count as
-  mounts of the source): a holder keeps the device open, so it has to be closed
+  the source or one of its partitions, or its disk or another device below it
+  with a byte range that includes the source; mounts of such a loop device, and
+  of its partitions that lie on the source, count as mounts of the source): a holder keeps the device open, so it has to be closed
   first (there is no override). Unmounting is a separate, explicit, audited
   action (`dfdisk unmount`, `--auto-unmount`) that refuses system mounts and
   protected devices and never forces or lazily unmounts.
@@ -460,7 +467,9 @@ identify-class queries that the report records.
   kernel read-only flag (BLKROSET) on the source node, its own partitions, every
   node it sits on down to the disk (the partition and intermediate dm/md devices
   under a LUKS, LVM or md source) and the disk(s) it is stored on together with
-  every partition node of those disks. A disk that has other mounted filesystems
+  every partition node of those disks. Under a mapping of an image file (LUKS or
+  kpartx over a loop device) the loop device counts as the disk: the host disk
+  that holds the file is never touched, identified or queried. A disk that has other mounted filesystems
   stays writable together with its partitions outside the source's chain (as
   does a node of the chain that another mounted device depends on); the report
   names exactly the nodes left writable. It refuses if a flag cannot be set,
@@ -471,7 +480,8 @@ identify-class queries that the report records.
   the audit "acquisition_started" record is written. On dfnix an audit log that
   cannot be written refuses the acquisition.
 - **Hidden areas.** `hdparm -N` and `hdparm --dco-identify` (ATA) or
-  `nvme id-ns` (NVMe) run on the physical disk, read-only, with a timeout. A
+  `nvme id-ns` (NVMe) run on the physical disk (there is none under a loop
+  device), read-only, with a timeout. A
   host protected area or device configuration overlay is a loud warning and is
   recorded; `--refuse-hidden-areas` turns it into a refusal. dfdisk never changes
   them.

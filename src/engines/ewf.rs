@@ -25,9 +25,10 @@
 //! - **Source loss.** When the source's node disappears (or is another device
 //!   now), ewfacquire stops with FAILURE (libsmdev re-checks the path after a
 //!   read error). When it does not notice and zero-fills to the end of the
-//!   medium, a read-error range that runs to the end together with a vanished
-//!   or replaced source becomes "source lost at offset X" (the range is then
-//!   `Unread`: those zeros are not source data). The session re-checks the
+//!   medium, a read-error range that runs to the end together with a vanished,
+//!   replaced or smaller source (checked after ewfacquire ended: presence and
+//!   size) becomes "source lost at offset X" (the range is then `Unread`:
+//!   those zeros are not source data). The session re-checks the
 //!   identity as well. When the source ends before its probed size while it
 //!   stays attached (a shrunk file, a device reporting less), ewfacquire
 //!   waits for data forever: after [`SOURCE_STALL_SECS`] without progress the
@@ -1061,7 +1062,8 @@ pub struct EwfFacts {
     pub info_errors: Option<Result<RunBlock, String>>,
     /// `ewfinfo -m`
     pub info_media: Option<Result<EwfMediaInfo, String>>,
-    /// [`source_presence`] after ewfacquire ended
+    /// [`source_still_there`] after ewfacquire ended: the source is present
+    /// with at least the size it had at the start (Err: why not)
     pub source_presence: Result<(), String>,
     /// dfdisk stopped ewfacquire because it made no progress and the source
     /// was gone or smaller (E-1): why ("source lost at offset X ...")
@@ -1444,17 +1446,18 @@ pub fn assemble(f: &EwfFacts) -> Result<EngineOutput, AcquisitionError> {
                     format_iec(start)
                 ));
                 notes.push(format!(
-                    "ewfacquire stored zeros for the {} bytes from offset {start} to the end after the source was lost; they are not source data and are listed as not acquired",
+                    "ewfacquire stored zeros for the {} bytes from offset {start} to the end after the source was lost or became smaller; they are not source data and are listed as not acquired",
                     end.saturating_sub(start)
                 ));
             } else {
                 notes.push(format!(
-                    "the read errors extend from offset {start} to the end of the medium; the source was still present afterwards"
+                    "the read errors extend from offset {start} to the end of the medium; the source was still present afterwards, with at least the {} bytes it had at the start",
+                    f.expected_bytes
                 ));
             }
         } else if let Some(why) = loss {
             notes.push(format!(
-                "after ewfacquire finished, the source was no longer present: {why}"
+                "after ewfacquire finished, the source was gone or smaller than at the start: {why}"
             ));
         }
         if !detail.is_empty() {
@@ -1702,7 +1705,13 @@ pub async fn acquire(ctx: &EngineContext) -> Result<EngineOutput, AcquisitionErr
         log_file: log.exists().then_some(log),
         info_errors,
         info_media,
-        source_presence: source_presence(&ctx.identity),
+        // E-NEW-2: presence AND size, as the stall watch checks it
+        source_presence: source_still_there(
+            &ctx.identity,
+            expected,
+            Path::new("/sys/dev/block"),
+            &block_rdev,
+        ),
         stalled,
     };
     let out = assemble(&facts)?;

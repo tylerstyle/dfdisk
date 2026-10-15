@@ -152,6 +152,54 @@ impl SysRoot {
         out
     }
 
+    /// Whether `kname` is a loop device (it has `loop/`).
+    pub fn is_loop(&self, kname: &str) -> bool {
+        self.node(kname).is_some_and(|n| n.join("loop").is_dir())
+    }
+
+    /// The disks `kname` is stored on, by kernel name: follows `slaves/`
+    /// (dm, md) and a partition to its disk, and STOPS at a loop device,
+    /// which counts as the disk (S-N1). The disk that holds a loop device's
+    /// backing file is the host's: its hardware identity is not the
+    /// evidence's, and nothing (SMART, hdparm, nvme, BLKROSET) may be sent to
+    /// it. dfcore's [`BlockTopology::backing_disks`] follows loop devices to
+    /// that disk, which only the destination-disjointness check needs.
+    pub fn storage_disks(&self, kname: &str) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        self.collect_storage(kname, 0, &mut out);
+        out
+    }
+
+    fn collect_storage(
+        &self,
+        kname: &str,
+        depth: usize,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        if depth > 16 || self.is_loop(kname) {
+            // A loop device is a disk here; an unexpectedly deep stack keeps
+            // the device itself
+            out.insert(kname.to_string());
+            return;
+        }
+        let slaves = self.slaves(kname);
+        if !slaves.is_empty() {
+            for s in slaves {
+                self.collect_storage(&s, depth + 1, out);
+            }
+            return;
+        }
+        match self.parent_disk(kname) {
+            // The disk of a partition (a loop device's partition: the loop)
+            Some(disk) => {
+                out.insert(disk);
+            }
+            None => {
+                out.insert(kname.to_string());
+            }
+        }
+    }
+
     pub fn diskseq(&self, kname: &str) -> Option<u64> {
         self.topology().diskseq(kname)
     }

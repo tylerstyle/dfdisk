@@ -56,6 +56,14 @@ pub trait TuiBackend: Send + Sync {
         stop: StopFlags,
     ) -> BoxFuture<'static, Result<ForensicInfoReport, AcquisitionError>>;
 
+    /// The case values a conversion of `request` will record, each with
+    /// where it comes from (`engines::converter::preview_case`: the same
+    /// report and E01 header as the conversion; reads only). Blocking.
+    fn conversion_case(
+        &self,
+        request: &ConversionRequest,
+    ) -> Result<converter::CasePreview, String>;
+
     /// An image conversion (`engines::converter::convert`).
     fn convert(
         &self,
@@ -121,6 +129,13 @@ impl TuiBackend for HostBackend {
         stop: StopFlags,
     ) -> BoxFuture<'static, Result<ForensicInfoReport, AcquisitionError>> {
         Box::pin(async move { session::run_with(&HostSystem, request, progress, stop).await })
+    }
+
+    fn conversion_case(
+        &self,
+        request: &ConversionRequest,
+    ) -> Result<converter::CasePreview, String> {
+        converter::preview_case(request).map_err(|e| e.message)
     }
 
     fn convert(
@@ -218,6 +233,13 @@ impl TuiBackend for OfflineBackend {
         _stop: StopFlags,
     ) -> BoxFuture<'static, Result<ForensicInfoReport, AcquisitionError>> {
         Box::pin(async { Err(offline()) })
+    }
+
+    fn conversion_case(
+        &self,
+        _request: &ConversionRequest,
+    ) -> Result<converter::CasePreview, String> {
+        Err(offline().message)
     }
 
     fn convert(

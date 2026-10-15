@@ -307,6 +307,55 @@ async fn source_lost_after_zero_filling_to_the_end_is_incomplete() {
 }
 
 #[tokio::test]
+async fn a_source_smaller_after_zero_filling_to_the_end_is_lost_there() {
+    // E-NEW-2: ewfacquire zero-fills everything from 1 MiB on and completes;
+    // afterwards the source is still there but has only 1 MiB. The zeros
+    // are not source data, and no note says the source was still present
+    let Some(run) = acquire(
+        "SHRUNK1",
+        &[
+            ("FAKEDEV_DIE_AT", "1048576"),
+            ("FAKEDEV_SHRINK_AFTER", "1048576"),
+        ],
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let report = run.result.unwrap();
+    assert_eq!(report.outcome, Outcome::Incomplete);
+    assert!(run.src.exists());
+    assert_eq!(std::fs::metadata(&run.src).unwrap().len(), MIB);
+    let reason = report.stop_reason.clone().unwrap();
+    assert!(
+        reason.starts_with(
+            "source lost at offset 1048576 (1 MiB): the source has 1048576 bytes now, 4194304 bytes when the acquisition started"
+        ),
+        "{reason}"
+    );
+    assert_eq!(report.bytes_acquired, MIB);
+    assert!(
+        !report.notes.iter().any(|n| n.contains("still present")),
+        "{:?}",
+        report.notes
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("after the source was lost or became smaller")),
+        "{:?}",
+        report.notes
+    );
+    let (_, json) = read_files(&report);
+    assert_eq!(
+        json_ranges(&json),
+        vec![(MIB, 3 * MIB, "unread".to_string())]
+    );
+}
+
+#[tokio::test]
 async fn medium_failing_to_the_end_while_attached_is_read_errors() {
     let Some(run) = acquire("TAIL1", &[("FAKEDEV_DIE_AT", "1048576")], None).await else {
         return;
@@ -320,6 +369,13 @@ async fn medium_failing_to_the_end_while_attached_is_read_errors() {
         vec![(MIB, 3 * MIB, "substituted".to_string())]
     );
     assert!(run.src.exists());
+    assert!(
+        report.notes.iter().any(|n| n.contains(
+            "the source was still present afterwards, with at least the 4194304 bytes it had at the start"
+        )),
+        "{:?}",
+        report.notes
+    );
 }
 
 #[tokio::test]

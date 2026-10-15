@@ -302,6 +302,17 @@ impl TuiBackend for Fake {
         })
     }
 
+    fn conversion_case(
+        &self,
+        request: &ConversionRequest,
+    ) -> Result<dfdisk::engines::converter::CasePreview, String> {
+        // The converter's own merge, without running ewfinfo
+        dfdisk::engines::converter::preview_case_with(request, &|_| {
+            Err("ewfinfo is not run in this test".to_string())
+        })
+        .map_err(|e| e.message)
+    }
+
     fn convert(
         &self,
         request: ConversionRequest,
@@ -1422,14 +1433,20 @@ fn image_with_report(dir: &Path, stem: &str, case: &str, ev: &str, seal: &str) -
     };
     let id = identity_of(&dev);
     let cfg = dfdisk::models::config::AcquisitionConfig::for_engine(EngineKind::Raw, dir);
-    let r = ForensicInfoReport::new(
+    let mut r = ForensicInfoReport::new(
         EngineKind::Raw,
         &meta,
         id.clone(),
         EffectiveConfig::build(&cfg, Some(&id)),
     );
+    r.image_files = vec![image.display().to_string()];
     std::fs::write(dir.join(format!("{stem}.info.json")), r.to_json()).unwrap();
     image
+}
+
+/// The text of the confirmation sheet, one line per row.
+fn sheet_string(app: &App) -> String {
+    sheet_text(app).join("\n")
 }
 
 #[tokio::test]
@@ -1526,12 +1543,14 @@ async fn the_converter_never_keeps_the_previous_images_case_values() {
 
 /// C-5: the converter form has no report field, so a report the TUI passes
 /// is one it found next to the image. It goes to the converter as found
-/// (`source_report_auto`): one that describes another image, such as the
+/// (`source_report_auto`). I-N2: the TUI applies the converter's rule itself:
+/// a report next to the image that describes another image, such as the
 /// rescue report `x.info.json` (listing `x.raw`) next to the E01 that
-/// --rescue-to-e01 made, is ignored with a note instead of refusing the
-/// conversion as a given --report would.
+/// --rescue-to-e01 made, is not this image's report: it pre-fills nothing,
+/// is not passed on, does not choose the typed confirmation, and the sheet
+/// says why.
 #[tokio::test]
-async fn a_report_the_tui_found_is_passed_as_found_not_as_given() {
+async fn a_report_of_another_image_is_never_taken_for_this_one() {
     let dir = tempfile::tempdir().unwrap();
     let raw = image_with_report(dir.path(), "x", "CASE-X", "EV-X", "");
     let e01 = dir.path().join("x.E01");
@@ -1540,17 +1559,75 @@ async fn a_report_the_tui_found_is_passed_as_found_not_as_given() {
     let mut app = app_with(&fake);
     app.handle_key(key(KeyCode::Char('c')));
     typ(&mut app, &e01.display().to_string());
-    pump(&mut app, "report next to the E01", |app| {
+    pump(&mut app, "the look at the E01", |app| {
         app.conv.facts.as_ref().is_some_and(|f| f.path == e01)
     })
     .await;
-    let found = app.conv.facts.as_ref().unwrap().report.clone();
+    let facts = app.conv.facts.clone().unwrap();
     assert_eq!(
-        found.map(|r| r.path),
-        Some(dir.path().join("x.info.json")),
-        "the report of {} next to the E01",
+        facts.report,
+        None,
+        "x.info.json describes {}",
         raw.display()
     );
+    assert!(
+        facts
+            .report_notes
+            .iter()
+            .any(|n| n.contains("x.info.json was not used: it does not list x.E01")),
+        "{:?}",
+        facts.report_notes
+    );
+    assert_eq!(app.conv.case.case_number, "", "nothing pre-filled");
+    // The examiner gives the case values
+    app.conv.case.case_number = "CASE-E".into();
+    app.conv.case.evidence_number = "EV-E".into();
+    app.conv.case.examiner = "Conv Examiner".into();
+    app.conv.destination = dir.path().join("out").display().to_string();
+    app.handle_key(key(KeyCode::F(5)));
+    pump(&mut app, "sheet", |app| {
+        app.confirm.as_ref().is_some_and(|c| !c.pending)
+    })
+    .await;
+    let sheet = sheet_string(&app);
+    assert!(
+        sheet.contains("x.info.json was not used: it does not list x.E01"),
+        "{sheet}"
+    );
+    // No serial from a report of another image: the evidence number confirms
+    typ(&mut app, "serx");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.screen,
+        Screen::Confirm,
+        "the serial of x.raw does not confirm"
+    );
+    app.confirm.as_mut().unwrap().typed.clear();
+    typ(&mut app, "ev-e");
+    app.handle_key(key(KeyCode::Enter));
+    pump(&mut app, "conversion result", |app| {
+        app.screen == Screen::Result
+    })
+    .await;
+    let req = fake.s().conversions[0].clone();
+    assert_eq!(req.source, e01);
+    assert_eq!(req.source_report, None);
+}
+
+/// A report the TUI found that lists the image goes to the converter as
+/// found (`source_report_auto`, C-5).
+#[tokio::test]
+async fn a_report_the_tui_found_is_passed_as_found_not_as_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = image_with_report(dir.path(), "x", "CASE-X", "EV-X", "");
+    let fake = Fake::new(vec![]);
+    let mut app = app_with(&fake);
+    app.handle_key(key(KeyCode::Char('c')));
+    typ(&mut app, &raw.display().to_string());
+    pump(&mut app, "report next to the image", |app| {
+        app.conv.facts.as_ref().is_some_and(|f| f.path == raw)
+    })
+    .await;
     app.conv.destination = dir.path().join("out").display().to_string();
     app.handle_key(key(KeyCode::F(5)));
     pump(&mut app, "sheet", |app| {
@@ -1564,12 +1641,65 @@ async fn a_report_the_tui_found_is_passed_as_found_not_as_given() {
     })
     .await;
     let req = fake.s().conversions[0].clone();
-    assert_eq!(req.source, e01);
+    assert_eq!(req.source, raw);
     assert_eq!(
         req.source_report.as_deref(),
         Some(dir.path().join("x.info.json").as_path())
     );
     assert!(req.source_report_auto, "found by the TUI, not given");
+}
+
+/// I-N1: the confirmation sheet shows the case the conversion records (the
+/// report's values the form has no field for, the form's where it has one),
+/// each with where it comes from, not only the form.
+#[tokio::test]
+async fn the_conversion_sheet_shows_the_case_that_will_be_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = image_with_report(dir.path(), "imgA", "CASE-A", "EV-A", "SEAL-B");
+    let fake = Fake::new(vec![]);
+    let mut app = app_with(&fake);
+    app.handle_key(key(KeyCode::Char('c')));
+    typ(&mut app, &a.display().to_string());
+    pump(&mut app, "report of A", |app| {
+        app.conv.facts.as_ref().is_some_and(|f| f.path == a)
+    })
+    .await;
+    app.conv.case.examiner = "Conv Examiner".into();
+    app.conv.destination = dir.path().join("out").display().to_string();
+    app.handle_key(key(KeyCode::F(5)));
+    pump(&mut app, "sheet", |app| {
+        app.confirm.as_ref().is_some_and(|c| !c.pending)
+    })
+    .await;
+    let sheet = sheet_string(&app);
+    let row = |label: &str| {
+        sheet
+            .lines()
+            .find(|l| l.trim_start().starts_with(label))
+            .unwrap_or_else(|| panic!("no {label} row in\n{sheet}"))
+            .to_string()
+    };
+    assert!(
+        row("Seal Number").contains("SEAL-B  [acquisition report imgA.info.json]"),
+        "{sheet}"
+    );
+    assert!(
+        row("Examiner").contains("Conv Examiner  [given for this conversion]"),
+        "{sheet}"
+    );
+    assert!(
+        row("Case Number").contains("CASE-A  [given for this conversion]"),
+        "{sheet}"
+    );
+    assert!(
+        row("Seized At (time)").contains("(not provided)"),
+        "{sheet}"
+    );
+    assert!(!row("Seized At (time)").contains('['), "{sheet}");
+    assert!(
+        sheet.contains("examiner: acquisition report imgA.info.json records \"Acq Examiner\""),
+        "{sheet}"
+    );
 }
 
 #[tokio::test]
@@ -1603,4 +1733,36 @@ fn offline_app_never_touches_the_host() {
     assert!(!app.scanning);
     assert_eq!(app.rows.len(), 2);
     let _ = ProgressTelemetry::default();
+}
+
+/// I-N3: a panic of the UI drops the App; the job it started keeps running
+/// on the runtime and is counted, so the TUI aborts it and waits for its
+/// report before dfdisk exits (`process::exit` would cut it off).
+#[tokio::test]
+async fn a_job_outlives_a_dropped_ui_and_is_awaited_before_the_exit() {
+    let fake = Fake::new(vec![evidence()]);
+    fake.s().acquire = Acquire::UntilAborted;
+    let mut app = app_with(&fake);
+    to_case_setup(&mut app, "/mnt/case");
+    to_confirm(&mut app).await;
+    typ(&mut app, "kd7y");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen, Screen::Running);
+    let (controller, work) = (app.controller.clone(), app.work.clone());
+    assert_eq!(work.running(), 1, "the job is counted");
+    // The UI unwinds: the App goes, the job does not
+    drop(app);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(work.running(), 1, "the job still runs");
+    let said = dfdisk::tui::finish_background_work(
+        &controller,
+        &work,
+        Duration::from_secs(10),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(work.running(), 0, "{said:?}");
+    assert!(controller.is_aborted() && !controller.is_forced());
+    assert_eq!(fake.s().acquire_requests.len(), 1);
+    assert!(said.iter().any(|l| l.contains("ended")), "{said:?}");
 }
