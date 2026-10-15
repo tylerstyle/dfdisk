@@ -443,8 +443,9 @@ identify-class queries that the report records.
   a device with mounted filesystems (in dfdisk's mount namespace; a mount in
   another namespace makes the exclusive open below fail) or active swap, and a
   device with holders (dm-crypt, LVM, md, or a loop device whose backing file is
-  the source or one of its partitions; mounts of such a loop device count as
-  mounts of the source): a holder keeps the device open, so it has to be closed
+  the source or one of its partitions, or its disk or another device below it
+  with a byte range that includes the source; mounts of such a loop device, and
+  of its partitions that lie on the source, count as mounts of the source): a holder keeps the device open, so it has to be closed
   first (there is no override). Unmounting is a separate, explicit, audited
   action (`dfdisk unmount`, `--auto-unmount`) that refuses system mounts and
   protected devices and never forces or lazily unmounts.

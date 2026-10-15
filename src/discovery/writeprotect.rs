@@ -224,10 +224,136 @@ fn dependent_tree(sys: &SysRoot, root: &str) -> BTreeSet<String> {
 
 /// The source node and everything that depends on it ([`dependent_tree`]:
 /// its own partitions whatever its kind, stacked devices, loop devices over
-/// it), by kernel name: the nodes whose mounts (and active swap, R8) are "in
-/// the source tree".
+/// it), and the loop devices set up over a device BELOW the source whose
+/// byte range overlaps the source's data there ([`loops_over_lower_nodes`]),
+/// by kernel name: the nodes whose mounts (and active swap, R8) are "in the
+/// source tree".
 pub fn source_tree(sys: &SysRoot, identity: &SourceIdentity) -> BTreeSet<String> {
-    dependent_tree(sys, &identity.kernel_name)
+    let mut tree = dependent_tree(sys, &identity.kernel_name);
+    tree.extend(loops_over_lower_nodes(sys, &identity.kernel_name));
+    tree
+}
+
+/// A byte range `[start, end)` on a device; `end` [`u64::MAX`]: to its end.
+type ByteRange = (u64, u64);
+
+const WHOLE: ByteRange = (0, u64::MAX);
+
+fn overlaps(a: ByteRange, b: ByteRange) -> bool {
+    a.0 < b.1 && b.0 < a.1
+}
+
+/// `[start, start + sectors)` of a partition on its device, in bytes (sysfs
+/// counts both in 512-byte sectors whatever the logical sector size).
+fn partition_range(sys: &SysRoot, kname: &str) -> Option<ByteRange> {
+    let start: u64 = sys.attr(kname, "start")?.parse().ok()?;
+    let sectors: u64 = sys.attr(kname, "size")?.parse().ok()?;
+    let start = start.checked_mul(512)?;
+    Some((start, start.saturating_add(sectors.saturating_mul(512))))
+}
+
+/// The nodes `kname` is stored on, each with the byte range on it that may
+/// hold the source's data: a partition's disk with the partition's range, a
+/// dm or md device's slaves as a whole (the mapping table is not read).
+/// The walk stops at a loop device (the disk that holds its backing file is
+/// not below the source in the evidence's sense, S-N1).
+fn lower_nodes_with_ranges(sys: &SysRoot, kname: &str) -> Vec<(String, ByteRange)> {
+    let mut out: Vec<(String, ByteRange)> = Vec::new();
+    let mut pending: Vec<(String, ByteRange)> = vec![(kname.to_string(), WHOLE)];
+    while let Some((node, range)) = pending.pop() {
+        if out.len() >= MAX_TREE_NODES || sys.is_loop(&node) {
+            continue;
+        }
+        let slaves = sys.slaves(&node);
+        let lower: Vec<(String, ByteRange)> = if !slaves.is_empty() {
+            slaves.into_iter().map(|s| (s, WHOLE)).collect()
+        } else if let Some(disk) = sys.parent_disk(&node) {
+            let on_disk = match partition_range(sys, &node) {
+                Some((start, end)) if range == WHOLE => (start, end),
+                Some((start, end)) => (
+                    start.saturating_add(range.0),
+                    start.saturating_add(range.1).min(end),
+                ),
+                None => WHOLE,
+            };
+            vec![(disk, on_disk)]
+        } else {
+            Vec::new()
+        };
+        for (n, r) in lower {
+            if n != kname && !out.iter().any(|(o, or)| *o == n && *or == r) {
+                out.push((n.clone(), r));
+                pending.push((n, r));
+            }
+        }
+    }
+    out
+}
+
+/// Loop devices set up over a node BELOW the source (its disk, the partition
+/// under a dm source, an intermediate dm or md device) whose byte range
+/// (`loop/offset`, `loop/sizelimit`; 0: to the end) overlaps the source's
+/// data on that node, with what depends on that data through them (S-N2):
+/// `losetup -P /dev/sdb` makes `loop0p2` a second door to `sdb2`, and writes
+/// through loop0 or a filesystem mounted from loop0p2 land on sdb2. Such a
+/// loop device is a holder of the source and the mounts on it are mounts of
+/// the source. A partition of the loop device outside the source's range
+/// (loop0p1, the image of sdb1) is not; dm or md devices stacked on the
+/// whole loop device are counted (their mapping is not read).
+fn loops_over_lower_nodes(sys: &SysRoot, kname: &str) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    let mut targets = lower_nodes_with_ranges(sys, kname);
+    if targets.is_empty() {
+        return found;
+    }
+    let loops = sys.loops_over_block_devices();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    while let Some((node, range)) = targets.pop() {
+        let Some(dev) = sys.dev_of(&node) else {
+            continue;
+        };
+        for (lo, _) in loops.iter().filter(|(_, d)| *d == dev) {
+            if found.len() >= MAX_TREE_NODES || lo == kname {
+                continue;
+            }
+            let offset: u64 = sys
+                .attr(lo, "loop/offset")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let limit: u64 = sys
+                .attr(lo, "loop/sizelimit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let end = if limit == 0 {
+                u64::MAX
+            } else {
+                offset.saturating_add(limit)
+            };
+            if !overlaps(range, (offset, end)) {
+                continue;
+            }
+            // The source's data on the loop device, in its own offsets
+            let on_loop = (
+                range.0.max(offset) - offset,
+                range.1.min(end).saturating_sub(offset),
+            );
+            if !seen.insert(format!("{lo}:{}:{}", on_loop.0, on_loop.1)) {
+                continue;
+            }
+            found.insert(lo.clone());
+            for p in sys.partitions(lo) {
+                if partition_range(sys, &p).is_none_or(|r| overlaps(r, on_loop)) {
+                    found.extend(dependent_tree(sys, &p));
+                }
+            }
+            for h in sys.holders(lo) {
+                found.extend(dependent_tree(sys, &h));
+            }
+            // Loop devices over this loop device, again by range
+            targets.push((lo.clone(), on_loop));
+        }
+    }
+    found
 }
 
 /// Every node of a disk: the disk and everything that depends on it.
@@ -916,8 +1042,10 @@ mod tests {
         assert_eq!(wp.mounts_before, ["/mnt/loop"]);
         assert_eq!(wp.holders, ["loop0", "loop0p1", "loop1"]);
 
-        // A partition source: the loop over it is a holder; the loop over the
-        // whole disk is outside its tree, so its mount is foreign to sdb2
+        // A partition source: the loop over it is a holder, and so is the
+        // loop over the whole disk, which covers sdb2 too (S-N2); its
+        // partition loop0p1 (the image of sdb1) is not, so its mount stays
+        // foreign to sdb2
         let part = identity("sdb2", SourceKind::Partition, &["/dev/sdb"]);
         let wp = capture_in(
             &sys,
@@ -926,10 +1054,119 @@ mod tests {
             RegistryPresence::Absent,
             WriteProtectPolicy::Auto,
         );
-        assert_eq!(wp.holders, ["loop1"]);
+        assert_eq!(wp.holders, ["loop0", "loop1"]);
         assert!(wp.mounts_before.is_empty());
         let inputs = decision_inputs(&sys, &part, mi);
         assert_eq!(inputs.disks[0].foreign_mounts, ["/mnt/loop"]);
+    }
+
+    #[test]
+    fn a_loop_device_over_the_disk_is_a_holder_of_the_partitions_it_covers() {
+        // S-N2: losetup -P /dev/sdb; mount /dev/loop0p2 /mnt/x mounts sdb2's
+        // filesystem through loop0, invisible to sdb2's own holders/ and to
+        // its exclusive open
+        let f = FakeSysfs::new();
+        sata_with_partitions(&f);
+        f.add_loop("loop0", (7, 0), 10_000, "/dev/sdb");
+        f.add_partition("loop0", "loop0p1", (259, 0), 1, 2048, 4000);
+        f.add_partition("loop0", "loop0p2", (259, 1), 2, 6048, 3000);
+        // A loop over 1 MiB inside sdb1 (sectors 2048..6048), one starting in
+        // the middle of sdb2 (6048..9048) and one over the disk with a dm on it
+        f.add_loop("loop1", (7, 1), 2048, "/dev/sdb");
+        f.set("loop1", "loop/offset", &(2048u64 * 512).to_string());
+        f.set("loop1", "loop/sizelimit", &(1u64 << 20).to_string());
+        f.add_loop("loop2", (7, 2), 1000, "/dev/sdb");
+        f.set("loop2", "loop/offset", &(8000u64 * 512).to_string());
+        f.add_loop("loop3", (7, 3), 10_000, "/dev/sdb");
+        f.add_virtual("dm-3", (254, 3), 10_000);
+        f.set("dm-3", "dm/name", "over-loop3");
+        f.stack("dm-3", "loop3");
+        let mi = "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                  50 22 259:1 / /mnt/x rw - ext4 /dev/loop0p2 rw\n\
+                  51 22 259:0 / /mnt/y rw - ext4 /dev/loop0p1 rw\n";
+        let sys = f.root();
+
+        let sdb2 = identity("sdb2", SourceKind::Partition, &["/dev/sdb"]);
+        let tree = source_tree(&sys, &sdb2);
+        for n in ["sdb2", "loop0", "loop0p2", "loop2", "loop3", "dm-3"] {
+            assert!(tree.contains(n), "{n} not in {tree:?}");
+        }
+        for n in ["sdb", "sdb1", "loop0p1", "loop1"] {
+            assert!(!tree.contains(n), "{n} in {tree:?}");
+        }
+        let wp = capture_in(
+            &sys,
+            &sdb2,
+            mi,
+            RegistryPresence::Absent,
+            WriteProtectPolicy::Auto,
+        );
+        assert_eq!(wp.mounts_before, ["/mnt/x"]);
+        assert_eq!(wp.holders, ["dm-3", "loop0", "loop0p2", "loop2", "loop3"]);
+
+        // sdb1: loop0, its partition loop0p1 and loop1 (inside sdb1); not
+        // loop2, which starts in sdb2
+        let sdb1 = identity("sdb1", SourceKind::Partition, &["/dev/sdb"]);
+        let wp = capture_in(
+            &sys,
+            &sdb1,
+            mi,
+            RegistryPresence::Absent,
+            WriteProtectPolicy::Auto,
+        );
+        assert_eq!(wp.mounts_before, ["/mnt/y"]);
+        assert_eq!(wp.holders, ["dm-3", "loop0", "loop0p1", "loop1", "loop3"]);
+
+        // A LUKS mapping on sdb2: the same loop devices reach its data
+        f.add_virtual("dm-0", (254, 0), 2900);
+        f.set("dm-0", "dm/name", "evluks");
+        f.stack("dm-0", "sdb2");
+        let dm = identity(
+            "dm-0",
+            SourceKind::DeviceMapper {
+                crypt_plaintext: true,
+            },
+            &["/dev/sdb"],
+        );
+        let wp = capture_in(
+            &sys,
+            &dm,
+            mi,
+            RegistryPresence::Absent,
+            WriteProtectPolicy::Auto,
+        );
+        assert_eq!(wp.mounts_before, ["/mnt/x"]);
+        assert_eq!(wp.holders, ["dm-3", "loop0", "loop0p2", "loop2", "loop3"]);
+        // ... and a loop over sdb2 itself is one too (over a lower node)
+        f.add_loop("loop4", (7, 4), 3000, "/dev/sdb2");
+        let wp = capture_in(
+            &sys,
+            &dm,
+            mi,
+            RegistryPresence::Absent,
+            WriteProtectPolicy::Auto,
+        );
+        assert!(
+            wp.holders.contains(&"loop4".to_string()),
+            "{:?}",
+            wp.holders
+        );
+
+        // The unmount and swap tree of sdb2 names loop0p2's mount, not loop0p1's
+        let tree = crate::discovery::safety::SourceTree::from_sysfs(&sys, &sdb2);
+        assert!(tree.paths.contains("/dev/loop0p2"));
+        assert!(!tree.paths.contains("/dev/loop0p1"));
+
+        // A disk source is unchanged: every loop over it is a holder
+        let disk = identity("sdb", SourceKind::Disk, &[]);
+        let wp = capture_in(
+            &sys,
+            &disk,
+            mi,
+            RegistryPresence::Absent,
+            WriteProtectPolicy::Auto,
+        );
+        assert_eq!(wp.mounts_before, ["/mnt/x", "/mnt/y"]);
     }
 
     #[test]

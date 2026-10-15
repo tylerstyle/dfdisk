@@ -49,8 +49,9 @@ and when something was not done the report says so.
   refusals, per-boot audit export, `DeviceIdentity::same_attachment`).
 - **Stricter refusals.** Mounted sources are refused (unmounting is the explicit
   `dfdisk unmount` / `--auto-unmount`), as are sources with holders
-  (device-mapper, LVM, md, or a loop device set up over the source; they have
-  to be closed first), sources with active swap, sources in use (`O_EXCL`), tmpfs
+  (device-mapper, LVM, md, or a loop device set up over the source, or over its
+  disk with a byte range that includes the source; they have to be closed
+  first), sources with active swap, sources in use (`O_EXCL`), tmpfs
   destinations (unless `--allow-tmpfs`), E01 destinations with less free space
   than the source (unless `--allow-low-space`) and empty sources (size 0: no
   medium, or the size is unknown).
@@ -152,7 +153,11 @@ and when something was not done the report says so.
   md source) and its disk with every partition; a node that has to stay
   writable because of another mount is named in the report. A loop device set
   up over the source or its partitions is a holder and its mounts are mounts
-  of the source; a loop or md source's own partitions belong to it.
+  of the source; so is a loop device over a device below the source (its disk,
+  the partition under a LUKS source) whose byte range (`loop/offset`,
+  `loop/sizelimit`) includes part of the source, with those of its partitions
+  that do (`losetup -P /dev/sdb; mount /dev/loop0p2` for a source `sdb2`); a
+  loop or md source's own partitions belong to it.
 - **H6** Audit trail gaps: (a) the export is per boot and never replaces another
   boot's chain; (b) refusals are recognised by type, not by message text;
   (c) the "finished" record always carries the outcome, the digests known and

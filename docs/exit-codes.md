@@ -54,9 +54,12 @@ source device, when for example:
 - the device is protected by the dfnix protected-device registry, or the registry
   exists but cannot be read (fail closed);
 - the device is a system disk, is mounted (in dfdisk's mount namespace, also
-  through a loop device set up over it or its partitions), holds active swap, or
+  through a loop device set up over it or its partitions, or over its disk or a
+  device below it with a byte range that includes the source, such as
+  `losetup -P /dev/sdb` for a partition source `sdb2`), holds active swap, or
   has holders (device-mapper, LVM, md, LUKS, or such a loop device): a holder
-  keeps the device open, so it has to be closed first (there is no override);
+  keeps the device open or writes to it, so it has to be closed first (there is
+  no override);
 - the device cannot be opened exclusively (`O_EXCL` returns EBUSY: it is in use,
   for example mounted in another mount namespace);
 - the destination is on the source, on a dfnix evidence mount, on tmpfs/ramfs
