@@ -44,6 +44,7 @@ assets = [
     ["CHANGELOG.md", "usr/share/doc/dfdisk/CHANGELOG.md", "644"],
     ["docs/exit-codes.md", "usr/share/doc/dfdisk/exit-codes.md", "644"],
     ["docs/report-format.md", "usr/share/doc/dfdisk/report-format.md", "644"],
+    ["docs/safety.md", "usr/share/doc/dfdisk/safety.md", "644"],
     ["LICENSE-MIT", "usr/share/doc/dfdisk/LICENSE-MIT", "644"],
     ["LICENSE-APACHE", "usr/share/doc/dfdisk/LICENSE-APACHE", "644"],
 ]
