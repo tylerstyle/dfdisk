@@ -854,6 +854,50 @@ async fn partitions_are_selectable_sources() {
 }
 
 #[tokio::test]
+async fn a_partition_whose_mapping_is_mounted_offers_the_unmount() {
+    // sdx -> sdx1 (LUKS) -> luks-x (mounted at /media/x), as the scan lists it
+    let mut d = evidence();
+    d.partitions[0].fstype = Some("crypto_LUKS".into());
+    d.partitions[0].tree_mounts = vec!["/media/x".into()];
+    d.partitions[0].holders = vec!["dm-0".into()];
+    d.partitions[0].parent_disks = vec!["/dev/sdx".into()];
+    d.partitions.push(Partition {
+        name: "luks-x".into(),
+        path: "/dev/mapper/luks-x".into(),
+        size_bytes: (1 << 30) - (16 << 20),
+        kind: Some("crypt".into()),
+        maj_min: Some("254:0".into()),
+        mountpoint: Some("/media/x".into()),
+        tree_mounts: vec!["/media/x".into()],
+        parent_disks: vec!["/dev/sdx".into()],
+        ..Default::default()
+    });
+    d.mountpoints = vec!["/media/x".into()];
+    d.holders = vec!["dm-0".into()];
+    d.safety = DeviceSafety::Mounted(vec!["/media/x".into()]);
+    let fake = Fake::new(vec![d]);
+    let mut app = app_with(&fake);
+    select(&mut app, "sdx1");
+    let row = app.current_row().unwrap();
+    assert_eq!(row.badge_text(), "MOUNTED IN-USE");
+    // U offers the audited unmount of the partition's tree (it said "has no
+    // mounted filesystem")
+    app.handle_key(key(KeyCode::Char('u')));
+    match &app.modal {
+        Some(Modal::Unmount { device, mounts, .. }) => {
+            assert_eq!(device.path, "/dev/sdx1");
+            assert_eq!(mounts, &["/media/x".to_string()]);
+        }
+        other => panic!("{other:?}; notices {:?}", app.notices),
+    }
+    app.handle_key(key(KeyCode::Char('n')));
+    // Enter does not start a case setup on a mounted source either
+    app.handle_key(key(KeyCode::Enter));
+    assert!(matches!(app.modal, Some(Modal::Unmount { .. })));
+    assert_eq!(app.screen, Screen::Explorer);
+}
+
+#[tokio::test]
 async fn rescue_resume_prompt_when_a_map_exists() {
     let dir = tempfile::tempdir().unwrap();
     let fake = Fake::new(vec![evidence()]);

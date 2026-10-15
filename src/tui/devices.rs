@@ -232,47 +232,77 @@ impl SourceRow {
 }
 
 /// A child of `disk` (partition, LUKS mapping, LVM volume, ...) as a source
-/// snapshot: its own node, major:minor and size; the hardware identity
-/// (model, serial, WWN) of the disk it is stored on, as the identity probe
-/// reports it for such sources. The disk sequence number is the disk's for
-/// a partition (the kernel numbers disks, not partitions) and unknown for a
-/// stacked device (dm/md have their own).
+/// snapshot: its own node, major:minor and size, its own tree of mounts and
+/// holders; and the hardware identity (model, serial, WWN) of the disk only
+/// when the node is stored on that one disk, as the identity probe reports it
+/// for such sources (`discovery::identity`). A node stored on several disks
+/// (md RAID, LVM across disks) or on disks the scan did not name gets none:
+/// no single drive's serial applies. The disk sequence number is the disk's
+/// for a partition (the kernel numbers disks, not partitions) and unknown for
+/// a stacked device (dm/md have their own).
 pub fn partition_source(disk: &BlockDevice, part: &Partition) -> BlockDevice {
     let lsblk_type = part.kind.as_deref().unwrap_or("part");
     let kind = SourceKind::from_lsblk_type(lsblk_type);
     let is_partition = kind == SourceKind::Partition;
-    BlockDevice {
+    let on_this_disk_only = match part.parent_disks.as_slice() {
+        [] => is_partition,
+        [one] => one == &disk.path,
+        _ => false,
+    };
+    let mountpoints = tree_mounts(part);
+    let safety = if let Some(system) = mountpoints.iter().find(|m| is_system_mount(m)) {
+        DeviceSafety::SystemDisk(vec![system.clone()])
+    } else if mountpoints.is_empty() {
+        DeviceSafety::Safe
+    } else {
+        DeviceSafety::Mounted(mountpoints.clone())
+    };
+    let mut device = BlockDevice {
         name: part.name.clone(),
         path: part.path.clone(),
         size_bytes: part.size_bytes,
-        model: disk.model.clone(),
-        vendor: disk.vendor.clone(),
-        serial: disk.serial.clone(),
-        wwn: disk.wwn.clone(),
-        revision: disk.revision.clone(),
-        bus_type: disk.bus_type.clone(),
-        is_rotational: disk.is_rotational,
-        is_removable: disk.is_removable,
         is_read_only: part.is_read_only,
         logical_sector_size: disk.logical_sector_size,
         physical_sector_size: disk.physical_sector_size,
-        mountpoints: part.mountpoint.iter().cloned().collect(),
-        safety: match &part.mountpoint {
-            Some(mp) if is_system_mount(mp) => DeviceSafety::SystemDisk(vec![mp.clone()]),
-            Some(mp) => DeviceSafety::Mounted(vec![mp.clone()]),
-            None => DeviceSafety::Safe,
-        },
+        mountpoints,
+        safety,
         maj_min: part.maj_min.clone(),
-        diskseq: if is_partition { disk.diskseq } else { None },
-        hotplug: disk.hotplug,
-        transport: disk.transport.clone(),
         kind,
+        holders: part.holders.clone(),
         protected: disk.protected.clone(),
-        parent: Some(disk.path.clone()),
         start_sector: part.start_sector,
-        serial_candidates: disk.serial_candidates.clone(),
         ..Default::default()
+    };
+    if on_this_disk_only {
+        device.model = disk.model.clone();
+        device.vendor = disk.vendor.clone();
+        device.serial = disk.serial.clone();
+        device.wwn = disk.wwn.clone();
+        device.revision = disk.revision.clone();
+        device.bus_type = disk.bus_type.clone();
+        device.is_rotational = disk.is_rotational;
+        device.is_removable = disk.is_removable;
+        device.hotplug = disk.hotplug;
+        device.transport = disk.transport.clone();
+        device.serial_candidates = disk.serial_candidates.clone();
+        device.parent = Some(disk.path.clone());
+        device.diskseq = if is_partition { disk.diskseq } else { None };
+    } else {
+        device.bus_type = "UNKNOWN".into();
     }
+    device
+}
+
+/// A child's own mount point (lsblk's "[SWAP]" included) and the mounts of
+/// its tree as the scan found them.
+fn tree_mounts(part: &Partition) -> Vec<String> {
+    let mut out: Vec<String> = part.mountpoint.iter().cloned().collect();
+    for m in &part.tree_mounts {
+        if !out.contains(m) {
+            out.push(m.clone());
+        }
+    }
+    out
 }
 
 /// Rows of the device table: each disk followed by its children. `capacity`
@@ -306,34 +336,44 @@ pub fn source_rows(
         });
         for part in &disk.partitions {
             let device = partition_source(disk, part);
+            // Its own mount and those of everything stacked on it (a LUKS
+            // partition whose mapping is mounted is mounted)
+            let mounts = device.mountpoints.clone();
+            let critical: Vec<String> = mounts
+                .iter()
+                .filter(|m| is_system_mount(m))
+                .cloned()
+                .collect();
             let mut badges = Vec::new();
-            let critical = part.mountpoint.as_deref().is_some_and(is_system_mount);
             // A child of a system disk is shown as such: the session refuses
             // sources on the system disk
-            if disk.safety.is_system() || critical {
+            if disk.safety.is_system() || !critical.is_empty() {
                 badges.push(Badge::System);
             }
             if disk.protected.is_some() {
                 badges.push(Badge::Protected);
             }
-            if part.mountpoint.is_some() {
+            if !mounts.is_empty() {
                 badges.push(Badge::Mounted);
             }
             if part.is_read_only {
                 badges.push(Badge::ReadOnly);
             }
+            if !part.holders.is_empty() {
+                badges.push(Badge::InUse);
+            }
             rows.push(SourceRow {
                 key: SelectionKey::of(&device),
-                mountpoints: part.mountpoint.iter().cloned().collect(),
+                mountpoints: mounts,
                 device,
                 depth: 1,
                 disk: disk.name.clone(),
                 badges,
                 protected: disk.protected.clone(),
-                system_mounts: if critical {
-                    part.mountpoint.iter().cloned().collect()
-                } else {
+                system_mounts: if critical.is_empty() {
                     system_mounts.clone()
+                } else {
+                    critical
                 },
             });
         }
@@ -482,5 +522,116 @@ mod tests {
         iso.partitions[0].mountpoint = Some("/iso".into());
         let rows = source_rows(&[iso], &|_| None);
         assert!(rows[1].has(Badge::System), "{}", rows[1].badge_text());
+    }
+
+    #[test]
+    fn a_partition_whose_mapping_is_mounted_is_mounted_and_in_use() {
+        // sdb1 (LUKS) -> luks-x mounted at /media/x, as Scan::devices() lists it
+        let mut d = disk("sdb", "S1", 7);
+        d.mountpoints = vec!["/media/x".into()];
+        d.safety = DeviceSafety::Mounted(vec!["/media/x".into()]);
+        d.holders = vec!["dm-0".into()];
+        d.partitions[0].mountpoint = None;
+        d.partitions[0].fstype = Some("crypto_LUKS".into());
+        d.partitions[0].tree_mounts = vec!["/media/x".into()];
+        d.partitions[0].holders = vec!["dm-0".into()];
+        d.partitions[0].parent_disks = vec!["/dev/sdb".into()];
+        d.partitions.push(Partition {
+            name: "luks-x".into(),
+            path: "/dev/mapper/luks-x".into(),
+            size_bytes: 1 << 19,
+            maj_min: Some("254:0".into()),
+            kind: Some("crypt".into()),
+            mountpoint: Some("/media/x".into()),
+            tree_mounts: vec!["/media/x".into()],
+            parent_disks: vec!["/dev/sdb".into()],
+            ..Default::default()
+        });
+        let rows = source_rows(&[d], &|_| None);
+        let part = &rows[1];
+        assert_eq!(part.badge_text(), "MOUNTED IN-USE");
+        assert_eq!(part.mountpoints, ["/media/x"]);
+        assert_eq!(part.device.holders, ["dm-0"]);
+        assert_eq!(
+            part.device.safety,
+            DeviceSafety::Mounted(vec!["/media/x".into()])
+        );
+        // The mapping itself, stored on this one disk: the disk's identity
+        let crypt = &rows[2];
+        assert!(crypt.has(Badge::Mounted) && !crypt.has(Badge::InUse));
+        assert_eq!(crypt.device.serial.as_deref(), Some("S1"));
+        assert_eq!(crypt.device.parent.as_deref(), Some("/dev/sdb"));
+        assert_eq!(crypt.device.diskseq, None, "a dm device has its own");
+        // A system mount anywhere in the tree makes the row SYSTEM
+        let mut sys = disk("sdc", "S2", 8);
+        sys.partitions[0].mountpoint = None;
+        sys.partitions[0].tree_mounts = vec!["/".into()];
+        let rows = source_rows(&[sys], &|_| None);
+        assert!(rows[1].has(Badge::System), "{}", rows[1].badge_text());
+        assert_eq!(rows[1].system_mounts, ["/"]);
+    }
+
+    #[test]
+    fn a_device_on_several_disks_borrows_no_drive_identity() {
+        use crate::discovery::identity::Prober;
+        use crate::discovery::sysfs::fake::FakeSysfs;
+        const VIRTIO_B: &str = "pci0000:00/0000:00:05.0/virtio2";
+        const VIRTIO_C: &str = "pci0000:00/0000:00:06.0/virtio3";
+        let f = FakeSysfs::new();
+        f.add_disk(VIRTIO_B, "vdb", (252, 16), 131_072);
+        f.set("vdb", "serial", "DISK-B");
+        f.add_partition("vdb", "vdb1", (252, 17), 1, 2048, 100_000);
+        f.add_disk(VIRTIO_C, "vdc", (252, 32), 131_072);
+        f.set("vdc", "serial", "DISK-C");
+        f.add_partition("vdc", "vdc1", (252, 33), 1, 2048, 100_000);
+        f.add_virtual("md0", (9, 0), 99_000);
+        std::fs::create_dir_all(f.path().join("devices/virtual/block/md0/md")).unwrap();
+        f.stack("md0", "vdb1");
+        f.stack("md0", "vdc1");
+        // What the session probes at the start
+        let probed = Prober::sysfs_only(f.root())
+            .probe_block("/dev/md0", (9, 0))
+            .unwrap();
+        assert_eq!(probed.serial, None);
+
+        // The TUI row of md0 under vdb (the scan lists it under both disks)
+        let vdb = BlockDevice {
+            name: "vdb".into(),
+            path: "/dev/vdb".into(),
+            serial: Some("DISK-B".into()),
+            model: Some("Virtio".into()),
+            diskseq: Some(4),
+            maj_min: Some("252:16".into()),
+            size_bytes: 131_072 * 512,
+            ..Default::default()
+        };
+        let md = Partition {
+            name: "md0".into(),
+            path: "/dev/md0".into(),
+            size_bytes: 99_000 * 512,
+            kind: Some("raid1".into()),
+            maj_min: Some("9:0".into()),
+            parent_disks: vec!["/dev/vdb".into(), "/dev/vdc".into()],
+            ..Default::default()
+        };
+        let row = partition_source(&vdb, &md);
+        assert_eq!(row.serial, None, "no single drive's serial");
+        assert_eq!(row.model, None);
+        assert_eq!(row.parent, None);
+        assert!(row.serial_candidates.is_empty());
+        // Before, the row carried DISK-B and the start was refused as
+        // "source changed ... no serial reported, was DISK-B"
+        assert_eq!(probed.same_attachment(&row.device_identity()), Ok(()));
+
+        // A partition always borrows its disk's identity
+        let part = Partition {
+            name: "vdb1".into(),
+            path: "/dev/vdb1".into(),
+            kind: Some("part".into()),
+            ..Default::default()
+        };
+        let row = partition_source(&vdb, &part);
+        assert_eq!(row.serial.as_deref(), Some("DISK-B"));
+        assert_eq!(row.diskseq, Some(4));
     }
 }
