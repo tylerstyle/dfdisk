@@ -194,7 +194,7 @@ jobs:
           test -f "$DEB" || { echo "::error::expected $DEB"; ls target/debian; exit 1; }
           dpkg-deb --info "$DEB"
           depends=$(dpkg-deb --field "$DEB" Depends)
-          for pkg in libc6 ewf-tools gddrescue smartmontools util-linux udev hdparm nvme-cli; do
+          for pkg in libc6 ewf-tools gddrescue smartmontools util-linux mount udev hdparm nvme-cli; do
             if ! printf '%s\n' "$depends" | tr ',' '\n' | sed 's/^ *//' | grep -q "^$pkg\b"; then
               echo "::error::Depends lacks $pkg: $depends"
               exit 1
