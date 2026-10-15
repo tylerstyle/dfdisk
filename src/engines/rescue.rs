@@ -892,10 +892,82 @@ pub fn compare_resume_identity(
     }
 }
 
+/// The newest report of the rescue `base` in `dir`: `<base>.info.json` when
+/// it exists (the previous session's report before a resume keeps it), else
+/// the JSON twin of the highest kept session. (label, path)
+fn latest_report_json(dir: &Path, base: &str) -> Option<(String, PathBuf)> {
+    let current = dir.join(format!("{base}{INFO_JSON_SUFFIX}"));
+    if current.is_file() {
+        return Some(("the report of the last session".into(), current));
+    }
+    kept_sessions(dir, base)
+        .into_iter()
+        .rev()
+        .find_map(|(n, _, json)| json.map(|j| (format!("the report of session {n}"), j)))
+}
+
+/// SHA-256 of the auxiliary file whose name ends with `suffix` that the
+/// report `json` lists. `Err` when the report cannot be read.
+fn digest_listed_in(json: &Path, suffix: &str) -> Result<Option<String>, String> {
+    let text = fs::read_to_string(json).map_err(|e| format!("cannot read it: {e}"))?;
+    let report =
+        ForensicInfoReport::from_json(&text).map_err(|e| format!("it is not readable: {e}"))?;
+    Ok(report
+        .auxiliary_files
+        .iter()
+        .find(|f| f.path.to_lowercase().ends_with(suffix))
+        .map(|f| f.sha256.clone()))
+}
+
+/// The identity record must be the one the newest report lists (R-6): a
+/// record changed or replaced after that report cannot tie a resume to the
+/// source. Returns the statement; `Err` names both digests.
+fn check_identity_record_digest(
+    dir: &Path,
+    base: &str,
+    record: &Path,
+) -> Result<String, AcquisitionError> {
+    let now = sha256_file(record).map_err(|e| {
+        AcquisitionError::refused(format!(
+            "cannot resume the rescue: the identity record {} cannot be hashed: {e}",
+            record.display()
+        ))
+    })?;
+    let Some((label, report)) = latest_report_json(dir, base) else {
+        return Ok(format!(
+            "no report of an earlier session lists the identity record {} (SHA-256 {now}); it cannot be compared with one",
+            file_name(record)
+        ));
+    };
+    match digest_listed_in(&report, IDENTITY_SUFFIX) {
+        Ok(Some(listed)) if listed.eq_ignore_ascii_case(&now) => Ok(format!(
+            "the identity record {} (SHA-256 {now}) is the one {label} ({}) lists",
+            file_name(record),
+            file_name(&report)
+        )),
+        Ok(Some(listed)) => Err(AcquisitionError::refused(format!(
+            "cannot resume the rescue: the identity record {} was changed or replaced after {label} ({}) was written: that report lists SHA-256 {listed}, the record now has {now}. The record is what ties the map and image to the source; dfdisk does not resume on a record it cannot trust. Restore the original record, or start a new rescue under a new evidence number",
+            record.display(),
+            report.display()
+        ))),
+        Ok(None) => Ok(format!(
+            "{label} ({}) lists no digest of the identity record {} (SHA-256 {now}) to compare it with",
+            file_name(&report),
+            file_name(record)
+        )),
+        Err(e) => Ok(format!(
+            "the identity record {} (SHA-256 {now}) could not be compared with {label} ({}): {e}",
+            file_name(record),
+            file_name(&report)
+        )),
+    }
+}
+
 /// Before a resumed rescue writes anything (session step 4, and the engine
 /// again with the identity that includes the SMART IDENTIFY serial): the
-/// identity recorded at the first start must exist and describe this source.
-/// Returns the statement for the report; `Refused` otherwise.
+/// identity recorded at the first start must exist, be the record the newest
+/// report lists, and describe this source. Returns the statements for the
+/// report; `Refused` otherwise.
 pub fn check_resume_identity(
     dir: &Path,
     base: &str,
@@ -914,6 +986,7 @@ pub fn check_resume_identity(
             record.base_name
         )));
     }
+    let digest_statement = check_identity_record_digest(dir, base, &path)?;
     let tie = compare_resume_identity(&record.identity, now).map_err(|d| {
         AcquisitionError::refused(format!(
             "cannot resume the rescue: the source is not the device this rescue started on ({d}). The map and image belong to {} ({}, {} bytes, serial {}), recorded at {} in {}. dfdisk never merges two devices into one image",
@@ -925,11 +998,14 @@ pub fn check_resume_identity(
             path.display()
         ))
     })?;
-    Ok(vec![format!(
-        "resumed rescue: the source matches the identity recorded at the first start of this rescue ({}, {}): {tie}",
-        file_name(&path),
-        record.recorded_at.to_rfc3339()
-    )])
+    Ok(vec![
+        format!(
+            "resumed rescue: the source matches the identity recorded at the first start of this rescue ({}, {}): {tie}",
+            file_name(&path),
+            record.recorded_at.to_rfc3339()
+        ),
+        digest_statement,
+    ])
 }
 
 /// Session number of `file_name` if it is a kept report of `base`
@@ -1071,12 +1147,7 @@ pub fn list_sessions(dir: &Path, base: &str) -> Vec<SessionInfo> {
 /// SHA-256 of the map the report of kept session `session` lists.
 fn map_digest_in_report(dir: &Path, base: &str, session: u32) -> Option<String> {
     let json = dir.join(format!("{base}{SESSION_SUFFIX}{session}.json"));
-    let report = ForensicInfoReport::from_json(&fs::read_to_string(json).ok()?).ok()?;
-    report
-        .auxiliary_files
-        .iter()
-        .find(|f| f.path.to_lowercase().ends_with(MAP_SUFFIX))
-        .map(|f| f.sha256.clone())
+    digest_listed_in(&json, MAP_SUFFIX).ok().flatten()
 }
 
 /// What [`prepare_resume`] found and did.
@@ -1572,6 +1643,11 @@ mod tests {
     }
 
     fn report_json(outcome: Outcome, map_sha: &str) -> String {
+        report_json_listing(outcome, map_sha, None)
+    }
+
+    /// A rescue report listing the map and, when given, the identity record.
+    fn report_json_listing(outcome: Outcome, map_sha: &str, identity_sha: Option<&str>) -> String {
         let source = disk();
         let config = AcquisitionConfig::rescue("/out");
         let mut r = ForensicInfoReport::new(
@@ -1586,7 +1662,63 @@ mod tests {
                 path: "/out/b.map".into(),
                 sha256: map_sha.into(),
             });
+        if let Some(sha) = identity_sha {
+            r.auxiliary_files
+                .push(crate::models::info_report::FileDigest {
+                    path: "/out/b.identity.json".into(),
+                    sha256: sha.into(),
+                });
+        }
         r.to_json()
+    }
+
+    #[test]
+    fn the_identity_record_must_be_the_one_the_last_report_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let base = "b";
+        let record = IdentityRecord::new(&disk(), base, "/dev/sdx", 512);
+        let path = identity_record_path(d, base);
+        std::fs::write(&path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+        let sha = sha256_file(&path).unwrap();
+
+        // No report yet: stated, not refused
+        let notes = check_resume_identity(d, base, &disk()).unwrap();
+        assert!(
+            notes[1].contains("no report of an earlier session lists"),
+            "{notes:?}"
+        );
+        // The last report lists this record
+        std::fs::write(
+            d.join("b.info.json"),
+            report_json_listing(Outcome::Aborted, "aa", Some(&sha)),
+        )
+        .unwrap();
+        let notes = check_resume_identity(d, base, &disk()).unwrap();
+        assert!(
+            notes[1].contains(&format!(
+                "(SHA-256 {sha}) is the one the report of the last session (b.info.json) lists"
+            )),
+            "{notes:?}"
+        );
+        // The record was replaced afterwards (same identity, other bytes)
+        std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+        let e = check_resume_identity(d, base, &disk()).unwrap_err();
+        assert!(e.is_refusal(), "{e}");
+        assert!(e.message.contains("changed or replaced"), "{e}");
+        assert!(e.message.contains(&sha), "{e}");
+        // Kept as session 1 by an earlier resume: compared all the same
+        std::fs::rename(d.join("b.info.json"), d.join("b.info.session-1.json")).unwrap();
+        let e = check_resume_identity(d, base, &disk()).unwrap_err();
+        assert!(e.message.contains("the report of session 1"), "{e}");
+        // A report without the record's digest: stated
+        std::fs::write(
+            d.join("b.info.json"),
+            report_json_listing(Outcome::Aborted, "aa", None),
+        )
+        .unwrap();
+        let notes = check_resume_identity(d, base, &disk()).unwrap();
+        assert!(notes[1].contains("lists no digest"), "{notes:?}");
     }
 
     #[test]

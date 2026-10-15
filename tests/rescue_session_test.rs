@@ -459,6 +459,15 @@ async fn an_aborted_rescue_resumes_with_its_sessions_listed() {
         notes.contains("the source matches the identity recorded at the first start"),
         "{notes}"
     );
+    // R-6: the identity record is the one the previous report lists
+    let identity = out.join(format!("{}.identity.json", resumed.base_name));
+    let identity_sha = sha256_file(&identity).unwrap();
+    assert!(
+        notes.contains(&format!(
+            "(SHA-256 {identity_sha}) is the one the report of the last session"
+        )),
+        "{notes}"
+    );
     assert!(
         notes.contains(&format!(
             "(SHA-256 {first_map_sha}) is the map the report of session 1 lists"
@@ -526,6 +535,20 @@ async fn a_resume_on_another_source_is_refused_before_anything_is_written() {
         "{e}"
     );
     assert_eq!(snapshot(&out), before);
+
+    // R-6: an identity record changed after the last report (here: the same
+    // content re-serialised) is not trusted
+    std::fs::write(&src, vec![0xEEu8; MIB]).unwrap();
+    let record = out.join(format!("{base}.identity.json"));
+    let original = std::fs::read_to_string(&record).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&original).unwrap();
+    std::fs::write(&record, serde_json::to_string(&value).unwrap()).unwrap();
+    let changed = snapshot(&out);
+    let e = run(device.clone(), resume.clone()).await.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Refused, "{e}");
+    assert!(e.message.contains("changed or replaced"), "{e}");
+    assert_eq!(snapshot(&out), changed, "a refused resume changes nothing");
+    std::fs::write(&record, original).unwrap();
 
     // No identity record: the map cannot be tied to any source
     std::fs::remove_file(out.join(format!("{base}.identity.json"))).unwrap();
