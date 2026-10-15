@@ -5,6 +5,223 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - Unreleased
+
+dfdisk 0.2.0 is a rework driven by a review of 0.1.10 (items C1-C2,
+H1-H10, M1-M12 and feature proposals F1-F12 below). Its reports are meant to be
+read in court: every statement a report makes is derived from measured facts,
+and when something was not done the report says so.
+
+### Breaking changes
+
+- **Required case fields.** `acquire` (and the TUI) require `--case`,
+  `--evidence` and `--examiner`. The 0.1 placeholder defaults (`CASE001`, `cf01`,
+  `Forensic Examiner`, `Law Enforcement / DFIR Unit`, `Physical Storage Media`)
+  are gone; no placeholder is ever recorded. `convert` takes the case fields from
+  `<source>.info.json` or requires them.
+- **Exit codes.** One documented table (docs/exit-codes.md): 0 verified,
+  1 internal error, 2 usage, 3 refused, 4 failed, 5 mismatch, 6 incomplete,
+  7 completed with read errors, 8 aborted, 9 complete but not verified. In 0.1
+  refusals, failures, mismatches and incomplete runs all exited 1, and E01
+  acquisitions with read errors and rescues exited 0. `verify` exits 5 on a
+  mismatch (was 1) and 9 when there was nothing to compare against.
+- **Verdicts.** Seven outcomes (VERIFIED, COMPLETE NOT VERIFIED, COMPLETED WITH
+  READ ERRORS, INCOMPLETE, HASH MISMATCH, VERIFICATION FAILED, ABORTED) replace
+  the 0.1 statuses; "DamagedMedia" is gone. A clean rescue is COMPLETE, NOT
+  VERIFIED (exit 9) unless `--verify-source` confirmed it.
+- **Report schema 2.** `<base>.info` starts with a verdict banner and has new
+  sections (write protection, capacity, SMART, applied settings, clock,
+  read-error table, provenance, audit); `<base>.info.json` is its new
+  machine-readable twin (`schema_version: 2`, docs/report-format.md).
+- **Audit export file name.** The audit log copy in the output directory is
+  `audit-<boot_id>.jsonl` with `audit-<boot_id>.head` (one per boot, never
+  overwriting another boot's copy) instead of `audit.jsonl` / `audit.head`.
+- **dfcore 0.2.0** is required (registry matching by device number, typed
+  refusals, per-boot audit export, `DeviceIdentity::same_attachment`).
+- **Stricter refusals.** Mounted sources are refused (unmounting is the explicit
+  `dfdisk unmount` / `--auto-unmount`), as are sources with holders (unless
+  `--allow-holders`), sources with active swap, sources in use (`O_EXCL`), tmpfs
+  destinations (unless `--allow-tmpfs`) and E01 destinations with less free space
+  than the source (unless `--allow-low-space`).
+- **Write protection on by default.** `--write-protect auto` sets the kernel
+  read-only flag (BLKROSET) on the source and leaves it set; `off` only records.
+- **SMART** is no longer queried during device scans; `list --smart` asks for it.
+- **TUI keys.** Esc never aborts; aborting needs a y/N confirmation; Tab and
+  Shift-Tab always move between fields and path completion has its own key.
+- **Packaging.** The .deb depends on `$auto, ewf-tools, gddrescue, smartmontools,
+  util-linux, udev, hdparm, nvme-cli`; the Arch and nixpkgs files under
+  `packaging/` are gone (there is no AUR package). Minimum Rust version 1.88
+  (`rust-version`).
+
+### Fixed (review of 0.1.10)
+
+- **C1** E01 read errors were invisible and certified VERIFIED: ewfacquire's
+  read-error block is parsed from stdout and stderr, cross-checked with the
+  error list stored in the image (`ewfinfo -e`), and reported as exact
+  zero-filled ranges with verdict COMPLETED WITH READ ERRORS (exit 7); the media
+  size in the image is compared with the device size; ewfacquire's log
+  (`-l <base>.ewfacquire.log`) is kept and hashed; `-g` follows the physical
+  sector size.
+- **C2** Source identity was never re-checked: the identity (major:minor,
+  diskseq, serial, WWN, size) is pinned when the device is selected and checked
+  again at the start and at the end; the source is held open with `O_EXCL` for
+  the whole run; external tools read through `/dev/disk/by-diskseq/<N>` when it
+  points at the pinned device; the TUI keys its selection on the identity and
+  shows a confirmation sheet.
+- **H1** The TUI hid the verdict: the result screen starts with the verdict
+  banner, coloured by outcome, shows the key numbers and paths, scrolls the full
+  report and stays until acknowledged; errors no longer expire.
+- **H2** No signal handling: SIGINT/SIGTERM abort gracefully (SIGINT to the
+  tool's process group, grace period, then SIGTERM and SIGKILL), a second SIGINT
+  kills at once, SIGHUP lets the run finish headless; every engine keeps its
+  partial output; the report and the audit "finished" record are written on
+  every path.
+- **H3** The converter overwrote outputs and verified nothing: existing outputs
+  are refused before any tool runs, destination checks apply, the output is
+  verified against the source digests, it writes `.info` / `.info.json` and
+  audit records, abort works, sizes that are not a multiple of 512 bytes are
+  refused, split RAW inputs are converted completely or refused.
+- **H4** Rescue reports were not truthful: read-error ranges and counts come
+  from the ddrescue mapfile, untried areas make the run INCOMPLETE, the map is
+  hashed and listed, a resume requires the same device (identity sidecar) and
+  passes `-I`, the earlier report is kept as `<base>.info.session-N`, and the TUI
+  offers to resume.
+- **H5** Write protection was not checked or recorded: the read-only state of
+  the source and its partitions, holders, mounts and the exclusive open are
+  recorded; BLKROSET is set by default.
+- **H6** Audit trail gaps: (a) the export is per boot and never replaces another
+  boot's chain; (b) refusals are recognised by type, not by message text;
+  (c) the "finished" record always carries the outcome, the digests known and
+  the SHA-256 of both reports; (d) an unwritable audit log refuses on dfnix and
+  is stated in the report and the UI elsewhere; (e) tests no longer mirror
+  records into the host journal (dfcore 0.2.0).
+- **H7** Unmount: `dfdisk unmount` and `--auto-unmount` collect the mounts of
+  the source and all its descendants by device number, check the registry and
+  system mounts before unmounting anything, unmount deepest first, verify that
+  nothing remains and write an audit record. The output directory is created
+  only after every destination check. The registry is matched by device number
+  (device-mapper paths), and an ambiguous bare device name is refused.
+- **H8** TUI start and abort hazards: required fields, typed confirmation
+  (last four characters of the serial), source identity on every screen, a
+  scrolling device table that keeps the serial visible, abort with confirmation.
+- **H9** Exit codes: see Breaking changes; errors are printed once.
+- **H10** Release and packaging: releases are built only after the test job
+  passed; tag, Cargo.toml, Cargo.lock and package.nix versions must agree;
+  pinned Rust toolchain; `cargo install --locked --version` for cross and
+  cargo-deb; binaries and the .deb are built on Ubuntu 22.04 and the .deb
+  declares its C library dependency (`$auto`) and depends on `ewf-tools` (not the
+  nonexistent `libewf-tools`); the .deb is installed and run in CI before
+  publishing; README asset names are the real ones; stale packaging removed;
+  `cargo install --git` is documented as unsupported.
+- **M1** SMART ran on every disk at every scan with SCT commands and no timeout:
+  no SMART in scans, `--smart off|basic|full` without SCT commands, 30 s timeout,
+  snapshots recorded in the report with the raw JSON, inaccessible SMART is
+  UNKNOWN (not FAILED), NVMe wear from `percentage_used`.
+- **M2** HPA/DCO and NVMe capacity were not detected: `hdparm -N`,
+  `hdparm --dco-identify` and `nvme id-ns` (read-only, on the physical disk,
+  with timeouts) are recorded; `--refuse-hidden-areas` refuses.
+- **M3** Verification read the page cache: images, auxiliary files and the
+  directory are fsynced and evicted from the page cache before verification.
+- **M4** Metadata: control characters are sanitised (no shifted E01 header
+  fields), placeholders are never recorded, file names are capped at 255 bytes
+  (refused, never truncated), tokens are NFC-normalised, existing outputs are
+  compared case-insensitively.
+- **M5** Serial provenance: every serial candidate is kept with its source,
+  device-reported serials are preferred, empty values are ignored, and a note
+  warns when a USB bridge may report its own serial.
+- **M6** Partition and device-mapper sources are labelled as such, with parent
+  disk, start sector and an explicit note for decrypted dm-crypt plaintext;
+  hot-pluggable and removable are told apart.
+- **M7** Destination preflight: free space, FAT file size limit, tmpfs/ramfs,
+  read-only mounts and dfnix evidence mounts are checked before anything is
+  written; a 1 MiB reservation keeps room for the report.
+- **M8** The TUI and the reports state only the settings that were applied (no
+  compression or split for RAW, MD5 always for E01, at least one digest), and
+  progress is shown per phase (acquire, flush, verify, source re-read).
+- **M9** TUI ergonomics: probes run off the UI thread, Tab moves between fields,
+  path completion has its own key, modals fit their content, help overlay, no
+  mouse capture, partitions can be selected.
+- **M10** Tests: no host disks, fake tools on PATH, tool tests fail instead of
+  skipping when `DFDISK_REQUIRE_TOOLS=1` (set in the Nix build and in CI),
+  modules are compiled once (the binary uses the library).
+- **M11** RAW: source reads use `O_DIRECT` with aligned buffers (buffered reads
+  with page-cache eviction where unsupported, noted in the report), a bad
+  sector is located exactly, interrupted reads are retried, and
+  `--on-read-error zero-fill` continues over unreadable sectors.
+- **M12** `dfdisk verify`: a requested digest that was not computed is a failure,
+  never a pass; `.Ex01` and `.E02` segment families are recognised as EWF.
+- Low: `-r` above 255 is a usage error instead of silently becoming 2; `-m` and
+  `-M` (media type and flags) are set from the source; firmware and other device
+  strings are sanitised; false README claims removed; runtime tools are no longer
+  build inputs of the Nix package; the Debian copyright covers both licenses;
+  `rust-version` is declared; active swap files on the source are refused by
+  name; `/iso`, `/run/initramfs` and swap join the system-mount list.
+
+### Added
+
+- **F1** One verdict model and read-error table for all engines (ranges from
+  `ewfinfo -e`, the ddrescue map or the RAW engine), one function deciding the
+  verdict.
+- **F2** Identity pinning and a confirmation sheet with a typed serial suffix.
+- **F3** Write-protection capture and enforcement (sysfs read-only state,
+  holders, `O_EXCL`, BLKROSET), recorded in the report and the audit log.
+- **F4** HPA/DCO and NVMe capacity detection.
+- **F5** `<base>.info.json`, tool versions and command lines, kernel, host and
+  dfnix revision, dfdisk and dfcore git revisions (`dfdisk --version`), clock and
+  NTP state with the RTC offset, documented exit codes, `dfdisk check` (dry run),
+  `acquire --json`, `list --json`.
+- **F6** Re-verification as an audited addendum (`dfdisk verify`, TUI re-verify
+  screen, `--report`, `--pieces`) and an optional second read of the source
+  (`--verify-source`).
+- **F7** Piecewise SHA-256 (`--piece-size`, `<base>.pieces.tsv`) in the report
+  and the audit record.
+- **F8** Persistent result screen; SIGHUP-resilient headless completion and a
+  warning when the TUI runs over SSH outside tmux or screen.
+- **F10** `--rescue-to-e01`: a finished rescue is converted to E01 and the rescue's
+  read-error summary goes into the E01 notes and both reports. The ddrescue map is
+  not imported into the E01 as EWF error ranges.
+- **F11** Chain-of-custody fields `--seal`, `--seized-at`, `--seized-location`;
+  required examiner, case and evidence number; a TUI case profile
+  (`$XDG_CONFIG_HOME/dfdisk/profile.toml`) with an evidence-number suggestion.
+- **F12** SMART policy `--smart off|basic|full`, before and (rescue) after the
+  acquisition.
+- `--expect-serial`, `--expect-wwn`, `--expect-size`, `--allow-holders`,
+  `--allow-tmpfs`, `--allow-low-space`, `--write-protect auto|off`,
+  `--on-read-error stop|zero-fill`.
+
+### Not in 0.2.0
+
+- AFF4 output: little value for the effort.
+- Splitting RAW images into segments: refused with guidance (use E01).
+- Detachable acquisitions that can be re-attached: 0.2.0 finishes headless after
+  SIGHUP and warns about SSH sessions outside tmux/screen instead.
+- `cargo install --git`: dfdisk builds against a sibling dfcore checkout (D1).
+- **F9** Dual destination (`ewfacquire -2`) was not taken up.
+
+---
+
+## [0.1.10] - 2026-10-11
+
+### Added
+- **dfcore integration**: disk topology for the destination-on-source check
+  comes from dfcore; sources listed in the dfnix boot-time protected-device
+  registry are refused.
+- **Audit records**: each acquisition appends `acquisition_started` (its hash is
+  the report's Audit Anchor) and `acquisition_finished` (outcome, hashes, files,
+  report SHA-256) to the dfnix audit log, and copies the verified log and its
+  head into the case directory (not for refused acquisitions).
+
+### Fixed
+- Existing outputs of an acquisition are refused instead of being overwritten
+  (ewfacquire `-u` overwrote silently).
+- Output directories on the source's own physical disk are refused.
+- E01 digests are computed in ewfacquire's single read pass; only the selected
+  digests are verified.
+- RAW stops at the first unreadable sector, keeps the partial image and writes
+  an INCOMPLETE report with the exact offset.
+
+---
+
 ## [0.1.9] - 2026-10-11
 
 ### Changed
