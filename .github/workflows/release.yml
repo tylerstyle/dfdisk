@@ -89,7 +89,8 @@ jobs:
   build-binaries:
     name: Build Binary (${{ matrix.target }})
     needs: [check-version, test]
-    # glibc builds link against the oldest glibc of the runner images in use
+    # ubuntu-22.04 (glibc 2.35), the oldest runner image: the native x86_64 gnu
+    # binary needs no newer glibc (the cross targets use the cross images)
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -159,7 +160,7 @@ jobs:
   build-deb:
     name: Build Debian Package (.deb)
     needs: [check-version, test]
-    # Ubuntu 22.04 (glibc 2.35): the .deb also installs on Debian 12
+    # Ubuntu 22.04 (glibc 2.35): $auto then asks for no newer C library than that
     runs-on: ubuntu-22.04
     env:
       VERSION: ${{ needs.check-version.outputs.version }}
