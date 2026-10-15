@@ -4,7 +4,7 @@
 //! sized to their content; inputs scroll horizontally by display width.
 
 use crate::engines::preflight::is_memory_fs;
-use crate::models::config::EngineKind;
+use crate::models::config::{EffectiveConfig, EngineKind};
 use crate::models::conversion::ConversionTarget;
 use crate::models::outcome::Outcome;
 use crate::models::telemetry::AcquisitionStatus;
@@ -65,11 +65,12 @@ fn block(title: impl Into<String>, color: Color) -> Block<'static> {
 /// Draw the whole screen.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.frame_size = (area.width, area.height);
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         render_too_small(frame, area);
         return;
     }
-    let notice_lines = notice_lines(app, area.width as usize);
+    let notice_lines = notice_lines(app, area.width as usize, area.height);
     let [header, notices, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(notice_lines.len() as u16),
@@ -193,39 +194,43 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Notification lines: errors first, then warnings, then information,
-/// newest first; at most 3 lines.
-fn notice_lines(app: &App, width: usize) -> Vec<Line<'static>> {
-    let mut notices: Vec<_> = app.notices.iter().collect();
-    notices.sort_by(|a, b| b.level.cmp(&a.level).then(b.at.cmp(&a.at)));
-    let max = 3;
+/// newest first, each wrapped in full ([`App::notice_page`]); a last line
+/// counts the notices that did not fit, errors among them.
+fn notice_lines(app: &App, width: usize, height: u16) -> Vec<Line<'static>> {
+    let page = app.notice_page(width, App::notice_lines_max(height));
     let mut lines = Vec::new();
-    let shown = if notices.len() > max {
-        max - 1
-    } else {
-        notices.len()
-    };
-    for n in notices.iter().take(shown) {
-        let (icon, color) = match n.level {
-            Level::Error => ("✖ ", Color::Red),
-            Level::Warning => ("⚠ ", Color::Yellow),
-            Level::Info => ("ℹ ", Color::Cyan),
+    for (n, text) in &page.shown {
+        let color = match n.level {
+            Level::Error => Color::Red,
+            Level::Warning => Color::Yellow,
+            Level::Info => Color::Cyan,
         };
-        let text = format!("{icon}{}", n.text);
-        lines.push(Line::from(Span::styled(
-            truncate_to_width(&text, width),
-            bold(color),
-        )));
+        for l in text {
+            lines.push(Line::from(Span::styled(
+                truncate_to_width(l, width),
+                bold(color),
+            )));
+        }
     }
-    if notices.len() > shown {
+    if page.hidden > 0 {
+        let errors = match page.hidden_errors {
+            0 => String::new(),
+            1 => ", 1 of them an error".into(),
+            e => format!(", {e} of them errors"),
+        };
         lines.push(Line::from(Span::styled(
             truncate_to_width(
                 &format!(
-                    "  … {} more message(s); Ctrl+X dismisses all, F1 help",
-                    notices.len() - shown
+                    "  … {} more message(s){errors}; Ctrl+X dismisses the ones shown",
+                    page.hidden
                 ),
                 width,
             ),
-            Style::default().fg(Color::Yellow),
+            if page.hidden_errors > 0 {
+                bold(Color::Red)
+            } else {
+                Style::default().fg(Color::Yellow)
+            },
         )));
     }
     lines
@@ -259,7 +264,7 @@ pub(crate) fn footer_hints(app: &App) -> String {
         Screen::Verify => "Tab/Shift+Tab fields · F4 complete path · F5 start · Esc back · F1 help",
     };
     if app.notices.iter().any(|n| n.level != Level::Info) {
-        format!("Ctrl+X dismiss messages · {base}")
+        format!("Ctrl+X dismiss shown messages · {base}")
     } else {
         base.to_string()
     }
@@ -910,24 +915,32 @@ pub fn sheet_lines(app: &App) -> Vec<Line<'static>> {
     };
     let white = Style::default().fg(Color::White);
     let strong = bold(Color::Yellow);
+    let conversion = matches!(c.subject, ConfirmSubject::Conversion { .. });
+    // What was checked differs: the acquisition's dry run runs every check of
+    // the session; the converter's sheet only looked at the source file (and
+    // the destination's filesystem), the converter checks the rest at start
+    let (pending, ready, not_ready) = if conversion {
+        (
+            "Looking at the source image and the destination…",
+            "READY TO START: the source image exists. The converter checks the image, the destination and existing outputs when it starts. Nothing has been written yet.",
+            "NOT READY: the source image was not found or is not a regular file. Nothing has been written or changed.",
+        )
+    } else {
+        (
+            "Running the pre-flight checks (identity, safety, destination, hidden areas)…",
+            "READY: every pre-flight check passed. Nothing has been written or changed yet.",
+            "NOT READY: this would be refused. Nothing has been written or changed.",
+        )
+    };
     if c.pending {
         out.push(Line::from(Span::styled(
-            format!(
-                "{} Running the pre-flight checks (identity, safety, destination, hidden areas)…",
-                spinner(app)
-            ),
+            format!("{} {pending}", spinner(app)),
             bold(Color::Cyan),
         )));
     } else if c.ready() {
-        out.push(Line::from(Span::styled(
-            "READY: every pre-flight check passed. Nothing has been written or changed yet.",
-            bold(Color::Green),
-        )));
+        out.push(Line::from(Span::styled(ready, bold(Color::Green))));
     } else {
-        out.push(Line::from(Span::styled(
-            "NOT READY: this would be refused. Nothing has been written or changed.",
-            bold(Color::Red),
-        )));
+        out.push(Line::from(Span::styled(not_ready, bold(Color::Red))));
     }
     match &c.subject {
         ConfirmSubject::Acquisition {
@@ -1084,7 +1097,14 @@ pub fn sheet_lines(app: &App) -> Vec<Line<'static>> {
             out.push(Line::raw(""));
             out.push(section("ENGINE AND SETTINGS"));
             out.push(sheet_row("Engine", engine_choice(request.engine()), strong));
-            match check.as_ref().and_then(|c| c.effective_config.as_ref()) {
+            // The settings of the run as it will start, for the source the
+            // check identified. Not the check's own: its dry run sends no SMART
+            // command, so its configuration says SMART off
+            let effective = check
+                .as_ref()
+                .filter(|c| c.effective_config.is_some())
+                .map(|c| EffectiveConfig::build(&request.config, c.identity.as_ref()));
+            match effective {
                 Some(eff) => {
                     // The engine is the row above
                     for (k, v) in eff.rows().into_iter().filter(|(k, _)| k != "Engine") {
@@ -1926,7 +1946,7 @@ pub fn modal_rect(area: Rect, content_w: usize, content_h: usize) -> Rect {
 
 fn help_lines(app: &App) -> Vec<String> {
     let mut l = vec![
-        "Everywhere: F1 help · Esc back · Ctrl+C quit (asks while a run is busy) · Ctrl+X dismiss messages".to_string(),
+        "Everywhere: F1 help · Esc back · Ctrl+C quit (asks while a run or an unmount is busy) · Ctrl+X dismiss the messages shown (the next ones move up)".to_string(),
         "Text fields: ←→ Home End move · Backspace Delete · Ctrl+U clear · Ctrl+W delete word".to_string(),
         "Forms: Tab / Shift+Tab next / previous field · Space ←→ change a choice · F4 path completion".to_string(),
         String::new(),
@@ -1960,7 +1980,7 @@ fn help_lines(app: &App) -> Vec<String> {
         ],
         Screen::Converter => &[
             "RAW (.raw/.dd/.img/.001) converts to E01, EWF (.E01...) to RAW.",
-            "Case fields are pre-filled from the source's .info.json when one is found next to it.",
+            "Empty case, evidence, examiner and description fields are filled from the source's .info.json when one is found next to it; its other case values are taken over by the converter.",
             "F5 opens the confirmation sheet.",
         ],
         Screen::Verify => &[
@@ -2016,6 +2036,20 @@ fn render_modal(frame: &mut Frame, app: &App, area: Rect) {
                 "The report is still written; a tool killed hard may not finalise its own files.".into(),
                 String::new(),
                 "Kill now? [y/N]".into(),
+            ],
+        ),
+        Modal::Quit if app.job.is_none() => (
+            " Quit? ".into(),
+            Color::Magenta,
+            vec![
+                format!(
+                    "An audited unmount of {} is running.",
+                    app.unmounting.as_deref().unwrap_or("the source")
+                ),
+                "It is not interrupted: dfdisk quits once it has finished, checked that nothing".into(),
+                "stayed mounted and written its audit record.".into(),
+                String::new(),
+                "Quit then? [y/N]".into(),
             ],
         ),
         Modal::Quit => (

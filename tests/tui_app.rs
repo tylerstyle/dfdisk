@@ -16,7 +16,7 @@ use dfdisk::models::info_report::{ForensicInfoReport, HashResults};
 use dfdisk::models::outcome::{Outcome, VerificationResult};
 use dfdisk::models::telemetry::ProgressTelemetry;
 use dfdisk::signals::{SignalAction, SignalKind, StopFlags};
-use dfdisk::tui::app::{App, Level, Modal, RunResult, Screen};
+use dfdisk::tui::app::{App, JobKind, Level, Modal, RunResult, Screen};
 use dfdisk::tui::backend::{ProgressTx, TuiBackend};
 use dfdisk::tui::form::{ConvField, Field};
 use futures::future::BoxFuture;
@@ -165,6 +165,8 @@ enum Acquire {
     Refused,
     /// Runs until the abort flag is set, then reports Aborted
     UntilAborted,
+    /// A bug in the session: the job panics
+    Panic,
 }
 
 struct Script {
@@ -176,6 +178,12 @@ struct Script {
     acquire: Acquire,
     destination: Result<DestinationFacts, String>,
     unmounts: Vec<String>,
+    /// How long umount takes (dirty data being flushed)
+    unmount_delay: Duration,
+    /// Unmounts that ran to the end (their audit record written)
+    unmounts_finished: Vec<String>,
+    /// A bug in the unmount: it panics
+    unmount_panics: bool,
     conversions: Vec<ConversionRequest>,
     audit_log: Option<PathBuf>,
 }
@@ -198,6 +206,9 @@ impl Fake {
                 ..Default::default()
             }),
             unmounts: Vec::new(),
+            unmount_delay: Duration::ZERO,
+            unmounts_finished: Vec::new(),
+            unmount_panics: false,
             conversions: Vec::new(),
             audit_log: None,
         })))
@@ -222,7 +233,16 @@ impl TuiBackend for Fake {
     }
 
     fn unmount(&self, device: &BlockDevice) -> Result<UnmountResult, AcquisitionError> {
-        self.s().unmounts.push(device.path.clone());
+        let (delay, panics) = {
+            let mut s = self.s();
+            s.unmounts.push(device.path.clone());
+            (s.unmount_delay, s.unmount_panics)
+        };
+        std::thread::sleep(delay);
+        if panics {
+            panic!("simulated bug in the unmount");
+        }
+        self.s().unmounts_finished.push(device.path.clone());
         Ok(UnmountResult {
             unmounted: device.mountpoints.clone(),
             holders: Vec::new(),
@@ -259,6 +279,7 @@ impl TuiBackend for Fake {
                 Acquire::Verified => Ok(report_for(&request, false, false)),
                 Acquire::Mismatch => Ok(report_for(&request, false, true)),
                 Acquire::Refused => Err(AcquisitionError::refused("in use: mounted elsewhere")),
+                Acquire::Panic => panic!("simulated bug in the session"),
                 Acquire::UntilAborted => {
                     for _ in 0..1000 {
                         if stop.is_aborted() {
@@ -596,6 +617,37 @@ async fn a_source_without_serial_is_confirmed_with_the_evidence_number() {
     assert_eq!(app.screen, Screen::Running);
 }
 
+fn sheet_text(app: &App) -> Vec<String> {
+    dfdisk::tui::ui::sheet_lines(app)
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_sheet_shows_the_smart_policy_the_run_uses() {
+    let fake = Fake::new(vec![evidence()]);
+    let mut app = app_with(&fake);
+    to_case_setup(&mut app, "/mnt/case");
+    assert_eq!(app.form.smart, SmartPolicy::Basic, "form default");
+    to_confirm(&mut app).await;
+    // The dry run itself sends no SMART command
+    assert_eq!(fake.s().check_requests[0].config.smart, SmartPolicy::Off);
+    let smart: Vec<String> = sheet_text(&app)
+        .into_iter()
+        .filter(|l| l.contains("SMART"))
+        .collect();
+    assert_eq!(smart.len(), 1, "{smart:?}");
+    assert!(smart[0].trim_end().ends_with("basic"), "{smart:?}");
+    typ(&mut app, "kd7y");
+    app.handle_key(key(KeyCode::Enter));
+    pump(&mut app, "result", |a| a.screen == Screen::Result).await;
+    assert_eq!(
+        fake.s().acquire_requests[0].config.smart,
+        SmartPolicy::Basic
+    );
+}
+
 #[tokio::test]
 async fn a_refused_check_cannot_be_started() {
     let fake = Fake::new(vec![evidence()]);
@@ -747,6 +799,62 @@ async fn sighup_continues_headless_and_quits_after_the_report() {
 }
 
 #[tokio::test]
+async fn a_panic_in_a_job_is_a_failed_result_not_a_hang() {
+    for quit in [false, true] {
+        let fake = Fake::new(vec![evidence()]);
+        fake.s().acquire = Acquire::Panic;
+        let mut app = app_with(&fake);
+        to_case_setup(&mut app, "/mnt/case");
+        to_confirm(&mut app).await;
+        typ(&mut app, "kd7y");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Running);
+        if quit {
+            // The examiner asked to quit: dfdisk does, after the result
+            app.handle_key(ctrl('c'));
+            app.handle_key(key(KeyCode::Char('y')));
+            pump(&mut app, "quit", |a| a.should_quit).await;
+        } else {
+            pump(&mut app, "result", |a| a.screen == Screen::Result).await;
+        }
+        assert!(app.job.is_none(), "the job is over");
+        let r = app.result.as_ref().unwrap();
+        assert_eq!(r.label(), "FAILED (INTERNAL ERROR)");
+        assert_eq!(r.exit_code(), 4);
+        let lines = r.lines();
+        assert!(
+            lines[0].contains("simulated bug in the session"),
+            "{lines:?}"
+        );
+        // Nothing is claimed about what was or was not written
+        assert!(!lines.iter().any(|l| l.contains("No image")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("Check the destination")));
+        if quit {
+            assert_eq!(app.exit_code(), 4);
+            assert!(app
+                .exit_summary()
+                .unwrap()
+                .contains("FAILED (INTERNAL ERROR)"));
+        }
+    }
+
+    // A panic in an unmount ends the unmount, with an error; quitting works
+    let fake = Fake::new(vec![mounted(), evidence()]);
+    fake.s().unmount_panics = true;
+    let mut app = app_with(&fake);
+    select(&mut app, "sdy");
+    app.handle_key(key(KeyCode::Char('u')));
+    app.handle_key(key(KeyCode::Char('y')));
+    pump(&mut app, "unmount over", |a| a.unmounting.is_none()).await;
+    assert!(app
+        .notices
+        .iter()
+        .any(|n| n.level == Level::Error && n.text.contains("simulated bug in the unmount")));
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit);
+}
+
+#[tokio::test]
 async fn results_and_errors_stay_until_acknowledged() {
     let fake = Fake::new(vec![evidence()]);
     fake.s().acquire = Acquire::Refused;
@@ -840,6 +948,120 @@ async fn refused_sources_and_audited_unmount() {
 }
 
 #[tokio::test]
+async fn quitting_waits_for_a_running_unmount() {
+    for how in ["q", "ctrl-c", "sigterm", "sigquit", "sighup"] {
+        let fake = Fake::new(vec![mounted(), evidence()]);
+        fake.s().unmount_delay = Duration::from_millis(300);
+        let mut app = app_with(&fake);
+        select(&mut app, "sdy");
+        app.handle_key(key(KeyCode::Char('u')));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.unmounting.is_some(), "{how}: unmount in flight");
+        match how {
+            "q" | "ctrl-c" => {
+                app.handle_key(if how == "q" {
+                    key(KeyCode::Char('q'))
+                } else {
+                    ctrl('c')
+                });
+                assert!(matches!(app.modal, Some(Modal::Quit)), "{how}: asks");
+                assert!(!app.should_quit, "{how}");
+                app.handle_key(key(KeyCode::Char('y')));
+            }
+            other => {
+                let kind = match other {
+                    "sigterm" => SignalKind::Terminate,
+                    "sigquit" => SignalKind::Quit,
+                    _ => SignalKind::Hangup,
+                };
+                let action = app.controller.handle(kind);
+                app.on_signal(kind, action);
+            }
+        }
+        assert!(
+            !app.should_quit,
+            "{how}: quit while umount was still running"
+        );
+        assert!(fake.s().unmounts_finished.is_empty());
+        pump(&mut app, "quit after the unmount", |a| a.should_quit).await;
+        assert_eq!(fake.s().unmounts_finished, ["/dev/sdy"], "{how}");
+        // What happened is said on the terminal after the TUI closed
+        let summary = app.exit_summary().unwrap_or_default();
+        assert!(
+            summary.contains("Unmounted (audited): /media/stick"),
+            "{how}: {summary}"
+        );
+    }
+
+    // N keeps dfdisk running after the unmount
+    let fake = Fake::new(vec![mounted(), evidence()]);
+    fake.s().unmount_delay = Duration::from_millis(100);
+    let mut app = app_with(&fake);
+    select(&mut app, "sdy");
+    app.handle_key(key(KeyCode::Char('u')));
+    app.handle_key(key(KeyCode::Char('y')));
+    app.handle_key(key(KeyCode::Char('q')));
+    app.handle_key(key(KeyCode::Char('n')));
+    pump(&mut app, "unmount", |a| a.unmounting.is_none()).await;
+    assert!(!app.should_quit);
+    // Idle again: Q quits at once
+    app.handle_key(key(KeyCode::Char('q')));
+    assert!(app.should_quit);
+}
+
+#[tokio::test]
+async fn nothing_starts_while_an_unmount_runs_and_its_result_keeps_the_screen() {
+    let fake = Fake::new(vec![mounted(), evidence()]);
+    fake.s().unmount_delay = Duration::from_millis(300);
+    fake.s().acquire = Acquire::UntilAborted;
+    let mut app = app_with(&fake);
+    // Enter on the mounted stick: unmount, then its case setup
+    select(&mut app, "sdy");
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Char('y')));
+    assert!(app.unmounting.is_some());
+    // Meanwhile the examiner sets up the evidence disk
+    to_case_setup(&mut app, "/mnt/case");
+    app.handle_key(key(KeyCode::F(5)));
+    assert_eq!(app.screen, Screen::CaseSetup, "no sheet while unmounting");
+    assert!(app
+        .notices
+        .iter()
+        .any(|n| n.level == Level::Error && n.text.contains("still running")));
+    // A second unmount waits too
+    app.handle_key(key(KeyCode::Esc));
+    select(&mut app, "sdy");
+    app.handle_key(key(KeyCode::Char('u')));
+    assert!(app.modal.is_none());
+    select(&mut app, "sdx");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen, Screen::CaseSetup);
+    pump(&mut app, "unmount done", |a| a.unmounting.is_none()).await;
+    // The unmount's "then the case setup" does not take the examiner's screen
+    // or source away (it switched to the stick's case setup)
+    assert_eq!(app.screen, Screen::CaseSetup);
+    assert_eq!(app.source.as_ref().unwrap().key.kernel_name, "sdx");
+    assert_eq!(fake.s().unmounts, ["/dev/sdy"]);
+
+    // Now the acquisition starts; while it runs nothing else does
+    to_confirm(&mut app).await;
+    typ(&mut app, "kd7y");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.screen, Screen::Running);
+    app.verify.image = "/tmp/x.raw".into();
+    app.begin_verification();
+    assert_eq!(app.job.as_ref().unwrap().kind, JobKind::Acquisition);
+    assert!(app
+        .notices
+        .iter()
+        .any(|n| n.text.contains("An acquisition is running")));
+    app.handle_key(key(KeyCode::Char('a')));
+    app.handle_key(key(KeyCode::Char('y')));
+    pump(&mut app, "result", |a| a.screen == Screen::Result).await;
+    assert_eq!(fake.s().acquire_requests.len(), 1);
+}
+
+#[tokio::test]
 async fn partitions_are_selectable_sources() {
     let fake = Fake::new(vec![evidence()]);
     let mut app = app_with(&fake);
@@ -851,6 +1073,50 @@ async fn partitions_are_selectable_sources() {
     assert_eq!(src.path, "/dev/sdx1");
     assert_eq!(src.serial.as_deref(), Some("WX41A8F2KD7Y"));
     assert_eq!(src.parent.as_deref(), Some("/dev/sdx"));
+}
+
+#[tokio::test]
+async fn a_partition_whose_mapping_is_mounted_offers_the_unmount() {
+    // sdx -> sdx1 (LUKS) -> luks-x (mounted at /media/x), as the scan lists it
+    let mut d = evidence();
+    d.partitions[0].fstype = Some("crypto_LUKS".into());
+    d.partitions[0].tree_mounts = vec!["/media/x".into()];
+    d.partitions[0].holders = vec!["dm-0".into()];
+    d.partitions[0].parent_disks = vec!["/dev/sdx".into()];
+    d.partitions.push(Partition {
+        name: "luks-x".into(),
+        path: "/dev/mapper/luks-x".into(),
+        size_bytes: (1 << 30) - (16 << 20),
+        kind: Some("crypt".into()),
+        maj_min: Some("254:0".into()),
+        mountpoint: Some("/media/x".into()),
+        tree_mounts: vec!["/media/x".into()],
+        parent_disks: vec!["/dev/sdx".into()],
+        ..Default::default()
+    });
+    d.mountpoints = vec!["/media/x".into()];
+    d.holders = vec!["dm-0".into()];
+    d.safety = DeviceSafety::Mounted(vec!["/media/x".into()]);
+    let fake = Fake::new(vec![d]);
+    let mut app = app_with(&fake);
+    select(&mut app, "sdx1");
+    let row = app.current_row().unwrap();
+    assert_eq!(row.badge_text(), "MOUNTED IN-USE");
+    // U offers the audited unmount of the partition's tree (it said "has no
+    // mounted filesystem")
+    app.handle_key(key(KeyCode::Char('u')));
+    match &app.modal {
+        Some(Modal::Unmount { device, mounts, .. }) => {
+            assert_eq!(device.path, "/dev/sdx1");
+            assert_eq!(mounts, &["/media/x".to_string()]);
+        }
+        other => panic!("{other:?}; notices {:?}", app.notices),
+    }
+    app.handle_key(key(KeyCode::Char('n')));
+    // Enter does not start a case setup on a mounted source either
+    app.handle_key(key(KeyCode::Enter));
+    assert!(matches!(app.modal, Some(Modal::Unmount { .. })));
+    assert_eq!(app.screen, Screen::Explorer);
 }
 
 #[tokio::test]
@@ -926,9 +1192,28 @@ async fn case_profile_prefills_suggests_and_is_saved() {
     typ(&mut app, "KD7Y");
     app.handle_key(key(KeyCode::Enter));
     pump(&mut app, "result", |a| a.screen == Screen::Result).await;
-    let saved = std::fs::read_to_string(&path).unwrap();
-    assert!(saved.contains("last_evidence = \"HDD08\""), "{saved}");
-    assert!(saved.contains("examiner = \"A. Examiner\""));
+    // The profile is saved on a blocking thread, independently of the run:
+    // wait for its content, not for the result screen
+    let saved = wait_for_file(&path, "last_evidence = \"HDD08\"").await;
+    assert!(saved.contains("examiner = \"A. Examiner\""), "{saved}");
+}
+
+/// The content of `path` once it contains `needle` (5 s at most).
+async fn wait_for_file(path: &Path, needle: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..1000 {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if text.contains(needle) {
+                return text;
+            }
+            last = text;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!(
+        "{} never contained {needle:?}; last content:\n{last}",
+        path.display()
+    );
 }
 
 #[tokio::test]
@@ -1014,6 +1299,13 @@ async fn conversion_goes_through_the_confirmation_sheet() {
     })
     .await;
     assert!(app.confirm.as_ref().unwrap().ready());
+    // Only the source file was looked at: the sheet does not claim more
+    let sheet = sheet_text(&app);
+    assert!(
+        sheet[0].starts_with("READY TO START: the source image exists."),
+        "{sheet:?}"
+    );
+    assert!(!sheet.iter().any(|l| l.contains("every pre-flight check")));
     // No serial known: the evidence number confirms
     typ(&mut app, "ev");
     app.handle_key(key(KeyCode::Enter));
@@ -1034,6 +1326,146 @@ async fn conversion_goes_through_the_confirmation_sheet() {
         Screen::Converter,
         "back to the form after an error"
     );
+}
+
+/// An image `<stem>.raw` with its acquisition report `<stem>.info.json`.
+fn image_with_report(dir: &Path, stem: &str, case: &str, ev: &str, seal: &str) -> PathBuf {
+    let image = dir.join(format!("{stem}.raw"));
+    std::fs::write(&image, vec![0u8; 4096]).unwrap();
+    let mut dev = disk("sdx", Some(&format!("SER{stem}")), 1, 16);
+    dev.size_bytes = 4096;
+    let meta = dfdisk::models::case::CaseMetadata {
+        case_number: case.into(),
+        evidence_number: ev.into(),
+        examiner: "Acq Examiner".into(),
+        seal_number: seal.into(),
+        ..Default::default()
+    };
+    let id = identity_of(&dev);
+    let cfg = dfdisk::models::config::AcquisitionConfig::for_engine(EngineKind::Raw, dir);
+    let r = ForensicInfoReport::new(
+        EngineKind::Raw,
+        &meta,
+        id.clone(),
+        EffectiveConfig::build(&cfg, Some(&id)),
+    );
+    std::fs::write(dir.join(format!("{stem}.info.json")), r.to_json()).unwrap();
+    image
+}
+
+#[tokio::test]
+async fn the_converter_never_keeps_the_previous_images_case_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = image_with_report(dir.path(), "imgA", "CASE-A", "EV-A", "SEAL-A");
+    let b = image_with_report(dir.path(), "imgB", "CASE-B", "EV-B", "SEAL-B");
+    let fake = Fake::new(vec![]);
+    let mut app = app_with(&fake);
+    app.handle_key(key(KeyCode::Char('c')));
+    typ(&mut app, &a.display().to_string());
+    pump(&mut app, "report of A", |app| {
+        app.conv.facts.as_ref().is_some_and(|f| f.path == a)
+    })
+    .await;
+    assert_eq!(app.conv.case.case_number, "CASE-A");
+    assert_eq!(app.conv.case.evidence_number, "EV-A");
+    assert_eq!(app.conv.case.examiner, "Acq Examiner");
+    // Fields without an input on the form are not filled (and so not sent
+    // as "given"): the converter takes them from the report itself
+    assert_eq!(app.conv.case.seal_number, "");
+    assert!(app
+        .notices
+        .iter()
+        .any(|n| n.text.contains("Pre-filled from")
+            && n.text.contains("case number, evidence no., examiner")));
+
+    // The examiner changes the source to image B
+    app.notices.clear();
+    app.handle_key(ctrl('u'));
+    typ(&mut app, &b.display().to_string());
+    pump(&mut app, "report of B", |app| {
+        app.conv.facts.as_ref().is_some_and(|f| f.path == b)
+    })
+    .await;
+    assert_eq!(app.conv.case.case_number, "CASE-B");
+    assert_eq!(app.conv.case.evidence_number, "EV-B");
+    let texts: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("were emptied")),
+        "{texts:?}"
+    );
+
+    // A value the examiner typed is theirs: kept, and the difference named
+    app.conv.case.case_number = "MANUAL-1".into();
+    app.notices.clear();
+    app.handle_key(ctrl('u'));
+    typ(&mut app, &a.display().to_string());
+    pump(&mut app, "report of A again", |app| {
+        app.conv.facts.as_ref().is_some_and(|f| f.path == a)
+    })
+    .await;
+    assert_eq!(app.conv.case.case_number, "MANUAL-1");
+    assert_eq!(app.conv.case.evidence_number, "EV-A");
+    let texts: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("records other values for case number")),
+        "{texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with("Pre-filled from") && !t.contains("case number")),
+        "only the fields taken are named: {texts:?}"
+    );
+
+    // What is sent: the form's values and B's... no: A's report
+    app.conv.destination = dir.path().join("out").display().to_string();
+    app.handle_key(key(KeyCode::F(5)));
+    pump(&mut app, "sheet", |app| {
+        app.confirm.as_ref().is_some_and(|c| !c.pending)
+    })
+    .await;
+    // The serial of A's acquired device confirms
+    typ(&mut app, "imga");
+    app.handle_key(key(KeyCode::Enter));
+    pump(&mut app, "conversion result", |app| {
+        app.screen == Screen::Result
+    })
+    .await;
+    let req = fake.s().conversions[0].clone();
+    assert_eq!(req.source, a);
+    assert_eq!(
+        req.source_report.as_deref(),
+        Some(dir.path().join("imgA.info.json").as_path())
+    );
+    let case = req.case.unwrap();
+    assert_eq!(case.case_number, "MANUAL-1");
+    assert_eq!(case.evidence_number, "EV-A");
+    assert_eq!(case.seal_number, "", "not given: taken from the report");
+}
+
+#[tokio::test]
+async fn converting_a_rescue_fills_only_the_fields_the_form_shows() {
+    let fake = Fake::new(vec![evidence()]);
+    let mut app = app_with(&fake);
+    to_case_setup(&mut app, "/mnt/case");
+    app.form.engine = EngineKind::Rescue;
+    app.case.seal_number = "SEAL-1".into();
+    to_confirm(&mut app).await;
+    typ(&mut app, "kd7y");
+    app.handle_key(key(KeyCode::Enter));
+    pump(&mut app, "result", |a| a.screen == Screen::Result).await;
+    app.handle_key(key(KeyCode::Char('c')));
+    assert_eq!(app.screen, Screen::Converter);
+    assert_eq!(app.conv.case.case_number, "2026-0042");
+    assert_eq!(app.conv.case.evidence_number, "HDD01");
+    assert_eq!(app.conv.case.examiner, "J. Doe");
+    // No input on the form: not "given"; the converter reads the report
+    assert_eq!(app.conv.case.seal_number, "");
+    let p = app.conv.prefilled.as_ref().expect("recorded as pre-filled");
+    assert!(p.report.to_string_lossy().ends_with(".info.json"), "{p:?}");
+    assert_eq!(p.fields.len(), 3);
 }
 
 #[test]

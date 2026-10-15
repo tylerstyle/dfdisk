@@ -339,3 +339,51 @@ fn bad_lsblk_output_is_an_error() {
     inp.lsblk_json = "{}".into();
     assert!(scan(&inp).unwrap_err().contains("No blockdevices"));
 }
+
+#[test]
+fn a_loop_device_over_a_disk_is_its_holder_and_its_mount_counts() {
+    // losetup /dev/sdc; mount /dev/loop0 /mnt/l: lsblk lists loop0 on its
+    // own, sysfs has no holder link; the disk is in use and mounted
+    let f = host();
+    f.set("loop0", "loop/backing_file", "/dev/sdc");
+    let mut inp = input(&f);
+    inp.mountinfo = Ok(format!(
+        "{MOUNTINFO}60 22 7:0 / /mnt/l rw,relatime - ext4 /dev/loop0 rw\n"
+    ));
+    let scan = scan(&inp).unwrap();
+    let sources = scan.sources();
+    let sdc = source(&sources, "/dev/sdc");
+    assert_eq!(sdc.holders, ["loop0"]);
+    assert_eq!(sdc.mountpoints, ["/mnt/l"]);
+    assert_eq!(sdc.safety, DeviceSafety::Mounted(vec!["/mnt/l".into()]));
+    let badges = badges(sdc, None);
+    assert!(
+        badges.contains(&"MOUNTED") && badges.contains(&"IN-USE"),
+        "{badges:?}"
+    );
+}
+
+#[test]
+fn partition_entries_carry_their_tree_mounts_holders_and_disks() {
+    // sdb2 (LUKS) -> dm-0 mounted: the partition entry of the disk says so
+    let f = host();
+    let mut inp = input(&f);
+    inp.mountinfo = Ok(format!(
+        "{MOUNTINFO}61 22 254:0 / /media/plain rw,relatime - ext4 /dev/mapper/cryptdata rw\n"
+    ));
+    let scan = scan(&inp).unwrap();
+    let devices = scan.devices();
+    let sdb = devices.iter().find(|d| d.name == "sdb").unwrap();
+    let sdb2 = sdb.partitions.iter().find(|p| p.name == "sdb2").unwrap();
+    assert_eq!(sdb2.mountpoint, None, "not mounted itself");
+    assert_eq!(sdb2.tree_mounts, ["/media/plain"]);
+    assert_eq!(sdb2.holders, ["dm-0"]);
+    assert_eq!(sdb2.parent_disks, ["/dev/sdb"]);
+    let crypt = sdb
+        .partitions
+        .iter()
+        .find(|p| p.name == "cryptdata")
+        .unwrap();
+    assert_eq!(crypt.mountpoint.as_deref(), Some("/media/plain"));
+    assert_eq!(crypt.parent_disks, ["/dev/sdb"]);
+}

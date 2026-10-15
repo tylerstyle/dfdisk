@@ -1,4 +1,5 @@
 mod common;
+mod support;
 
 use common::{audit_sandbox, case, file_device, sample, scratch};
 use dfdisk::{
@@ -19,17 +20,6 @@ use digest::Digest;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-
-fn have_libewf() -> bool {
-    std::process::Command::new("ewfacquire")
-        .arg("-V")
-        .output()
-        .is_ok()
-        && std::process::Command::new("ewfverify")
-            .arg("-V")
-            .output()
-            .is_ok()
-}
 
 /// Run the session on this host (regular-file sources only), draining progress.
 async fn run(
@@ -153,8 +143,8 @@ async fn run_ewf(
     calc_sha1: bool,
     calc_sha256: bool,
 ) -> Option<(Vec<u8>, models::info_report::ForensicInfoReport)> {
-    if !have_libewf() {
-        eprintln!("skipping: ewfacquire/ewfverify not installed");
+    // Skips without libewf; fails instead when DFDISK_REQUIRE_TOOLS=1
+    if !support::tool_available(&["ewfacquire", "ewfverify"]) {
         return None;
     }
     let tmp = scratch();

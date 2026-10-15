@@ -34,11 +34,12 @@ use crate::tui::devices::{
     invalidation_notice, reconcile, source_rows, Badge, Reconciled, SelectionKey, SourceRow,
 };
 use crate::tui::form::{
-    case_text, case_text_mut, report_candidate, AcqForm, ConvField, ConvForm, Field, SourceFacts,
-    SourceReport, VerField, VerifyForm,
+    case_text, case_text_mut, field_labels, report_candidate, AcqForm, ConvField, ConvForm, Field,
+    SourceFacts, SourceReport, VerField, VerifyForm,
 };
 use crate::tui::profile::{self, CaseProfile};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use futures::FutureExt;
 use ratatui::widgets::TableState;
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -104,12 +105,40 @@ pub enum Level {
 }
 
 /// A message in the notification area. Info expires after [`INFO_TTL`];
-/// warnings and errors stay until dismissed (Ctrl+X).
+/// warnings and errors stay until dismissed (Ctrl+X dismisses the ones shown).
 #[derive(Debug, Clone)]
 pub struct Notice {
     pub text: String,
     pub level: Level,
     pub at: Instant,
+    /// Unique within the App (dismissal by identity)
+    pub id: u64,
+}
+
+/// Lines the notification area may take at least / at most a quarter of the
+/// terminal height.
+pub const NOTICE_MIN_LINES: usize = 4;
+
+/// The notices the notification area shows at a given size, wrapped, and
+/// how many it cannot show.
+#[derive(Debug, Clone)]
+pub struct NoticePage<'a> {
+    /// The notices shown with their lines (icon included); errors first,
+    /// then warnings, then information, newest first
+    pub shown: Vec<(&'a Notice, Vec<String>)>,
+    /// Notices not shown
+    pub hidden: usize,
+    /// Errors among them
+    pub hidden_errors: usize,
+}
+
+/// The icon in front of a notice.
+pub fn notice_icon(level: Level) -> &'static str {
+    match level {
+        Level::Error => "✖ ",
+        Level::Warning => "⚠ ",
+        Level::Info => "ℹ ",
+    }
 }
 
 /// A text input (for path completion).
@@ -277,6 +306,9 @@ pub enum RunResult {
         kind: JobKind,
         error: AcquisitionError,
     },
+    /// The run stopped on an internal error of dfdisk (a panic): FAILED. What
+    /// it had written by then is unknown to the TUI
+    Panicked { kind: JobKind, message: String },
 }
 
 impl RunResult {
@@ -285,7 +317,7 @@ impl RunResult {
             RunResult::Acquisition { .. } => JobKind::Acquisition,
             RunResult::Conversion { .. } => JobKind::Conversion,
             RunResult::Verification { .. } => JobKind::Verification,
-            RunResult::Error { kind, .. } => *kind,
+            RunResult::Error { kind, .. } | RunResult::Panicked { kind, .. } => *kind,
         }
     }
 
@@ -295,6 +327,7 @@ impl RunResult {
             RunResult::Conversion { report, .. } => report.exit_code(),
             RunResult::Verification { result, .. } => result.exit_code,
             RunResult::Error { error, .. } => error.exit_code(),
+            RunResult::Panicked { .. } => crate::models::outcome::exit_code::FAILED,
         }
     }
 
@@ -317,6 +350,7 @@ impl RunResult {
                 ErrorKind::Failed => "FAILED".into(),
                 ErrorKind::Aborted => "ABORTED".into(),
             },
+            RunResult::Panicked { .. } => "FAILED (INTERNAL ERROR)".into(),
         }
     }
 
@@ -339,6 +373,7 @@ impl RunResult {
                 ErrorKind::Aborted => Tone::Aborted,
                 _ => Tone::Bad,
             },
+            RunResult::Panicked { .. } => Tone::Bad,
         }
     }
 
@@ -367,6 +402,7 @@ impl RunResult {
                 }
                 l
             }
+            RunResult::Panicked { kind, message } => panic_lines(*kind, message),
         };
         if let Some(problem) = self.audit_problem() {
             lines.push(problem);
@@ -431,7 +467,7 @@ impl RunResult {
                     out.push(("Addendum".into(), a.display().to_string()));
                 }
             }
-            RunResult::Error { .. } => {}
+            RunResult::Error { .. } | RunResult::Panicked { .. } => {}
         }
         out.into_iter()
             .map(|(l, p)| (l, sanitize_line(&p)))
@@ -450,8 +486,34 @@ impl RunResult {
                 error.exit_code(),
                 error.message
             ),
+            RunResult::Panicked { kind, message } => format!(
+                "{}\n\n{}\n",
+                self.title(),
+                panic_lines(*kind, message).join("\n")
+            ),
         }
     }
+}
+
+/// What the result screen says about a run that stopped on a panic: what
+/// happened, and what is not known.
+fn panic_lines(kind: JobKind, message: &str) -> Vec<String> {
+    vec![
+        format!(
+            "dfdisk stopped the {} on an internal error: {message}",
+            kind.label()
+        ),
+        "Files written so far are left as they are and may be incomplete; the run may have stopped before writing its report and audit record. Check the destination and the audit log.".into(),
+    ]
+}
+
+/// The text of a panic payload.
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic without a message".into())
 }
 
 /// Results of background work.
@@ -500,6 +562,18 @@ enum BgEvent {
         report: Option<PathBuf>,
     },
     Acquired(Box<Result<ForensicInfoReport, AcquisitionError>>),
+    /// A job's work panicked (dfdisk bug): FAILED, never a hang
+    JobPanicked {
+        kind: JobKind,
+        message: String,
+    },
+    /// Other background work panicked
+    Internal {
+        /// Token of the sheet or completion it belonged to
+        token: Option<u64>,
+        what: &'static str,
+        message: String,
+    },
     Converted(Box<Result<(ConversionReport, String), AcquisitionError>>),
     Verified(Box<Result<ImageVerification, AcquisitionError>>),
     ProfileSaved(Result<(), String>),
@@ -576,8 +650,12 @@ pub struct App {
     pub should_quit: bool,
     /// SIGHUP: the terminal is gone; nothing is drawn any more
     pub headless: bool,
-    /// Quit as soon as the running job has its result (signal, Ctrl+C)
+    /// Quit as soon as the running job has its result and a running unmount
+    /// has finished and been recorded (signal, Ctrl+C, Q)
     pub quit_after_job: bool,
+    /// What happened in the background after the examiner asked to quit
+    /// (an unmount's outcome), for the terminal once the TUI closed
+    pub exit_notes: Vec<String>,
     pub ticks: u64,
 
     // Devices
@@ -634,6 +712,9 @@ pub struct App {
     verify_due: Option<Instant>,
 
     pub notices: Vec<Notice>,
+    notice_seq: u64,
+    /// Terminal size of the last frame drawn: which notices were shown
+    pub frame_size: (u16, u16),
     pub profile: CaseProfile,
     pub profile_path: Option<PathBuf>,
     pub ssh_warning: Option<String>,
@@ -697,6 +778,7 @@ impl App {
             should_quit: false,
             headless: false,
             quit_after_job: false,
+            exit_notes: Vec::new(),
             ticks: 0,
             devices: Vec::new(),
             rows: Vec::new(),
@@ -734,6 +816,8 @@ impl App {
             verify: VerifyForm::default(),
             verify_due: None,
             notices: Vec::new(),
+            notice_seq: 0,
+            frame_size: (MIN_WIDTH, MIN_HEIGHT),
             profile: CaseProfile::default(),
             profile_path: None,
             ssh_warning: None,
@@ -783,24 +867,89 @@ impl App {
                 return;
             }
         }
+        self.notice_seq += 1;
         self.notices.push(Notice {
             text,
             level,
             at: Instant::now(),
+            id: self.notice_seq,
         });
         if self.notices.len() > 50 {
-            self.notices.remove(0);
+            // The oldest message that is not an error goes first
+            let drop = self
+                .notices
+                .iter()
+                .position(|n| n.level != Level::Error)
+                .unwrap_or(0);
+            self.notices.remove(drop);
         }
     }
 
-    /// Notices that are still shown (info ones expire).
+    /// Notices that are still kept (info ones expire), newest first.
     pub fn visible_notices(&self) -> Vec<&Notice> {
         self.notices.iter().rev().collect()
     }
 
-    /// Acknowledge every notice (Ctrl+X).
+    /// The notices the notification area shows `width` cells wide in at
+    /// most `max_lines` lines: errors first, then warnings, then
+    /// information, newest first, each wrapped in full. The first one is
+    /// always shown (cut with "…" only when it alone is longer than the
+    /// area); one line is kept free to count the notices not shown.
+    pub fn notice_page(&self, width: usize, max_lines: usize) -> NoticePage<'_> {
+        let mut sorted: Vec<&Notice> = self.notices.iter().collect();
+        sorted.sort_by(|a, b| b.level.cmp(&a.level).then(b.at.cmp(&a.at)));
+        let max_lines = max_lines.max(1);
+        let mut shown: Vec<(&Notice, Vec<String>)> = Vec::new();
+        let mut used = 0;
+        for (i, n) in sorted.iter().enumerate() {
+            // The icon, then the text; continuation lines indented under it
+            let icon = notice_icon(n.level);
+            let indent = " ".repeat(crate::tui::input::str_width(icon));
+            let mut lines: Vec<String> =
+                crate::tui::input::wrap_text(&n.text, width.saturating_sub(indent.len()))
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, l)| format!("{}{l}", if j == 0 { icon } else { &indent }))
+                    .collect();
+            let reserve = usize::from(i + 1 < sorted.len());
+            let avail = max_lines.saturating_sub(used + reserve);
+            if lines.len() > avail {
+                if !shown.is_empty() {
+                    break;
+                }
+                lines.truncate(avail.max(1));
+                if let Some(last) = lines.last_mut() {
+                    *last = crate::tui::input::truncate_to_width(&format!("{last} …"), width);
+                }
+            }
+            used += lines.len();
+            shown.push((*n, lines));
+        }
+        let hidden: Vec<&&Notice> = sorted.iter().skip(shown.len()).collect();
+        NoticePage {
+            hidden: hidden.len(),
+            hidden_errors: hidden.iter().filter(|n| n.level == Level::Error).count(),
+            shown,
+        }
+    }
+
+    /// Lines the notification area may take on a terminal `height` rows
+    /// high.
+    pub fn notice_lines_max(height: u16) -> usize {
+        (height as usize / 4).max(NOTICE_MIN_LINES)
+    }
+
+    /// Acknowledge the notices shown (Ctrl+X); the ones that did not fit
+    /// stay and move up.
     pub fn dismiss_notices(&mut self) {
-        self.notices.clear();
+        let (w, h) = self.frame_size;
+        let ids: Vec<u64> = self
+            .notice_page(w as usize, Self::notice_lines_max(h))
+            .shown
+            .iter()
+            .map(|(n, _)| n.id)
+            .collect();
+        self.notices.retain(|n| !ids.contains(&n.id));
     }
 
     pub fn has_errors(&self) -> bool {
@@ -811,15 +960,23 @@ impl App {
     // Background work
     // ------------------------------------------------------------------
 
-    fn spawn<F>(&mut self, fut: F) -> bool
+    /// Run `fut` on the runtime; its event comes back through [`tick`](Self::tick).
+    /// A panic in it becomes the event `on_panic` makes of its message, so
+    /// the UI never waits for a result that cannot come.
+    fn spawn<F, P>(&mut self, fut: F, on_panic: P) -> bool
     where
         F: Future<Output = BgEvent> + Send + 'static,
+        P: FnOnce(String) -> BgEvent + Send + 'static,
     {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 let tx = self.bg_tx.clone();
                 handle.spawn(async move {
-                    let _ = tx.send(fut.await);
+                    let ev = match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+                        Ok(ev) => ev,
+                        Err(payload) => on_panic(panic_message(payload.as_ref())),
+                    };
+                    let _ = tx.send(ev);
                 });
                 true
             }
@@ -833,15 +990,22 @@ impl App {
         }
     }
 
-    fn spawn_blocking<F>(&mut self, f: F) -> bool
+    /// [`spawn`](Self::spawn) for blocking work (a thread of the blocking
+    /// pool).
+    fn spawn_blocking<F, P>(&mut self, f: F, on_panic: P) -> bool
     where
         F: FnOnce() -> BgEvent + Send + 'static,
+        P: FnOnce(String) -> BgEvent + Send + 'static,
     {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 let tx = self.bg_tx.clone();
                 handle.spawn_blocking(move || {
-                    let _ = tx.send(f());
+                    let ev = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+                        Ok(ev) => ev,
+                        Err(payload) => on_panic(panic_message(payload.as_ref())),
+                    };
+                    let _ = tx.send(ev);
                 });
                 true
             }
@@ -853,6 +1017,57 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Work that must finish before dfdisk may exit: a job (its report) or
+    /// an audited unmount (its audit record and the check that nothing stayed
+    /// mounted). Quitting waits for it; nothing else starts meanwhile.
+    pub fn busy(&self) -> bool {
+        self.job.is_some() || self.unmounting.is_some()
+    }
+
+    /// Quit now if a quit was requested and nothing is left to finish.
+    fn quit_when_idle(&mut self) {
+        if self.quit_after_job && !self.busy() {
+            self.should_quit = true;
+        }
+    }
+
+    /// Quit requested (Q, Ctrl+C answered, a signal): at once when idle,
+    /// else once the running work has finished.
+    fn request_quit(&mut self) {
+        self.quit_after_job = true;
+        if let Some(p) = self.unmounting.clone() {
+            self.notify(
+                Level::Warning,
+                format!(
+                    "Quitting once the unmount of {p} has finished and been recorded in the audit log."
+                ),
+            );
+        }
+        self.quit_when_idle();
+    }
+
+    /// Nothing may start while a job runs (it would share the abort flags)
+    /// or an unmount is pending (it changes the sources): tell why.
+    fn start_blocked(&mut self) -> bool {
+        let why = if let Some(job) = &self.job {
+            let article = if job.kind == JobKind::Acquisition {
+                "An"
+            } else {
+                "A"
+            };
+            format!(
+                "{article} {} is running; wait for its result before starting another.",
+                job.kind.label()
+            )
+        } else if let Some(p) = &self.unmounting {
+            format!("The unmount of {p} is still running; wait for its result before starting.")
+        } else {
+            return false;
+        };
+        self.notify(Level::Error, why);
+        true
     }
 
     /// Something runs in the background (spinner in the header).
@@ -888,10 +1103,16 @@ impl App {
         let generation = self.scan_generation;
         let backend = self.backend.clone();
         self.scan_manual = manual;
-        if self.spawn_blocking(move || BgEvent::Scan {
-            generation,
-            result: backend.scan(),
-        }) {
+        if self.spawn_blocking(
+            move || BgEvent::Scan {
+                generation,
+                result: backend.scan(),
+            },
+            move |m| BgEvent::Scan {
+                generation,
+                result: Err(format!("internal error: {m}")),
+            },
+        ) {
             self.scanning = true;
         }
     }
@@ -1065,9 +1286,24 @@ impl App {
     /// the report is written); after an abort, offer the immediate stop.
     fn ctrl_c(&mut self) {
         match &self.job {
-            None => self.should_quit = true,
+            None => self.ask_quit(),
             Some(job) if job.abort_requested && !job.force_requested => {
                 self.modal = Some(Modal::Force)
+            }
+            Some(_) => self.modal = Some(Modal::Quit),
+        }
+    }
+
+    /// Quit without a running job: at once, or (an unmount runs) after a
+    /// y/N, once the unmount has finished and been recorded.
+    fn ask_quit(&mut self) {
+        match &self.unmounting {
+            None => self.should_quit = true,
+            Some(p) if self.quit_after_job => {
+                let text = format!(
+                    "Still waiting for the unmount of {p} to finish and be recorded; dfdisk quits then."
+                );
+                self.notify(Level::Info, text);
             }
             Some(_) => self.modal = Some(Modal::Quit),
         }
@@ -1112,10 +1348,8 @@ impl App {
                 if yes {
                     if self.job.is_some() {
                         self.request_abort();
-                        self.quit_after_job = true;
-                    } else {
-                        self.should_quit = true;
                     }
+                    self.request_quit();
                 }
             }
             Modal::Resume { map } => {
@@ -1181,7 +1415,7 @@ impl App {
                     self.notify(Level::Info, "No result yet in this session.");
                 }
             }
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.ask_quit(),
             _ => {}
         }
     }
@@ -1253,6 +1487,13 @@ impl App {
         let Some(row) = self.current_row().cloned() else {
             return;
         };
+        if let Some(p) = self.unmounting.clone() {
+            self.notify(
+                Level::Info,
+                format!("The unmount of {p} is still running; wait for its result."),
+            );
+            return;
+        }
         if !row.has(Badge::Mounted) {
             self.notify(
                 Level::Info,
@@ -1282,12 +1523,23 @@ impl App {
         let backend = self.backend.clone();
         let path = device.path.clone();
         self.unmounting = Some(path.clone());
-        if !self.spawn_blocking(move || BgEvent::Unmount {
-            result: backend.unmount(&device),
-            key,
-            path,
-            then_setup,
-        }) {
+        let (key2, path2) = (key.clone(), path.clone());
+        if !self.spawn_blocking(
+            move || BgEvent::Unmount {
+                result: backend.unmount(&device),
+                key,
+                path,
+                then_setup,
+            },
+            move |m| BgEvent::Unmount {
+                result: Err(AcquisitionError::failed(format!(
+                    "internal error during the unmount ({m}); check the mounts and the audit log"
+                ))),
+                key: key2,
+                path: path2,
+                then_setup: false,
+            },
+        ) {
             self.unmounting = None;
         }
     }
@@ -1313,13 +1565,21 @@ impl App {
             ),
         );
         let name = disk.name.clone();
-        if self.spawn(async move {
-            BgEvent::Capacity {
-                disk: name,
-                key,
-                result: fut.await,
-            }
-        }) {
+        let (name2, key2) = (name.clone(), key.clone());
+        if self.spawn(
+            async move {
+                BgEvent::Capacity {
+                    disk: name,
+                    key,
+                    result: fut.await,
+                }
+            },
+            move |m| BgEvent::Capacity {
+                disk: name2,
+                key: key2,
+                result: Err(format!("internal error: {m}")),
+            },
+        ) {
             self.capacity_probing = Some(disk.name);
         }
     }
@@ -1438,6 +1698,9 @@ impl App {
     /// dry run of the session (`check_with`) in the background.
     pub fn begin_acquisition(&mut self) {
         self.completion = None;
+        if self.start_blocked() {
+            return;
+        }
         let Some(source) = self.source.clone() else {
             self.notify(Level::Error, "Select a source in the device list first.");
             return;
@@ -1519,34 +1782,42 @@ impl App {
         let offer_resume = request.engine() == EngineKind::Rescue && !request.config.resume;
         let dir = request.config.output_dir.clone();
         let backend = self.backend.clone();
-        self.spawn(async move {
-            if offer_resume {
-                let (d, b) = (dir.clone(), base_name.clone());
-                let map = tokio::task::spawn_blocking(move || find_rescue_map(&d, &b))
-                    .await
-                    .ok()
-                    .flatten();
-                if map.is_some() {
-                    return BgEvent::Prepared {
-                        token,
-                        resume_map: map,
-                        check: None,
-                        destination: None,
-                    };
+        let on_panic = move |message| BgEvent::Internal {
+            token: Some(token),
+            what: "the pre-flight checks",
+            message,
+        };
+        self.spawn(
+            async move {
+                if offer_resume {
+                    let (d, b) = (dir.clone(), base_name.clone());
+                    let map = tokio::task::spawn_blocking(move || find_rescue_map(&d, &b))
+                        .await
+                        .ok()
+                        .flatten();
+                    if map.is_some() {
+                        return BgEvent::Prepared {
+                            token,
+                            resume_map: map,
+                            check: None,
+                            destination: None,
+                        };
+                    }
                 }
-            }
-            let b2 = backend.clone();
-            let destination = tokio::task::spawn_blocking(move || b2.destination(&dir))
-                .await
-                .unwrap_or_else(|e| Err(format!("destination probe stopped: {e}")));
-            let check = backend.check(check_request).await;
-            BgEvent::Prepared {
-                token,
-                resume_map: None,
-                check: Some(Box::new(check)),
-                destination: Some(destination),
-            }
-        });
+                let b2 = backend.clone();
+                let destination = tokio::task::spawn_blocking(move || b2.destination(&dir))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("destination probe stopped: {e}")));
+                let check = backend.check(check_request).await;
+                BgEvent::Prepared {
+                    token,
+                    resume_map: None,
+                    check: Some(Box::new(check)),
+                    destination: Some(destination),
+                }
+            },
+            on_panic,
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1636,6 +1907,9 @@ impl App {
         };
         if c.pending {
             self.notify(Level::Info, "The pre-flight checks are still running.");
+            return;
+        }
+        if self.start_blocked() {
             return;
         }
         if matches!(c.subject, ConfirmSubject::Acquisition { .. }) {
@@ -1730,7 +2004,13 @@ impl App {
         self.confirm = None;
         self.screen = Screen::Running;
         self.save_profile();
-        self.spawn(async move { BgEvent::Acquired(Box::new(fut.await)) });
+        self.spawn(
+            async move { BgEvent::Acquired(Box::new(fut.await)) },
+            |message| BgEvent::JobPanicked {
+                kind: JobKind::Acquisition,
+                message,
+            },
+        );
     }
 
     fn save_profile(&mut self) {
@@ -1743,13 +2023,16 @@ impl App {
             return;
         };
         let profile = self.profile.clone();
-        self.spawn_blocking(move || {
-            BgEvent::ProfileSaved(
-                profile
-                    .save(&path)
-                    .map_err(|e| format!("case profile {} not saved: {e}", path.display())),
-            )
-        });
+        self.spawn_blocking(
+            move || {
+                BgEvent::ProfileSaved(
+                    profile
+                        .save(&path)
+                        .map_err(|e| format!("case profile {} not saved: {e}", path.display())),
+                )
+            },
+            |m| BgEvent::ProfileSaved(Err(format!("case profile not saved: internal error: {m}"))),
+        );
     }
 
     fn key_running(&mut self, key: KeyEvent) {
@@ -1784,9 +2067,7 @@ impl App {
         self.result_acknowledged = false;
         self.modal = None;
         self.screen = Screen::Result;
-        if self.quit_after_job {
-            self.should_quit = true;
-        }
+        self.quit_when_idle();
     }
 
     fn key_result(&mut self, key: KeyEvent) {
@@ -1879,11 +2160,13 @@ impl App {
             source: image,
             target: ConversionTarget::E01,
             destination: dir,
-            case,
             field: ConvField::Destination,
             notes,
             ..ConvForm::default()
         };
+        // The fields the form shows, from the rescue's report; the converter
+        // reads that report itself for the rest
+        self.conv.prefill_from(&report_json, &case);
         self.conv.cursor = self.conv.destination.len();
         self.conv_due = Some(Instant::now());
         self.screen = Screen::Converter;
@@ -1949,9 +2232,7 @@ impl App {
                     let changed = *t != before;
                     self.conv.cursor = cursor;
                     if changed && field == ConvField::Source {
-                        self.conv.detect_target();
-                        self.conv.facts = None;
-                        self.conv_due = Some(Instant::now() + PROBE_DEBOUNCE);
+                        self.conv_source_changed();
                     }
                 }
             }
@@ -1962,9 +2243,60 @@ impl App {
         }
     }
 
+    /// The converter's source text changed: target guess, probe after the
+    /// debounce, and the case values the previous image's report filled in
+    /// (and the examiner left untouched) are emptied: they are not the new
+    /// image's.
+    fn conv_source_changed(&mut self) {
+        self.conv.detect_target();
+        self.conv.facts = None;
+        self.conv_due = Some(Instant::now() + PROBE_DEBOUNCE);
+        if let Some((report, cleared)) = self.conv.clear_prefill() {
+            if !cleared.is_empty() {
+                self.notify(
+                    Level::Info,
+                    format!(
+                        "The source changed: {} taken from {} were emptied.",
+                        field_labels(&cleared),
+                        report.display()
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Fill the converter's empty case fields from the report of its source
+    /// and say exactly which were taken, and which differ from the report.
+    fn prefill_conversion(&mut self, report: &SourceReport) {
+        let (taken, differing) = self.conv.prefill_from(&report.path, &report.case);
+        if !taken.is_empty() {
+            self.notify(
+                Level::Info,
+                format!(
+                    "Pre-filled from {}: {}",
+                    report.path.display(),
+                    field_labels(&taken)
+                ),
+            );
+        }
+        if !differing.is_empty() {
+            self.notify(
+                Level::Warning,
+                format!(
+                    "{} records other values for {}; the form's values are recorded for the conversion (the report's are noted in it).",
+                    report.path.display(),
+                    field_labels(&differing)
+                ),
+            );
+        }
+    }
+
     /// Start pressed in the converter: validate, then the confirmation sheet.
     pub fn begin_conversion(&mut self) {
         self.completion = None;
+        if self.start_blocked() {
+            return;
+        }
         let source = self.conv.source.trim().to_string();
         if source.is_empty() {
             self.conv.field = ConvField::Source;
@@ -2028,11 +2360,18 @@ impl App {
         });
         self.screen = Screen::Confirm;
         let backend = self.backend.clone();
-        self.spawn_blocking(move || BgEvent::ConvPrepared {
-            token,
-            facts: probe_source(&source_path),
-            destination: backend.destination(&dir),
-        });
+        self.spawn_blocking(
+            move || BgEvent::ConvPrepared {
+                token,
+                facts: probe_source(&source_path),
+                destination: backend.destination(&dir),
+            },
+            move |message| BgEvent::Internal {
+                token: Some(token),
+                what: "the look at the source image",
+                message,
+            },
+        );
     }
 
     fn start_conversion_job(&mut self, request: ConversionRequest, facts: Option<SourceFacts>) {
@@ -2074,23 +2413,29 @@ impl App {
         });
         self.confirm = None;
         self.screen = Screen::Running;
-        self.spawn(async move {
-            let result = match fut.await {
-                Ok(report) => {
-                    let text = tokio::fs::read_to_string(&report.report_file)
-                        .await
-                        .unwrap_or_else(|e| {
-                            format!(
-                                "(the report {} could not be read: {e})",
-                                report.report_file.display()
-                            )
-                        });
-                    Ok((report, text))
-                }
-                Err(e) => Err(e),
-            };
-            BgEvent::Converted(Box::new(result))
-        });
+        self.spawn(
+            async move {
+                let result = match fut.await {
+                    Ok(report) => {
+                        let text = tokio::fs::read_to_string(&report.report_file)
+                            .await
+                            .unwrap_or_else(|e| {
+                                format!(
+                                    "(the report {} could not be read: {e})",
+                                    report.report_file.display()
+                                )
+                            });
+                        Ok((report, text))
+                    }
+                    Err(e) => Err(e),
+                };
+                BgEvent::Converted(Box::new(result))
+            },
+            |message| BgEvent::JobPanicked {
+                kind: JobKind::Conversion,
+                message,
+            },
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2163,6 +2508,9 @@ impl App {
     /// audit record; no confirmation sheet: nothing is acquired).
     pub fn begin_verification(&mut self) {
         self.completion = None;
+        if self.start_blocked() {
+            return;
+        }
         let image = self.verify.image.trim().to_string();
         if image.is_empty() {
             self.verify.field = Some(VerField::Image);
@@ -2203,25 +2551,31 @@ impl App {
             force_requested: false,
         });
         self.screen = Screen::Running;
-        self.spawn(async move {
-            let expected = match report {
-                None => Ok(ExpectedHashes::default()),
-                Some(p) => {
-                    tokio::task::spawn_blocking(move || ExpectedHashes::from_report_json(&p))
-                        .await
-                        .unwrap_or_else(|e| {
-                            Err(AcquisitionError::failed(format!(
-                                "reading the report stopped: {e}"
-                            )))
-                        })
-                }
-            };
-            let result = match expected {
-                Ok(expected) => backend.verify(image, expected, stop, events_tx).await,
-                Err(e) => Err(e),
-            };
-            BgEvent::Verified(Box::new(result))
-        });
+        self.spawn(
+            async move {
+                let expected = match report {
+                    None => Ok(ExpectedHashes::default()),
+                    Some(p) => {
+                        tokio::task::spawn_blocking(move || ExpectedHashes::from_report_json(&p))
+                            .await
+                            .unwrap_or_else(|e| {
+                                Err(AcquisitionError::failed(format!(
+                                    "reading the report stopped: {e}"
+                                )))
+                            })
+                    }
+                };
+                let result = match expected {
+                    Ok(expected) => backend.verify(image, expected, stop, events_tx).await,
+                    Err(e) => Err(e),
+                };
+                BgEvent::Verified(Box::new(result))
+            },
+            |message| BgEvent::JobPanicked {
+                kind: JobKind::Verification,
+                message,
+            },
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2302,11 +2656,18 @@ impl App {
             pending: true,
         });
         let p = prefix.clone();
-        self.spawn_blocking(move || BgEvent::Completion {
-            token,
-            candidates: find_path_completions(&p, dirs_only),
-            prefix,
-        });
+        self.spawn_blocking(
+            move || BgEvent::Completion {
+                token,
+                candidates: find_path_completions(&p, dirs_only),
+                prefix,
+            },
+            move |message| BgEvent::Internal {
+                token: Some(token),
+                what: "path completion",
+                message,
+            },
+        );
     }
 
     fn apply_completion(&mut self, token: u64, prefix: String, candidates: Vec<String>) {
@@ -2365,11 +2726,7 @@ impl App {
                 self.form.resume = false;
                 self.dest_due = due;
             }
-            Input::Conv(ConvField::Source) => {
-                self.conv.detect_target();
-                self.conv.facts = None;
-                self.conv_due = due;
-            }
+            Input::Conv(ConvField::Source) => self.conv_source_changed(),
             Input::Verify(VerField::Image) => self.verify_due = due,
             Input::Verify(VerField::Report) => self.verify.report_auto = false,
             _ => {}
@@ -2382,28 +2739,24 @@ impl App {
 
     /// A signal arrived (the [`AbortController`] already applied it to the
     /// flags). SIGHUP: continue headless and quit after the report; SIGTERM /
-    /// SIGINT: graceful abort of a running job, then quit; idle: quit.
+    /// SIGINT / SIGQUIT: graceful abort of a running job, then quit; idle: quit.
     pub fn on_signal(&mut self, kind: SignalKind, action: SignalAction) {
         match kind {
             SignalKind::Hangup => {
                 self.headless = true;
-                if self.job.is_some() {
-                    self.quit_after_job = true;
-                } else {
-                    self.should_quit = true;
-                }
+                self.request_quit();
             }
-            SignalKind::Interrupt | SignalKind::Terminate => {
+            SignalKind::Interrupt | SignalKind::Terminate | SignalKind::Quit => {
                 if let Some(job) = &mut self.job {
                     job.abort_requested = true;
                     if action == SignalAction::Force {
                         job.force_requested = true;
                     }
-                    self.quit_after_job = true;
                     self.notify(Level::Warning, action.message(kind));
-                } else {
-                    self.should_quit = true;
                 }
+                // An unmount is never cut short: dfdisk quits once it has
+                // finished and been recorded
+                self.request_quit();
             }
         }
     }
@@ -2424,22 +2777,22 @@ impl App {
     /// One line for the terminal after the TUI closed, when a result was not
     /// acknowledged on screen.
     pub fn exit_summary(&self) -> Option<String> {
-        if self.result_acknowledged {
-            return None;
+        let mut lines = self.exit_notes.clone();
+        if let Some(r) = self.result.as_ref().filter(|_| !self.result_acknowledged) {
+            let report = r
+                .files()
+                .into_iter()
+                .next()
+                .map(|(_, p)| format!("; report: {p}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "dfdisk: {} {}{}",
+                r.kind().label(),
+                r.title(),
+                report
+            ));
         }
-        let r = self.result.as_ref()?;
-        let report = r
-            .files()
-            .into_iter()
-            .next()
-            .map(|(_, p)| format!("; report: {p}"))
-            .unwrap_or_default();
-        Some(format!(
-            "dfdisk: {} {}{}",
-            r.kind().label(),
-            r.title(),
-            report
-        ))
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
     // ------------------------------------------------------------------
@@ -2504,21 +2857,35 @@ impl App {
             self.conv_due = None;
             let path = self.conv.source.trim().to_string();
             if !path.is_empty() {
-                self.spawn_blocking(move || BgEvent::SourceProbe {
-                    facts: probe_source(&expand_tilde(Path::new(&path))),
-                    path,
-                });
+                self.spawn_blocking(
+                    move || BgEvent::SourceProbe {
+                        facts: probe_source(&expand_tilde(Path::new(&path))),
+                        path,
+                    },
+                    |message| BgEvent::Internal {
+                        token: None,
+                        what: "the look at the source image",
+                        message,
+                    },
+                );
             }
         }
         if self.verify_due.is_some_and(|t| now >= t) {
             self.verify_due = None;
             let image = self.verify.image.trim().to_string();
             if !image.is_empty() && (self.verify.report.is_empty() || self.verify.report_auto) {
-                self.spawn_blocking(move || BgEvent::VerifyReport {
-                    report: report_candidate(&expand_tilde(Path::new(&image)))
-                        .filter(|p| p.is_file()),
-                    image,
-                });
+                self.spawn_blocking(
+                    move || BgEvent::VerifyReport {
+                        report: report_candidate(&expand_tilde(Path::new(&image)))
+                            .filter(|p| p.is_file()),
+                        image,
+                    },
+                    |message| BgEvent::Internal {
+                        token: None,
+                        what: "the search for the image's report",
+                        message,
+                    },
+                );
             }
         }
     }
@@ -2530,10 +2897,17 @@ impl App {
         }
         let dir = self.form.output_dir();
         let backend = self.backend.clone();
-        self.spawn_blocking(move || BgEvent::Destination {
-            result: backend.destination(&dir),
-            dir,
-        });
+        let dir2 = dir.clone();
+        self.spawn_blocking(
+            move || BgEvent::Destination {
+                result: backend.destination(&dir),
+                dir,
+            },
+            move |m| BgEvent::Destination {
+                result: Err(format!("internal error: {m}")),
+                dir: dir2,
+            },
+        );
     }
 
     fn on_bg(&mut self, ev: BgEvent) {
@@ -2595,16 +2969,22 @@ impl App {
                 self.unmounting = None;
                 match result {
                     Ok(res) => {
-                        self.notify(
-                            Level::Info,
-                            if res.unmounted.is_empty() {
-                                format!("Nothing was mounted on {path}.")
-                            } else if res.audit_hash.is_some() {
-                                format!("Unmounted (audited): {}", res.unmounted.join(", "))
-                            } else {
-                                format!("Unmounted: {}", res.unmounted.join(", "))
-                            },
-                        );
+                        let text = if res.unmounted.is_empty() {
+                            format!("Nothing was mounted on {path}.")
+                        } else if res.audit_hash.is_some() {
+                            format!("Unmounted (audited): {}", res.unmounted.join(", "))
+                        } else {
+                            format!("Unmounted: {}", res.unmounted.join(", "))
+                        };
+                        if self.quit_after_job {
+                            self.exit_notes.push(format!("dfdisk: {text}"));
+                            if let Some(e) = &res.audit_error {
+                                self.exit_notes.push(format!(
+                                    "dfdisk: the unmount was NOT recorded in the audit log: {e}"
+                                ));
+                            }
+                        }
+                        self.notify(Level::Info, text);
                         for note in &res.notes {
                             // The audit failure is among the notes: an error
                             let level = if res.audit_error.is_some()
@@ -2618,18 +2998,37 @@ impl App {
                         }
                         self.unmounted = res.unmounted;
                         self.unmounted_key = Some(key.clone());
+                        // On to the case setup only where the examiner asked
+                        // for it: still in the explorer, nothing running
                         if then_setup {
-                            if let Some(row) = self.rows.iter().find(|r| r.key == key).cloned() {
-                                self.pin_source(row);
+                            let row = self.rows.iter().find(|r| r.key == key).cloned();
+                            match row {
+                                Some(row)
+                                    if self.job.is_none()
+                                        && self.modal.is_none()
+                                        && !self.quit_after_job
+                                        && self.screen == Screen::Explorer =>
+                                {
+                                    self.pin_source(row)
+                                }
+                                _ => self.notify(
+                                    Level::Info,
+                                    format!("Select {path} again to set up its acquisition."),
+                                ),
                             }
                         }
                         self.start_scan(false);
                     }
-                    Err(e) => self.notify(
-                        Level::Error,
-                        format!("Unmount of {path} {}: {}", e.kind.label().to_lowercase(), e),
-                    ),
+                    Err(e) => {
+                        let text =
+                            format!("Unmount of {path} {}: {}", e.kind.label().to_lowercase(), e);
+                        if self.quit_after_job {
+                            self.exit_notes.push(format!("dfdisk: {text}"));
+                        }
+                        self.notify(Level::Error, text);
+                    }
                 }
+                self.quit_when_idle();
             }
             BgEvent::Prepared {
                 token,
@@ -2709,32 +3108,17 @@ impl App {
                 if facts.is_ewf {
                     self.conv.target = ConversionTarget::Raw;
                 }
+                // Pre-fill the case fields the form shows from what the
+                // report recorded (the examiner sees and may edit each before
+                // it is recorded again); its other case values have no input
+                // here and are taken over by the converter from the report
+                // itself. Values of an earlier source's report were emptied
+                // when the source changed.
                 if let Some(report) = &facts.report {
-                    // Pre-fill what the report recorded; the examiner sees and
-                    // may edit every value before it is recorded again
-                    let case = &mut self.conv.case;
-                    let from = &report.case;
-                    for (dst, src) in [
-                        (&mut case.case_number, &from.case_number),
-                        (&mut case.evidence_number, &from.evidence_number),
-                        (&mut case.location_ea, &from.location_ea),
-                        (&mut case.authority, &from.authority),
-                        (&mut case.description, &from.description),
-                        (&mut case.seal_number, &from.seal_number),
-                        (&mut case.seizure_time, &from.seizure_time),
-                        (&mut case.seizure_location, &from.seizure_location),
-                    ] {
-                        if dst.trim().is_empty() {
-                            *dst = src.clone();
-                        }
+                    if self.conv.prefilled.as_ref().map(|p| &p.report) != Some(&report.path) {
+                        self.conv.clear_prefill();
                     }
-                    if case.examiner.trim().is_empty() {
-                        case.examiner = from.examiner.clone();
-                    }
-                    self.notify(
-                        Level::Info,
-                        format!("Case fields pre-filled from {}", report.path.display()),
-                    );
+                    self.prefill_conversion(report);
                 }
                 self.conv.facts = Some(facts);
             }
@@ -2815,6 +3199,30 @@ impl App {
                     }),
                 }
             }
+            BgEvent::JobPanicked { kind, message } => {
+                self.job = None;
+                self.show_result(RunResult::Panicked { kind, message });
+                if kind == JobKind::Acquisition && self.auto_refresh {
+                    self.start_scan(false);
+                }
+            }
+            BgEvent::Internal {
+                token,
+                what,
+                message,
+            } => {
+                let text = format!("Internal error in {what}: {message}");
+                if let Some(t) = token {
+                    if let Some(c) = self.confirm.as_mut().filter(|c| c.token == t) {
+                        c.pending = false;
+                        c.error = Some(text.clone());
+                    }
+                    if self.completion.as_ref().is_some_and(|c| c.token == t) {
+                        self.completion = None;
+                    }
+                }
+                self.notify(Level::Error, text);
+            }
             BgEvent::ProfileSaved(Err(e)) => self.notify(Level::Warning, e),
             BgEvent::ProfileSaved(Ok(())) => {}
         }
@@ -2866,6 +3274,67 @@ mod tests {
         assert_eq!(app.notices[0].text, "error");
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         assert!(app.notices.is_empty());
+    }
+
+    fn long_error(i: usize) -> String {
+        format!(
+            "error number {i}: Unmount of /dev/sdx1 refused: /media/evidence/some/long/path is held by process 1234 (bash) and cannot be unmounted without force"
+        )
+    }
+
+    #[test]
+    fn notices_are_wrapped_in_full_and_the_hidden_ones_counted() {
+        let mut app = App::with_devices(Vec::new());
+        app.notify(Level::Info, "Device list refreshed (2 disks).");
+        for i in 0..4 {
+            app.notify(Level::Error, long_error(i));
+        }
+        let page = app.notice_page(80, App::notice_lines_max(24));
+        // The newest errors first, each complete (no "…")
+        assert_eq!(page.shown.len(), 2);
+        for (n, lines) in &page.shown {
+            assert!(lines.iter().all(|l| crate::tui::input::str_width(l) <= 80));
+            let joined = lines
+                .iter()
+                .map(|l| l.trim_start_matches(notice_icon(n.level)).trim())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(joined, n.text, "nothing cut");
+        }
+        assert!(page.shown[0].1[0].starts_with("✖ error number 3"));
+        assert_eq!((page.hidden, page.hidden_errors), (3, 2));
+        let lines: usize = page.shown.iter().map(|(_, l)| l.len()).sum();
+        assert!(
+            lines < App::notice_lines_max(24),
+            "a line left for the count"
+        );
+    }
+
+    #[test]
+    fn ctrl_x_dismisses_only_the_notices_shown() {
+        let mut app = App::with_devices(Vec::new());
+        for i in 0..4 {
+            app.notify(Level::Error, long_error(i));
+        }
+        app.frame_size = (80, 24);
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_x);
+        // The two shown are gone; the two that did not fit stay, unread
+        let left: Vec<&str> = app.notices.iter().map(|n| n.text.as_str()).collect();
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(left[0].starts_with("error number 0") && left[1].starts_with("error number 1"));
+        app.handle_key(ctrl_x);
+        assert!(app.notices.is_empty());
+    }
+
+    #[test]
+    fn a_notice_longer_than_the_area_is_cut_visibly() {
+        let mut app = App::with_devices(Vec::new());
+        app.notify(Level::Error, "x".repeat(2000));
+        let page = app.notice_page(80, 4);
+        assert_eq!(page.shown[0].1.len(), 4);
+        assert!(page.shown[0].1[3].ends_with('…'));
+        assert_eq!(page.hidden, 0);
     }
 
     #[test]

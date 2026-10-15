@@ -3,10 +3,13 @@
 //!
 //! Terminal handling: raw mode and the alternate screen, no mouse capture
 //! (text stays selectable for copying hashes), restored on every exit path
-//! including panics. Signals (installed once per process): SIGHUP continues
+//! including a panic of the UI itself (dfdisk then exits 1). A panic in
+//! background work (a job, a scan, an unmount) does not end the UI: it
+//! becomes that work's failure on screen (a job's FAILED result), and its
+//! message is printed once the terminal is restored. Signals (installed once per process): SIGHUP continues
 //! headless (nothing more is drawn) until the running job has written its
-//! report; SIGTERM / SIGINT abort a running job gracefully and quit once its
-//! report is written; idle, they quit at once.
+//! report; SIGTERM / SIGINT / SIGQUIT abort a running job gracefully and quit
+//! once its report is written; idle, they quit at once.
 
 pub mod app;
 pub mod autocomplete;
@@ -20,14 +23,17 @@ pub mod profile;
 pub mod ui;
 
 use crate::signals::{AbortController, SignalListener};
-use app::App;
+use app::{panic_message, App};
 use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use events::{AppEvent, EventHandler};
+use futures::FutureExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
+use std::sync::Mutex;
+use std::thread::ThreadId;
 use std::time::Duration;
 
 /// Redraw and background-poll interval.
@@ -36,6 +42,43 @@ const TICK: Duration = Duration::from_millis(50);
 pub fn restore_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
+}
+
+/// Panics of background threads while the TUI runs, printed after it closed.
+static BACKGROUND_PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// What the TUI's panic hook does with a panic on `current`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanicRoute {
+    /// The UI thread: the process ends; give the terminal back and print
+    RestoreAndPrint,
+    /// Background work: the UI keeps running and shows the failure; keep
+    /// the message for later (printing now would garble the screen)
+    Keep,
+}
+
+pub fn panic_route(ui_thread: ThreadId, current: ThreadId) -> PanicRoute {
+    if current == ui_thread {
+        PanicRoute::RestoreAndPrint
+    } else {
+        PanicRoute::Keep
+    }
+}
+
+/// Await the UI; a panic of the UI itself becomes an error (exit 1, not the
+/// runtime's 101).
+async fn guard_ui<F, T>(ui: F) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: std::future::Future<Output = Result<T, Box<dyn std::error::Error>>>,
+{
+    match std::panic::AssertUnwindSafe(ui).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => Err(format!(
+            "internal error: the terminal UI stopped ({})",
+            panic_message(payload.as_ref())
+        )
+        .into()),
+    }
 }
 
 /// Run the TUI with the process' [`AbortController`] and its one signal
@@ -47,20 +90,38 @@ pub async fn run_tui_with(
     controller: AbortController,
     listener: Option<SignalListener>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
-    // Restore the terminal if a panic occurs
+    // A panic of the UI thread ends dfdisk: the terminal is restored first.
+    // Background panics are kept and printed once the terminal is back
+    let ui_thread = std::thread::current().id();
     let prev_hook = std::sync::Arc::new(std::panic::take_hook());
     let hook_clone = std::sync::Arc::clone(&prev_hook);
     std::panic::set_hook(Box::new(move |panic_info| {
-        restore_terminal();
-        hook_clone(panic_info);
+        match panic_route(ui_thread, std::thread::current().id()) {
+            PanicRoute::RestoreAndPrint => {
+                restore_terminal();
+                hook_clone(panic_info);
+            }
+            PanicRoute::Keep => {
+                if let Ok(mut kept) = BACKGROUND_PANICS.lock() {
+                    kept.push(panic_info.to_string());
+                }
+            }
+        }
     }));
 
-    let res = run_tui_inner(controller, listener).await;
+    let res = guard_ui(run_tui_inner(controller, listener)).await;
 
     restore_terminal();
     let _ = std::panic::take_hook();
     if let Ok(prev_hook) = std::sync::Arc::try_unwrap(prev_hook) {
         std::panic::set_hook(prev_hook);
+    }
+    let kept: Vec<String> = BACKGROUND_PANICS
+        .lock()
+        .map(|mut k| std::mem::take(&mut *k))
+        .unwrap_or_default();
+    for p in kept {
+        eprintln!("dfdisk: internal error in background work: {p}");
     }
 
     // The terminal is ours again: say what was not acknowledged on screen
@@ -95,7 +156,7 @@ async fn run_tui_inner(
             // A drawing error on a terminal that just went away must not end a
             // running acquisition: its report is written first
             if let Err(e) = terminal.draw(|frame| ui::render(frame, &mut app)) {
-                if app.job.is_none() {
+                if !app.busy() {
                     return Err(e.into());
                 }
                 app.headless = true;
@@ -110,7 +171,7 @@ async fn run_tui_inner(
                     // The terminal input is gone (hang-up): finish headless
                     events_open = false;
                     app.headless = true;
-                    if app.job.is_some() {
+                    if app.busy() {
                         app.quit_after_job = true;
                     } else {
                         app.should_quit = true;
@@ -150,5 +211,34 @@ mod tests {
     fn test_restore_terminal_callable() {
         // Ensure restore_terminal runs safely even if terminal was not in raw mode
         restore_terminal();
+    }
+
+    #[test]
+    fn only_a_panic_of_the_ui_thread_gives_the_terminal_back() {
+        let ui = std::thread::current().id();
+        assert_eq!(panic_route(ui, ui), PanicRoute::RestoreAndPrint);
+        let worker = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap();
+        assert_eq!(panic_route(ui, worker), PanicRoute::Keep);
+    }
+
+    #[tokio::test]
+    async fn a_panic_of_the_ui_is_an_error_not_an_abort() {
+        let ok: Result<i32, _> = guard_ui(async { Ok(7) }).await;
+        assert_eq!(ok.unwrap(), 7);
+        let failed: Result<i32, _> = guard_ui(async {
+            if std::hint::black_box(true) {
+                panic!("drawing went wrong");
+            }
+            Ok(0)
+        })
+        .await;
+        let e = failed.unwrap_err().to_string();
+        assert!(
+            e.starts_with("internal error: the terminal UI stopped"),
+            "{e}"
+        );
+        assert!(e.contains("drawing went wrong"), "{e}");
     }
 }

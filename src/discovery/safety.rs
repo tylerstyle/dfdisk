@@ -6,9 +6,10 @@
 //! ([`SafetyChecker::is_critical_mount`]) and dfcore's
 //! (`dfcore::lsblk::is_mount_system`: also /iso, /run, /sysroot, `[SWAP]`)
 //! plus the dfnix live-medium label, over the whole disk(s) a source sits on.
-//! The source tree is the source node, its partitions (for a disk) and
-//! everything stacked on them (dm, LUKS, LVM, md), matched in the mount table
-//! by device number and by mount source path.
+//! The source tree is the source node, its partitions (whatever its kind) and
+//! everything stacked on them (dm, LUKS, LVM, md, and loop devices whose
+//! backing file is a node of the tree), matched in the mount table by device
+//! number and by mount source path.
 
 use crate::discovery::sysfs::SysRoot;
 use crate::discovery::writeprotect;
@@ -17,7 +18,7 @@ use crate::engines::process::{run_blocking, ProcessSpec};
 use crate::engines::session::{HostSystem, SessionHost, SwapEntry};
 use crate::engines::AcquisitionError;
 use crate::models::device::DeviceSafety;
-use crate::models::identity::{SourceIdentity, SourceKind};
+use crate::models::identity::SourceIdentity;
 use crate::models::protection::RegistryPresence;
 use crate::models::text::sanitize_line;
 use dfcore::lsblk::FlatDevice;
@@ -198,8 +199,8 @@ pub struct SourceTree {
 }
 
 impl SourceTree {
-    /// From sysfs: the source, its partitions (for a disk) and everything
-    /// stacked on them (`writeprotect::source_tree`).
+    /// From sysfs: the source, its partitions and everything stacked on them,
+    /// loop devices over them included (`writeprotect::source_tree`).
     pub fn from_sysfs(sys: &SysRoot, identity: &SourceIdentity) -> Self {
         let mut tree = SourceTree::default();
         for node in writeprotect::source_tree(sys, identity) {
@@ -506,15 +507,12 @@ pub fn unmount_source_tree_with(
         Ok(swaps) => refusals.extend(tree.swaps(&swaps).into_iter().map(swap_refusal)),
     }
 
-    // Holders: stacked devices, not partitions of a disk source
-    let partitions: BTreeSet<String> =
-        if matches!(tree_identity.kind, SourceKind::Disk | SourceKind::Other) {
-            sys.partitions(&tree_identity.kernel_name)
-                .into_iter()
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
+    // Holders: stacked devices and loop devices over the source, not the
+    // source's own partitions
+    let partitions: BTreeSet<String> = sys
+        .partitions(&tree_identity.kernel_name)
+        .into_iter()
+        .collect();
     let holders: Vec<String> = tree
         .nodes
         .iter()
@@ -524,7 +522,7 @@ pub fn unmount_source_tree_with(
     let mut notes = Vec::new();
     if !holders.is_empty() {
         notes.push(format!(
-            "devices stacked on the source stay open ({}); dfdisk does not close LUKS, LVM or md devices; close them before the acquisition",
+            "devices stacked on the source stay open ({}); dfdisk does not close LUKS, LVM, md or loop devices. Close them before the acquisition: it refuses a source with holders",
             holders.join(", ")
         ));
     }

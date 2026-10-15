@@ -24,8 +24,8 @@ The workflow refuses to run unless these agree:
 - the `dfdisk` entry in `Cargo.lock` (run `cargo check` after editing `Cargo.toml`)
 - `version` in `package.nix`
 - the tag (`v` + version)
-- a section `## [<version>] - <date>` in `CHANGELOG.md`; its text becomes the
-  release notes
+- a section `## [<version>] - <YYYY-MM-DD>` in `CHANGELOG.md` (a section still
+  headed `- Unreleased` is refused); its text becomes the release notes
 
 ## 3. Dry run
 
@@ -70,8 +70,11 @@ is a change worth a CHANGELOG line.
 
 ## NUR recipe (manual step)
 
-The `update-nur` job rewrites only `version`, the source hash, `cargoHash` and
-the dfcore `rev`/`hash` in `pkgs/dfdisk/default.nix` of `tylerstyle/nur-packages`.
+The `update-nur` job rewrites only `version`, the source hash, `cargoHash`, the
+dfcore `rev`/`hash` and `DFDISK_GIT_REV` in `pkgs/dfdisk/default.nix` of
+`tylerstyle/nur-packages`. `DFDISK_GIT_REV` becomes the commit the tag names
+(`git rev-parse "<tag>^{commit}"`; the recipe fetches the source by tag, so it
+cannot take the commit from the fetch). The job fails when it cannot set it.
 Everything else in that recipe is maintained by hand and has to follow
 `package.nix` whenever it changes:
 
@@ -83,8 +86,10 @@ Everything else in that recipe is maintained by hand and has to follow
 - `nativeCheckInputs = [ libewf ddrescue stdenv.cc ]` and
   `preCheck = "export DFDISK_REQUIRE_TOOLS=1"`, so the tool tests run instead of
   skipping;
-- `DFDISK_GIT_REV` / `DFCORE_GIT_REV` in `env` (the tag's commit and the dfcore
-  revision), because build.rs cannot run git in the sandbox;
+- `env = { DFDISK_GIT_REV = "<commit>"; DFCORE_GIT_REV = dfcoreSrc.rev; }`,
+  because build.rs cannot run git in the sandbox: the job writes the dfdisk
+  commit, the dfcore revision follows the dfcore fetch it pins (a literal
+  dfcore revision there is rewritten with the pin);
 - the combined source tree with dfcore next to dfdisk (`sourceRoot` in the
   dfdisk directory) so that `path = "../dfcore"` resolves.
 

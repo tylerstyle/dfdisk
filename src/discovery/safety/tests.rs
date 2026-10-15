@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::discovery::sysfs::fake::FakeSysfs;
+use crate::models::identity::SourceKind;
 use dfcore::lsblk::DeviceIdentity;
 use dfcore::protected::{ProtectedDevice, Role};
 use serde_json::Value;
@@ -438,4 +439,68 @@ fn legacy_checker_uses_the_union_and_never_unmounts() {
     assert!(!SafetyChecker::is_critical_mount("/homebrew"));
     assert!(!SafetyChecker::is_critical_mount("/variable"));
     assert!(SafetyChecker::is_critical_mount(" /nix/store\t"));
+}
+
+/// LSBLK plus loop0 (an image) with a partition.
+const LSBLK_LOOP: &str = r#"{"blockdevices":[
+  {"name":"sda","path":"/dev/sda","maj:min":"8:0","size":"100G","ro":false,"type":"disk","serial":"SYS1","mountpoints":[null],"children":[
+    {"name":"sda1","path":"/dev/sda1","maj:min":"8:1","type":"part","fstype":"ext4","mountpoints":["/"]}]},
+  {"name":"loop0","path":"/dev/loop0","maj:min":"7:0","size":"512000","ro":false,"type":"loop","mountpoints":[null],"children":[
+    {"name":"loop0p1","path":"/dev/loop0p1","maj:min":"259:0","type":"part","fstype":"ext4","mountpoints":["/mnt/img"]}]}
+]}"#;
+
+#[test]
+fn a_loop_source_unmounts_the_filesystems_of_its_partitions() {
+    // losetup -P of an image; loop0p1 mounted
+    let mut host = Fake::new();
+    host.lsblk = LSBLK_LOOP;
+    host.sys
+        .add_loop("loop0", (7, 0), 1000, "/srv/images/case.img");
+    host.sys
+        .add_partition("loop0", "loop0p1", (259, 0), 1, 2048, 900);
+    host.mountinfo
+        .borrow_mut()
+        .push_str("60 22 259:0 / /mnt/img rw,relatime - ext4 /dev/loop0p1 rw\n");
+    host.node = Some((7, 0));
+    let res = unmount_source_tree_with(
+        &host,
+        &id(
+            "loop0",
+            "7:0",
+            SourceKind::Loop {
+                backing_file: Some("/srv/images/case.img".into()),
+            },
+        ),
+    )
+    .unwrap();
+    assert_eq!(res.mounts_before, ["/mnt/img"]);
+    assert_eq!(res.unmounted, ["/mnt/img"]);
+    assert!(res.holders.is_empty(), "{:?}", res.holders);
+    assert!(!host.mountinfo.borrow().contains("/mnt/img"));
+}
+
+#[test]
+fn a_loop_over_the_source_is_a_holder_and_its_mounts_are_unmounted() {
+    // losetup -P /dev/sdb; loop0p1 mounted: the source's data is mounted
+    let mut host = Fake::new();
+    host.sys.add_loop("loop0", (7, 0), 10_000, "/dev/sdb");
+    host.sys
+        .add_partition("loop0", "loop0p1", (259, 0), 1, 2048, 4000);
+    host.mountinfo
+        .borrow_mut()
+        .push_str("60 22 259:0 / /mnt/loop rw,relatime - ext4 /dev/loop0p1 rw\n");
+    host.node = Some((8, 16));
+    let res = unmount_source_tree_with(&host, &id("sdb", "8:16", SourceKind::Disk)).unwrap();
+    assert!(res.mounts_before.contains(&"/mnt/loop".to_string()));
+    assert!(res.unmounted.contains(&"/mnt/loop".to_string()));
+    assert!(
+        res.holders.contains(&"loop0".to_string()),
+        "{:?}",
+        res.holders
+    );
+    assert!(
+        res.notes.iter().any(|n| n.contains("loop0")),
+        "{:?}",
+        res.notes
+    );
 }

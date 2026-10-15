@@ -460,8 +460,9 @@ fn build_node(
     );
     let protected = registry_protection(&input.registry, &ctx.flat, &path, dev);
 
-    // Holders: devices stacked on the node or its partitions
-    let partitions: BTreeSet<String> = if in_sysfs && identity.kind == SourceKind::Disk {
+    // Holders: devices stacked on the node or its partitions, loop devices
+    // over them; the node's own partitions (of a disk, loop or md) are not
+    let partitions: BTreeSet<String> = if in_sysfs {
         input
             .sys
             .partitions(&identity.kernel_name)
@@ -686,6 +687,9 @@ impl ScannedNode {
             maj_min: d.maj_min.clone(),
             kind: Some(self.lsblk_type.clone()),
             start_sector: d.start_sector,
+            tree_mounts: d.mountpoints.clone(),
+            holders: d.holders.clone(),
+            parent_disks: self.identity.parent_disks.clone(),
         }
     }
 }

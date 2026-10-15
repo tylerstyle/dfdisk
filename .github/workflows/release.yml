@@ -44,8 +44,11 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match the version v$cargo_version"
             exit 1
           fi
-          if ! grep -q "^## \[$cargo_version\]" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md has no section \"## [$cargo_version]\""
+          # The release section must carry its date: "## [0.2.0] - Unreleased"
+          # is not a release
+          version_re=$(printf '%s' "$cargo_version" | sed 's/[.]/\\./g')
+          if ! grep -Eq "^## \[$version_re\] - [0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]]*\$" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no dated section \"## [$cargo_version] - YYYY-MM-DD\""
             exit 1
           fi
           echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
@@ -277,6 +280,21 @@ jobs:
             experimental-features = nix-command flakes
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
 
+      - name: Commit of the tag
+        id: tagrev
+        run: |
+          # The recipe fetches the source by tag, so it cannot name the commit
+          # itself: DFDISK_GIT_REV (dfdisk --version, every report) is written
+          # into it as a literal. An annotated tag is peeled to its commit.
+          TAG="${GITHUB_REF_NAME}"
+          DFDISK_REV=$(git rev-parse --verify --quiet "refs/tags/${TAG}^{commit}" || true)
+          if ! printf '%s' "$DFDISK_REV" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::cannot resolve the commit of tag ${TAG} (got '${DFDISK_REV}')"
+            exit 1
+          fi
+          echo "Tag ${TAG} is commit ${DFDISK_REV}"
+          echo "dfdisk_rev=$DFDISK_REV" >> "$GITHUB_OUTPUT"
+
       - name: Calculate release hashes
         id: hashes
         run: |
@@ -328,9 +346,9 @@ jobs:
           echo "cargo_hash=$CARGO_HASH" >> "$GITHUB_OUTPUT"
           echo "Computed: version=$VERSION, src_hash=$SRC_HASH, cargo_hash=$CARGO_HASH"
 
-      # Only version, hashes and the dfcore pin are rewritten. The recipe's
-      # wrapper PATH (runtime tools) and check inputs are maintained by hand:
-      # see "NUR recipe" in docs/RELEASING.md.
+      # Only version, hashes, the dfcore pin and the embedded revisions are
+      # rewritten. The recipe's wrapper PATH (runtime tools) and check inputs
+      # are maintained by hand: see "NUR recipe" in docs/RELEASING.md.
       - name: Update NUR derivation and push
         run: |
           if [ -z "$NUR_UPDATE_TOKEN" ]; then
@@ -347,6 +365,7 @@ jobs:
 
           DFCORE_REV="${{ steps.hashes.outputs.dfcore_rev }}"
           DFCORE_HASH="${{ steps.hashes.outputs.dfcore_hash }}"
+          DFDISK_REV="${{ steps.tagrev.outputs.dfdisk_rev }}"
 
           # Each fetchFromGitHub block is addressed by its repo line so the
           # dfdisk and dfcore hashes are updated independently
@@ -355,6 +374,14 @@ jobs:
           sed -i -E "/repo = \"dfcore\";/,/hash = /{s|rev = \"[0-9a-f]+\";|rev = \"$DFCORE_REV\";|;s|hash = \"sha256-[^\"]+\";|hash = \"$DFCORE_HASH\";|}" "$TARGET_FILE"
           sed -i -E "s|cargoHash = \"sha256-[^\"]+\";|cargoHash = \"$CARGO_HASH\";|" "$TARGET_FILE"
           grep -q "rev = \"$DFCORE_REV\";" "$TARGET_FILE" || { echo "dfcore pin not updated in $TARGET_FILE"; exit 1; }
+
+          # The revisions build.rs embeds (it cannot run git in the sandbox):
+          # dfdisk's as the tag's commit; dfcore's follows the pin
+          # (DFCORE_GIT_REV = dfcoreSrc.rev), a literal there is rewritten too
+          sed -i -E "s|DFDISK_GIT_REV = [^;]+;|DFDISK_GIT_REV = \"$DFDISK_REV\";|" "$TARGET_FILE"
+          sed -i -E "s|DFCORE_GIT_REV = \"[0-9a-f]+\";|DFCORE_GIT_REV = \"$DFCORE_REV\";|" "$TARGET_FILE"
+          grep -q "DFDISK_GIT_REV = \"$DFDISK_REV\";" "$TARGET_FILE" || { echo "DFDISK_GIT_REV not set to $DFDISK_REV in $TARGET_FILE"; exit 1; }
+          grep -Eq "DFCORE_GIT_REV = (dfcoreSrc\.rev|\"$DFCORE_REV\");" "$TARGET_FILE" || { echo "DFCORE_GIT_REV in $TARGET_FILE is neither dfcoreSrc.rev nor $DFCORE_REV"; exit 1; }
 
           # Remind the maintainer when the recipe's tool list lags behind package.nix
           for tool in libewf ddrescue smartmontools util-linux systemd hdparm nvme-cli; do
