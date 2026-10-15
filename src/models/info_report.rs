@@ -701,6 +701,36 @@ impl ForensicInfoReport {
                 if let Some(dev) = &c.probed_device {
                     row(out, "Probed Device", dev);
                 }
+                let n = |v: Option<u64>| v.map_or_else(|| "?".to_string(), |v| v.to_string());
+                if let Some(a) = &c.ata {
+                    row(
+                        out,
+                        "ATA Max Sectors",
+                        format!(
+                            "visible {}, native {}, DCO real max {}{}",
+                            n(a.current_max_sectors),
+                            n(a.native_max_sectors),
+                            n(a.dco_real_max_sectors),
+                            a.sector_bytes
+                                .map(|b| format!(" ({b}-byte sectors)"))
+                                .unwrap_or_default()
+                        ),
+                    );
+                }
+                if let Some(ns) = &c.nvme {
+                    row(
+                        out,
+                        "NVMe Namespace",
+                        format!(
+                            "size {}, capacity {}, used {} blocks of {} bytes",
+                            n(ns.nsze),
+                            n(ns.ncap),
+                            n(ns.nuse),
+                            ns.lba_bytes
+                                .map_or_else(|| "?".to_string(), |b| b.to_string())
+                        ),
+                    );
+                }
                 row(out, "Method", &c.method);
                 for e in &c.errors {
                     row(out, "Probe Error", e);
@@ -1243,6 +1273,48 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("VERIFIED - ALL HASHES MATCH"));
+    }
+
+    #[test]
+    fn capacity_facts_are_in_the_text() {
+        use crate::models::capacity::{AtaCapacity, CapacityInfo, NvmeCapacity};
+        let mut r = verified();
+        r.capacity = Some(CapacityInfo {
+            reported_bytes: 1 << 20,
+            probed_device: Some("/dev/sdb".into()),
+            ata: Some(AtaCapacity {
+                native_max_sectors: Some(2048),
+                current_max_sectors: Some(2048),
+                hpa_present: Some(false),
+                dco_present: Some(false),
+                dco_real_max_sectors: Some(2048),
+                sector_bytes: Some(512),
+            }),
+            method: "hdparm -N".into(),
+            ..Default::default()
+        });
+        let text = r.render_text();
+        assert!(text.contains("no HPA or DCO found"), "{text}");
+        assert!(
+            text.contains("visible 2048, native 2048, DCO real max 2048 (512-byte sectors)"),
+            "{text}"
+        );
+        r.capacity = Some(CapacityInfo {
+            nvme: Some(NvmeCapacity {
+                nsze: Some(2048),
+                ncap: Some(2048),
+                nuse: Some(12),
+                lba_bytes: Some(512),
+            }),
+            method: "nvme id-ns (NVMe has no HPA or DCO)".into(),
+            ..Default::default()
+        });
+        let text = r.render_text();
+        assert!(
+            text.contains("size 2048, capacity 2048, used 12 blocks of 512 bytes"),
+            "{text}"
+        );
+        assert!(text.contains("NVMe has no HPA or DCO"), "{text}");
     }
 
     #[test]
