@@ -535,7 +535,7 @@ async fn bad_areas_hold_zeros_after_a_killed_session_is_resumed() {
         resume: true,
         ..rescue_config(&out)
     };
-    let resumed = run(device, config).await.unwrap();
+    let resumed = run(device.clone(), config).await.unwrap();
     assert_eq!(
         resumed.outcome,
         Outcome::CompletedWithReadErrors,
@@ -571,6 +571,57 @@ async fn bad_areas_hold_zeros_after_a_killed_session_is_resumed() {
         resumed.image_hashes.md5.as_deref(),
         Some(hex::encode(<md5::Md5 as md5::Digest>::digest(&expected)).as_str())
     );
+
+    // S-N3: the source data the zeros replaced is kept in the files of
+    // session 2 (the first session's report is kept as session 1), listed
+    // with their SHA-256
+    let bin = out.join(format!("{}.zeroed-2.bin", resumed.base_name));
+    let tsv = out.join(format!("{}.zeroed-2.tsv", resumed.base_name));
+    let mut kept = data[0x10000..0x10400].to_vec();
+    kept.extend_from_slice(&data[0x90000..0x90200]);
+    assert_eq!(std::fs::read(&bin).unwrap(), kept);
+    let sha = |b: &[u8]| hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b));
+    assert_eq!(
+        std::fs::read_to_string(&tsv).unwrap(),
+        format!(
+            "{}\n65536\t1024\t0\t{}\n589824\t512\t1024\t{}\n",
+            rescue::ZEROED_TSV_HEADER,
+            sha(&data[0x10000..0x10400]),
+            sha(&data[0x90000..0x90200])
+        )
+    );
+    for f in [&bin, &tsv] {
+        let listed = resumed
+            .auxiliary_files
+            .iter()
+            .find(|a| Path::new(&a.path) == f.as_path())
+            .unwrap_or_else(|| panic!("{} not listed", f.display()));
+        assert_eq!(listed.sha256, sha(&std::fs::read(f).unwrap()));
+    }
+    assert!(
+        notes.contains(&format!(
+            "their bytes are kept in {}.zeroed-2.bin",
+            resumed.base_name
+        )),
+        "{notes}"
+    );
+    let text = std::fs::read_to_string(out.join(format!("{}.info", resumed.base_name))).unwrap();
+    assert!(
+        text.contains(&format!(".zeroed-2.bin (SHA-256 {})", sha(&kept))),
+        "{text}"
+    );
+
+    // A further resume accepts the kept files and never touches them
+    let config = AcquisitionConfig {
+        resume: true,
+        ..rescue_config(&out)
+    };
+    let again = run(device, config).await.unwrap();
+    assert_eq!(again.outcome, Outcome::CompletedWithReadErrors);
+    assert_eq!(std::fs::read(&bin).unwrap(), kept);
+    assert!(!out
+        .join(format!("{}.zeroed-3.bin", resumed.base_name))
+        .exists());
 }
 
 #[tokio::test]

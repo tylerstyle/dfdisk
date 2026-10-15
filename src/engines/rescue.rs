@@ -7,7 +7,10 @@
 //!   never writes a bad sector, but a session killed before it saved its map
 //!   can leave data there that the map does not list as rescued; after every
 //!   ddrescue run dfdisk writes zeros over the bad-sector areas inside the
-//!   image (and fsyncs it), so the statement holds;
+//!   image (and fsyncs it), so the statement holds. The sectors that held
+//!   anything else are first copied to `<base>.zeroed-N.bin` with their
+//!   places in `<base>.zeroed-N.tsv` (N: the rescue session; never
+//!   overwritten), so nothing a session read is destroyed;
 //! - `?` non-tried, `*` non-trimmed, `/` non-scraped: `Unread`; the rescue is
 //!   incomplete until it is run again (resumed).
 //!
@@ -80,6 +83,10 @@ pub const IDENTITY_SUFFIX: &str = ".identity.json";
 /// A kept report of an earlier session: `<base>.info.session-N` and
 /// `<base>.info.session-N.json`.
 pub const SESSION_SUFFIX: &str = ".info.session-";
+/// Bytes dfdisk found in bad-sector areas before it wrote zeros over them
+/// (S-N3): `<base>.zeroed-N.bin` (the sector bytes, concatenated) and
+/// `<base>.zeroed-N.tsv` (where each run of them was), N the rescue session.
+pub const ZEROED_SUFFIX: &str = ".zeroed-";
 /// SIGINT → SIGTERM delay on abort: ddrescue saves its map on SIGINT.
 pub const DDRESCUE_GRACE: Duration = Duration::from_secs(30);
 /// How often the map is re-read for the live bad-sector count.
@@ -272,7 +279,14 @@ pub async fn acquire_with(
         )));
     }
 
-    let fin = finalize(&map, &image, expected, sector_size);
+    // This session's number: one past the kept reports of earlier sessions
+    // (the previous report was kept above)
+    let session = kept_sessions(&ctx.output_dir, &ctx.base_name)
+        .last()
+        .map(|(n, _, _)| n + 1)
+        .unwrap_or(1);
+    let zeroed_files = ZeroSidecar::new(&ctx.output_dir, &ctx.base_name, session);
+    let fin = finalize(&map, &image, expected, sector_size, &zeroed_files);
     notes.extend(fin.notes);
     let mut stop_reason = fin.stop_reason;
     if outcome.force_killed {
@@ -319,6 +333,7 @@ pub async fn acquire_with(
     if sidecar.exists() {
         auxiliary_files.push(sidecar.clone());
     }
+    auxiliary_files.extend(fin.auxiliary_files);
     Ok(EngineOutput {
         bytes_acquired: fin.bytes_acquired,
         expected_bytes: expected,
@@ -387,11 +402,21 @@ struct Finalized {
     stop_reason: Option<String>,
     bad_sectors: u64,
     notes: Vec<String>,
+    /// The files keeping bytes the zeros replaced (S-N3)
+    auxiliary_files: Vec<PathBuf>,
 }
 
 /// Parse the map, extend a finished image to the size of the source when
-/// only bad sectors are missing at its end, and derive the facts.
-fn finalize(map_path: &Path, image_path: &Path, expected: u64, sector_size: u32) -> Finalized {
+/// only bad sectors are missing at its end, and derive the facts. Bytes
+/// found in bad-sector areas are kept in `zeroed_files` before the zeros
+/// are written.
+fn finalize(
+    map_path: &Path,
+    image_path: &Path,
+    expected: u64,
+    sector_size: u32,
+    zeroed_files: &ZeroSidecar,
+) -> Finalized {
     let image_len = fs::metadata(image_path).map(|m| m.len()).ok();
     let map = match ddrescue_map::read(map_path) {
         Ok(m) => m,
@@ -406,6 +431,7 @@ fn finalize(map_path: &Path, image_path: &Path, expected: u64, sector_size: u32)
                 )),
                 bad_sectors: 0,
                 notes: Vec::new(),
+                auxiliary_files: Vec::new(),
             };
         }
     };
@@ -421,13 +447,28 @@ fn finalize(map_path: &Path, image_path: &Path, expected: u64, sector_size: u32)
     // never writes them, so data an earlier session wrote there before its
     // map recorded it would stay. dfdisk writes the zeros itself
     let mut stop_reason = None;
+    let mut auxiliary_files = Vec::new();
     let zeroed = match image_len {
-        Some(l) => match zero_bad_sectors(image_path, &map, l, sector_size) {
-            Ok(z) => z.map(|z| z.statement()),
+        Some(l) => match zero_bad_sectors(image_path, &map, l, sector_size, zeroed_files) {
+            Ok(z) => z.map(|z| {
+                if z.kept {
+                    auxiliary_files.extend(zeroed_files.paths());
+                }
+                z.statement(zeroed_files)
+            }),
             Err(e) => {
                 stop_reason = Some(format!(
-                    "dfdisk could not write zeros over the bad-sector areas of the map in the image ({e}); the image may hold other data there than the zeros this report states"
+                    "dfdisk could not write zeros over the bad-sector areas of the map in the image ({}); the image may hold other data there than the zeros this report states",
+                    e.message
                 ));
+                if e.kept {
+                    auxiliary_files.extend(zeroed_files.paths());
+                    notes.push(format!(
+                        "the bytes the bad-sector areas held before dfdisk began to write zeros over them are kept in {} and {}",
+                        file_name(&zeroed_files.bin),
+                        file_name(&zeroed_files.tsv)
+                    ));
+                }
                 None
             }
         },
@@ -466,8 +507,47 @@ fn finalize(map_path: &Path, image_path: &Path, expected: u64, sector_size: u32)
         bytes_acquired: a.bytes_acquired,
         stop_reason,
         notes,
+        auxiliary_files,
     }
 }
+
+/// Where [`zero_bad_sectors`] keeps the bytes it finds in bad-sector areas
+/// (S-N3): `<base>.zeroed-N.bin` holds them concatenated, `<base>.zeroed-N.tsv`
+/// one line per run of sectors: image offset, length, offset in the .bin
+/// file and SHA-256 of those bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZeroSidecar {
+    pub bin: PathBuf,
+    pub tsv: PathBuf,
+}
+
+impl ZeroSidecar {
+    pub fn new(dir: &Path, base: &str, session: u32) -> Self {
+        Self {
+            bin: dir.join(format!("{base}{ZEROED_SUFFIX}{session}.bin")),
+            tsv: dir.join(format!("{base}{ZEROED_SUFFIX}{session}.tsv")),
+        }
+    }
+
+    fn paths(&self) -> [PathBuf; 2] {
+        [self.bin.clone(), self.tsv.clone()]
+    }
+
+    /// Remove the files this run created after a failure before anything
+    /// was zeroed (the image still holds the bytes); a file that existed
+    /// before is never touched.
+    fn discard(&self, bin: bool, tsv: bool) {
+        if bin {
+            let _ = fs::remove_file(&self.bin);
+        }
+        if tsv {
+            let _ = fs::remove_file(&self.tsv);
+        }
+    }
+}
+
+/// The header line of `<base>.zeroed-N.tsv`.
+pub const ZEROED_TSV_HEADER: &str = "image_offset\tlength\tbin_offset\tsha256";
 
 /// What [`zero_bad_sectors`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,10 +559,12 @@ struct Zeroed {
     /// Sectors among them that held something other than zeros before
     sectors_with_data: u64,
     sector_size: u32,
+    /// Those sectors were kept in the sidecar files
+    kept: bool,
 }
 
 impl Zeroed {
-    fn statement(&self) -> String {
+    fn statement(&self, files: &ZeroSidecar) -> String {
         let what = format!(
             "dfdisk wrote zeros over the {} of the map inside the image ({}) after ddrescue ended, so the image holds zeros there",
             plural(self.ranges as u64, "bad-sector area", "bad-sector areas"),
@@ -492,12 +574,39 @@ impl Zeroed {
             format!("{what}; none of their sectors held other data before")
         } else {
             format!(
-                "{what}; {} ({}-byte) held other data before, which the map does not record as rescued (an earlier session can write data before its map records it, e.g. when it is killed), and was overwritten",
+                "{what}; {} ({}-byte) held other data before, which the map does not record as rescued (ddrescue writes data before its map records it, so a run killed before it saved its map can leave data there, also sectors a retry pass read); their bytes are kept in {} with their image offsets and SHA-256 in {}",
                 plural(self.sectors_with_data, "sector", "sectors"),
-                self.sector_size
+                self.sector_size,
+                file_name(&files.bin),
+                file_name(&files.tsv)
             )
         }
     }
+}
+
+/// Why [`zero_bad_sectors`] failed, and whether the sidecar files exist
+/// (the zeroing had begun: they hold bytes the image no longer has).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ZeroError {
+    message: String,
+    kept: bool,
+}
+
+impl ZeroError {
+    fn before(message: String) -> Self {
+        Self {
+            message,
+            kept: false,
+        }
+    }
+}
+
+/// A run of adjacent sectors with data, being copied to the .bin file.
+struct KeptRun {
+    image_offset: u64,
+    length: u64,
+    bin_offset: u64,
+    sha256: sha2::Sha256,
 }
 
 /// Write zeros over every bad-sector (`-`) block of `map` inside the image
@@ -507,12 +616,20 @@ impl Zeroed {
 /// saved its map leaves data the map does not list as rescued, which a
 /// later session can mark bad. `None` when no bad-sector block lies inside
 /// the image.
+///
+/// Every sector there that holds anything but zeros is first copied to
+/// `files` (S-N3), created new (an existing file is never overwritten) and
+/// fsynced with the directory, so nothing is destroyed; nothing is written
+/// when no sector held data. A read error, or a sidecar that cannot be
+/// written, stops before any zero is written.
 fn zero_bad_sectors(
     image: &Path,
     map: &Mapfile,
     image_len: u64,
     sector_size: u32,
-) -> Result<Option<Zeroed>, String> {
+    files: &ZeroSidecar,
+) -> Result<Option<Zeroed>, ZeroError> {
+    use std::io::Write;
     use std::os::unix::fs::FileExt;
     let ranges: Vec<(u64, u64)> = map
         .blocks
@@ -528,40 +645,164 @@ fn zero_bad_sectors(
         .read(true)
         .write(true)
         .open(image)
-        .map_err(|e| format!("cannot open {}: {e}", image.display()))?;
+        .map_err(|e| ZeroError::before(format!("cannot open {}: {e}", image.display())))?;
     let sector = u64::from(sector_size.max(1));
-    let zeros = vec![0u8; ZERO_CHUNK];
     let mut buf = vec![0u8; ZERO_CHUNK];
     let mut z = Zeroed {
         ranges: ranges.len(),
         bytes: 0,
         sectors_with_data: 0,
         sector_size: sector_size.max(1),
+        kept: false,
+    };
+
+    // 1: copy every sector that holds data to the .bin file
+    let mut bin: Option<io::BufWriter<File>> = None;
+    let mut bin_len = 0u64;
+    let mut rows: Vec<String> = Vec::new();
+    let mut run: Option<KeptRun> = None;
+    let finish = |run: &mut Option<KeptRun>, rows: &mut Vec<String>| {
+        if let Some(r) = run.take() {
+            rows.push(format!(
+                "{}\t{}\t{}\t{}",
+                r.image_offset,
+                r.length,
+                r.bin_offset,
+                hex::encode(r.sha256.finalize())
+            ));
+        }
+    };
+    let failed = |message: String, bin_created: bool, tsv_created: bool| {
+        files.discard(bin_created, tsv_created);
+        ZeroError::before(format!("{message}; nothing was overwritten"))
+    };
+    for &(start, end) in &ranges {
+        let mut offset = start;
+        while offset < end {
+            let n = (end - offset).min(ZERO_CHUNK as u64) as usize;
+            if let Err(e) = file.read_exact_at(&mut buf[..n], offset) {
+                return Err(failed(
+                    format!("read error in the image at byte offset {offset}: {e}"),
+                    bin.is_some(),
+                    false,
+                ));
+            }
+            // Per sector (clipped to the area): data is kept, zeros are not
+            let mut s = offset - offset % sector;
+            while s < offset + n as u64 {
+                let from = s.max(offset);
+                let to = (s + sector).min(offset + n as u64);
+                let bytes = &buf[(from - offset) as usize..(to - offset) as usize];
+                if bytes.iter().any(|b| *b != 0) {
+                    z.sectors_with_data += 1;
+                    if bin.is_none() {
+                        let created = OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&files.bin)
+                            .map_err(|e| {
+                                failed(
+                                    format!(
+                                        "cannot create {} to keep the bytes found there: {e}{}",
+                                        files.bin.display(),
+                                        if e.kind() == io::ErrorKind::AlreadyExists {
+                                            " (dfdisk never overwrites it)"
+                                        } else {
+                                            ""
+                                        }
+                                    ),
+                                    false,
+                                    false,
+                                )
+                            })?;
+                        bin = Some(io::BufWriter::new(created));
+                    }
+                    if let Some(w) = bin.as_mut() {
+                        if let Err(e) = w.write_all(bytes) {
+                            return Err(failed(
+                                format!("write to {}: {e}", files.bin.display()),
+                                true,
+                                false,
+                            ));
+                        }
+                    }
+                    match run.as_mut() {
+                        Some(r) if r.image_offset + r.length == from => {
+                            r.length += to - from;
+                            r.sha256.update(bytes);
+                        }
+                        _ => {
+                            finish(&mut run, &mut rows);
+                            let mut sha256 = sha2::Sha256::new();
+                            sha256.update(bytes);
+                            run = Some(KeptRun {
+                                image_offset: from,
+                                length: to - from,
+                                bin_offset: bin_len,
+                                sha256,
+                            });
+                        }
+                    }
+                    bin_len += to - from;
+                } else {
+                    finish(&mut run, &mut rows);
+                }
+                s += sector;
+            }
+            offset += n as u64;
+        }
+        finish(&mut run, &mut rows);
+    }
+    if let Some(w) = bin.take() {
+        let mut tsv_created = false;
+        let durable = || -> Result<(), String> {
+            w.into_inner()
+                .map_err(|e| e.into_error())
+                .and_then(|f| f.sync_all())
+                .map_err(|e| format!("cannot write {}: {e}", files.bin.display()))?;
+            let mut tsv = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&files.tsv)
+                .map_err(|e| format!("cannot create {}: {e}", files.tsv.display()))?;
+            tsv_created = true;
+            let mut text = format!("{ZEROED_TSV_HEADER}\n");
+            for row in &rows {
+                text.push_str(row);
+                text.push('\n');
+            }
+            tsv.write_all(text.as_bytes())
+                .and_then(|()| tsv.sync_all())
+                .map_err(|e| format!("cannot write {}: {e}", files.tsv.display()))?;
+            match files.bin.parent() {
+                Some(dir) => sync_dir(dir).map_err(|e| e.to_string()),
+                None => Ok(()),
+            }
+        };
+        if let Err(e) = durable() {
+            return Err(failed(e, true, tsv_created));
+        }
+        z.kept = true;
+    }
+
+    // 2: the zeros
+    let zeros = vec![0u8; ZERO_CHUNK];
+    let after = |message: String| ZeroError {
+        message,
+        kept: z.kept,
     };
     for (start, end) in ranges {
         let mut offset = start;
         while offset < end {
             let n = (end - offset).min(ZERO_CHUNK as u64) as usize;
-            // What was there (counted per sector), then the zeros
-            if file.read_exact_at(&mut buf[..n], offset).is_ok() {
-                let mut s = offset - offset % sector;
-                while s < offset + n as u64 {
-                    let from = s.max(offset) - offset;
-                    let to = (s + sector).min(offset + n as u64) - offset;
-                    if buf[from as usize..to as usize].iter().any(|b| *b != 0) {
-                        z.sectors_with_data += 1;
-                    }
-                    s += sector;
-                }
-            }
             file.write_all_at(&zeros[..n], offset)
-                .map_err(|e| format!("write at byte offset {offset}: {e}"))?;
+                .map_err(|e| after(format!("write at byte offset {offset}: {e}")))?;
             offset += n as u64;
             z.bytes += n as u64;
         }
     }
     file.sync_all()
-        .map_err(|e| format!("fsync of {}: {e}", image.display()))?;
+        .map_err(|e| after(format!("fsync of {}: {e}", image.display())))?;
     Ok(Some(z))
 }
 
@@ -2010,6 +2251,34 @@ mod tests {
         assert!(!preflight::resume_may_exist(base, "b.info.session-.json"));
     }
 
+    /// The sidecar of session `n` of base "b" in `dir`.
+    fn zs(dir: &Path, n: u32) -> ZeroSidecar {
+        ZeroSidecar::new(dir, "b", n)
+    }
+
+    /// (image offset, length, bin offset, SHA-256) rows of a .tsv sidecar.
+    fn tsv_rows(path: &Path) -> Vec<(u64, u64, u64, String)> {
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some(ZEROED_TSV_HEADER));
+        lines
+            .map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                assert_eq!(f.len(), 4, "{l}");
+                (
+                    f[0].parse().unwrap(),
+                    f[1].parse().unwrap(),
+                    f[2].parse().unwrap(),
+                    f[3].to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn sha256_of(bytes: &[u8]) -> String {
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
     #[test]
     fn a_finished_image_short_of_its_bad_tail_is_extended() {
         let dir = tempfile::tempdir().unwrap();
@@ -2017,7 +2286,7 @@ mod tests {
         let image = dir.path().join("b.raw");
         std::fs::write(&map, BAD_TAIL).unwrap();
         std::fs::write(&image, vec![7u8; (MIB - 0x400) as usize]).unwrap();
-        let fin = finalize(&map, &image, MIB, 512);
+        let fin = finalize(&map, &image, MIB, 512, &zs(dir.path(), 1));
         assert_eq!(std::fs::metadata(&image).unwrap().len(), MIB);
         assert_eq!(fin.bytes_acquired, MIB);
         assert_eq!(fin.read_errors.substituted_bytes(), 0x400);
@@ -2049,7 +2318,7 @@ mod tests {
         let mut data = vec![7u8; MIB as usize];
         data[0x10000..0x10200].fill(0); // one sector of the first area already zeros
         std::fs::write(&image, &data).unwrap();
-        let fin = finalize(&map, &image, MIB, 512);
+        let fin = finalize(&map, &image, MIB, 512, &zs(dir.path(), 1));
         let after = std::fs::read(&image).unwrap();
         assert!(after[0x10000..0x10400].iter().all(|b| *b == 0));
         assert!(after[0x90000..0x90200].iter().all(|b| *b == 0));
@@ -2070,8 +2339,27 @@ mod tests {
             notes.contains("2 sectors (512-byte) held other data before"),
             "{notes}"
         );
-        // Run again: nothing but zeros there now
-        let fin = finalize(&map, &image, MIB, 512);
+        // S-N3: the bytes the zeros replaced are kept, with their places and
+        // digests, and listed as files of the report
+        let kept = zs(dir.path(), 1);
+        assert!(
+            notes.contains("their bytes are kept in b.zeroed-1.bin with their image offsets and SHA-256 in b.zeroed-1.tsv"),
+            "{notes}"
+        );
+        assert_eq!(fin.auxiliary_files, [kept.bin.clone(), kept.tsv.clone()]);
+        let bin = std::fs::read(&kept.bin).unwrap();
+        let mut expected = data[0x10200..0x10400].to_vec();
+        expected.extend_from_slice(&data[0x90000..0x90200]);
+        assert_eq!(bin, expected);
+        assert_eq!(
+            tsv_rows(&kept.tsv),
+            [
+                (0x10200, 0x200, 0, sha256_of(&data[0x10200..0x10400])),
+                (0x90000, 0x200, 0x200, sha256_of(&data[0x90000..0x90200])),
+            ]
+        );
+        // Run again: nothing but zeros there now, so nothing is kept
+        let fin = finalize(&map, &image, MIB, 512, &zs(dir.path(), 2));
         assert!(
             fin.notes
                 .join("\n")
@@ -2079,9 +2367,11 @@ mod tests {
             "{:?}",
             fin.notes
         );
+        assert!(fin.auxiliary_files.is_empty());
+        assert!(!zs(dir.path(), 2).bin.exists() && !zs(dir.path(), 2).tsv.exists());
         // Bad areas beyond the end of an unfinished image are not written
         std::fs::write(&image, vec![7u8; 0x10200]).unwrap();
-        let fin = finalize(&map, &image, MIB, 512);
+        let fin = finalize(&map, &image, MIB, 512, &zs(dir.path(), 3));
         let after = std::fs::read(&image).unwrap();
         assert_eq!(after.len(), 0x10200);
         assert!(after[0x10000..].iter().all(|b| *b == 0));
@@ -2107,12 +2397,54 @@ mod tests {
             // root ignores the mode: nothing to test here
             return;
         }
-        let fin = finalize(&map, &image, MIB, 512);
+        let fin = finalize(&map, &image, MIB, 512, &zs(dir.path(), 1));
         let stop = fin.stop_reason.unwrap();
         assert!(
             stop.contains("could not write zeros over the bad-sector areas"),
             "{stop}"
         );
+    }
+
+    #[test]
+    fn kept_bytes_are_never_overwritten_and_nothing_is_zeroed_without_them() {
+        // S-N3: the sidecar of this session exists already (create_new):
+        // the zeros are not written, the image keeps its data, the existing
+        // files are untouched, and the report does not claim zeros
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("b.map");
+        let image = dir.path().join("b.raw");
+        std::fs::write(&map, BAD_MIDDLE).unwrap();
+        std::fs::write(&image, vec![7u8; MIB as usize]).unwrap();
+        let kept = zs(dir.path(), 4);
+        let refused = |existing: &Path, other: &Path| {
+            std::fs::write(existing, "earlier\n").unwrap();
+            let fin = finalize(&map, &image, MIB, 512, &kept);
+            let stop = fin.stop_reason.unwrap();
+            assert!(
+                stop.contains("could not write zeros over the bad-sector areas"),
+                "{stop}"
+            );
+            assert!(stop.contains("nothing was overwritten"), "{stop}");
+            assert_eq!(std::fs::read(existing).unwrap(), b"earlier\n");
+            assert!(!other.exists(), "{} left behind", other.display());
+            assert!(std::fs::read(&image).unwrap().iter().all(|b| *b == 7));
+            assert!(fin.auxiliary_files.is_empty());
+            assert!(!fin.notes.iter().any(|n| n.contains("dfdisk wrote zeros")));
+            std::fs::remove_file(existing).unwrap();
+        };
+        refused(&kept.bin, &kept.tsv);
+        // The .tsv exists: the .bin this run wrote is removed again
+        refused(&kept.tsv, &kept.bin);
+        // No data in the bad areas: nothing is written at all
+        let clean = tempfile::tempdir().unwrap();
+        let map = clean.path().join("b.map");
+        let image = clean.path().join("b.raw");
+        std::fs::write(&map, BAD_MIDDLE).unwrap();
+        std::fs::write(&image, vec![0u8; MIB as usize]).unwrap();
+        let fin = finalize(&map, &image, MIB, 512, &zs(clean.path(), 1));
+        assert_eq!(fin.stop_reason, None);
+        assert!(fin.auxiliary_files.is_empty());
+        assert_eq!(std::fs::read_dir(clean.path()).unwrap().count(), 2);
     }
 
     #[test]
@@ -2123,14 +2455,14 @@ mod tests {
         // Interrupted: non-tried blocks remain
         std::fs::write(&map, INTERRUPTED).unwrap();
         std::fs::write(&image, vec![1u8; 0xA0000]).unwrap();
-        let fin = finalize(&map, &image, 4 * MIB, 512);
+        let fin = finalize(&map, &image, 4 * MIB, 512, &zs(dir.path(), 1));
         assert_eq!(std::fs::metadata(&image).unwrap().len(), 0xA0000);
         assert_eq!(fin.bytes_acquired, 0xA0000);
         assert_eq!(fin.read_errors.unread_bytes(), 4 * MIB - 0xA0000);
         // Finished map, but the image lacks rescued data at its end
         std::fs::write(&map, BAD_MIDDLE).unwrap();
         std::fs::write(&image, vec![1u8; (MIB / 2) as usize]).unwrap();
-        let fin = finalize(&map, &image, MIB, 512);
+        let fin = finalize(&map, &image, MIB, 512, &zs(dir.path(), 1));
         assert_eq!(std::fs::metadata(&image).unwrap().len(), MIB / 2);
         assert_eq!(fin.read_errors.unread_bytes(), MIB / 2);
         assert!(fin
@@ -2140,7 +2472,7 @@ mod tests {
         // A map for a smaller source: not covering this one
         std::fs::write(&map, BAD_TAIL).unwrap();
         std::fs::write(&image, vec![1u8; (MIB - 0x400) as usize]).unwrap();
-        let fin = finalize(&map, &image, 2 * MIB, 512);
+        let fin = finalize(&map, &image, 2 * MIB, 512, &zs(dir.path(), 1));
         assert_eq!(std::fs::metadata(&image).unwrap().len(), MIB - 0x400);
         assert_eq!(fin.read_errors.unread_bytes(), MIB + 0x400);
         assert!(fin.notes.iter().any(|n| n.contains("does not list")));
@@ -2156,7 +2488,7 @@ mod tests {
             if let Some(c) = content {
                 std::fs::write(&map, c).unwrap();
             }
-            let fin = finalize(&map, &image, 4096, 512);
+            let fin = finalize(&map, &image, 4096, 512, &zs(dir.path(), 1));
             assert_eq!(fin.bytes_acquired, 0);
             assert_eq!(fin.read_errors.unread_bytes(), 4096);
             assert!(fin
@@ -2591,6 +2923,76 @@ mod tests {
             notes.contains("3 sectors (512-byte) held other data before"),
             "{notes}"
         );
+        // S-N3: what the zeros replaced is kept (session 1: no report of an
+        // earlier session exists) and listed with the files of the run
+        let kept = ZeroSidecar::new(&ctx.output_dir, "b", 1);
+        assert_eq!(std::fs::read(&kept.bin).unwrap(), vec![b'Z'; 0x600]);
+        assert_eq!(
+            tsv_rows(&kept.tsv),
+            [
+                (0x10000, 0x400, 0, sha256_of(&[b'Z'; 0x400])),
+                (0x90000, 0x200, 0x400, sha256_of(&[b'Z'; 0x200])),
+            ]
+        );
+        assert!(out.auxiliary_files.contains(&kept.bin));
+        assert!(out.auxiliary_files.contains(&kept.tsv));
+        assert!(
+            notes.contains("their bytes are kept in b.zeroed-1.bin"),
+            "{notes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sectors_a_killed_retry_pass_read_are_kept_before_the_zeros() {
+        // E-NEW-1: a retry pass reads sectors of a bad area and ddrescue
+        // writes them, but it is killed (SIGKILL, the OOM killer, a second
+        // Ctrl+C) before it saves its map, which still lists the area as bad.
+        // The zeros dfdisk writes there must not destroy what was read
+        let tmp = tempfile::tempdir().unwrap();
+        let killed = fake_ddrescue(
+            tmp.path(),
+            &format!(
+                "head -c {MIB} /dev/zero | tr '\\0' 'R' > \"$IMG\"\nprintf '%s' '{BAD_MIDDLE}' > \"$MAP\"\nkill -KILL $$\n"
+            ),
+        );
+        let ctx = context(tmp.path(), MIB, false);
+        let out = acquire_with(&ctx, killed.as_os_str()).await.unwrap();
+        assert!(
+            out.stop_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("ended by signal 9")),
+            "{:?}",
+            out.stop_reason
+        );
+        let image = std::fs::read(ctx.output_path(".raw")).unwrap();
+        assert!(image[0x10000..0x10400].iter().all(|b| *b == 0));
+        assert!(image[0x90000..0x90200].iter().all(|b| *b == 0));
+        let kept = ZeroSidecar::new(&ctx.output_dir, "b", 1);
+        assert_eq!(std::fs::read(&kept.bin).unwrap(), vec![b'R'; 0x600]);
+        assert_eq!(tsv_rows(&kept.tsv).len(), 2);
+        assert!(out.auxiliary_files.contains(&kept.bin));
+
+        // Resumed, ddrescue finds the areas bad again: nothing but zeros is
+        // there now, so no further file is written
+        let resumed = script(
+            tmp.path(),
+            "resumed-ddrescue",
+            &format!(
+                "if [ \"$1\" = --version ]; then echo 'GNU ddrescue 1.30 (fake)'; exit 0; fi\n\
+                 for a; do MAP=\"$a\"; done\nprintf '%s' '{BAD_MIDDLE}' > \"$MAP\"\nexit 0\n"
+            ),
+        );
+        let out = acquire_with(&context_again(&ctx, true), resumed.as_os_str())
+            .await
+            .unwrap();
+        assert_eq!(out.stop_reason, None);
+        assert!(!ZeroSidecar::new(&ctx.output_dir, "b", 2).bin.exists());
+        assert!(out
+            .notes
+            .iter()
+            .any(|n| n.contains("none of their sectors held other data before")));
+        // The first session's files stay as they were
+        assert_eq!(std::fs::read(&kept.bin).unwrap(), vec![b'R'; 0x600]);
     }
 
     #[tokio::test]

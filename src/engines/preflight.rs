@@ -443,7 +443,8 @@ fn numbered(rest: &str) -> bool {
 
 /// Files an interrupted rescue leaves that a resumed rescue continues or
 /// keeps (the rescue engine handles them): image, map, identity sidecar,
-/// earlier reports, SMART snapshots, a stale reservation.
+/// earlier reports, SMART snapshots, bytes kept before zeros were written, a
+/// stale reservation.
 pub fn resume_may_exist(base_name: &str, file_name: &str) -> bool {
     let Some(suffix) = output_suffix(base_name, file_name) else {
         return false;
@@ -476,6 +477,13 @@ pub fn resume_may_exist(base_name: &str, file_name: &str) -> bool {
         {
             return numbered(n);
         }
+    }
+    // The bytes an earlier session kept before it wrote zeros over bad
+    // areas (engines::rescue, S-N3); never written again
+    if let Some(rest) = suffix.strip_prefix(".zeroed-") {
+        return [".bin", ".tsv"]
+            .iter()
+            .any(|ext| rest.strip_suffix(ext).is_some_and(numbered));
     }
     false
 }
@@ -913,6 +921,10 @@ mod tests {
 
         assert!(resume_may_exist(base, &format!("{base}.info.session-12")));
         assert!(!resume_may_exist(base, &format!("{base}.info.session-")));
+        assert!(resume_may_exist(base, &format!("{base}.zeroed-2.bin")));
+        assert!(resume_may_exist(base, &format!("{base}.zeroed-2.tsv")));
+        assert!(!resume_may_exist(base, &format!("{base}.zeroed-.bin")));
+        assert!(!resume_may_exist(base, &format!("{base}.zeroed-2.txt")));
         assert!(!resume_may_exist(base, &format!("{base}.pieces.tsv")));
         assert!(!resume_may_exist(base, "other.raw"));
     }

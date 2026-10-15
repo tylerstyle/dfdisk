@@ -131,7 +131,12 @@ and when something was not done the report says so.
   or the same attachment, not by the bridge's serial; a refused resume leaves
   the previous report as `<base>.info`. After every ddrescue run dfdisk writes
   zeros over the bad-sector areas of the map, so they are zeros in the image
-  also after an interrupted session was resumed. The verdict explanation
+  also after an interrupted session was resumed; sectors there that held data
+  (left by a session killed before ddrescue saved its map, also sectors a retry
+  pass read) are first copied to `<base>.zeroed-N.bin`, with their image
+  offsets and SHA-256 in `<base>.zeroed-N.tsv` (N: the rescue session; created
+  new and fsynced before the first zero, never overwritten), and both are
+  listed with the report's files. The verdict explanation
   follows what happened: a rescue is INCOMPLETE "because the map lists
   unfinished areas" only when it does and nothing else stopped it, a VERIFIED
   rescue names the second read of the source it was compared with, and a second
