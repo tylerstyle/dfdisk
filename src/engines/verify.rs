@@ -976,38 +976,18 @@ async fn run_ewfverify(
     Ok((report, failure))
 }
 
-/// The pieces file check folded into `result`: a mismatching piece is a
-/// mismatch; a pieces file that matches is a comparison.
+/// The pieces file check folded into `result`: a differing piece, or image
+/// bytes the pieces file does not cover, is a mismatch; a pieces file that
+/// lists nothing cannot vouch for anything (failed); a pieces file that
+/// covers the image exactly and matches is a comparison.
 fn with_pieces(
     result: VerificationResult,
     pieces: &PiecesReport,
     method: &mut String,
 ) -> VerificationResult {
     let file = pieces.pieces_file.display().to_string();
-    if !pieces.mismatches.is_empty() {
-        let shown: Vec<String> = pieces
-            .mismatches
-            .iter()
-            .take(10)
-            .map(|m| {
-                format!(
-                    "piece {} (offset {}, {} bytes)",
-                    m.index, m.offset, m.length
-                )
-            })
-            .collect();
-        let more = pieces.mismatches.len().saturating_sub(shown.len());
-        let details = format!(
-            "{} of {} differ from {file}: {}{}",
-            plural(pieces.mismatches.len() as u64, "piece", "pieces"),
-            pieces.pieces_checked,
-            shown.join(", "),
-            if more > 0 {
-                format!(" and {more} more")
-            } else {
-                String::new()
-            }
-        );
+    if pieces.mismatch_count > 0 || (pieces.pieces_checked > 0 && pieces.uncovered_bytes() > 0) {
+        let details = format!("piecewise SHA-256 against {file}: {}", pieces.details(10));
         return match result {
             VerificationResult::Mismatched { method, details: d } => {
                 VerificationResult::Mismatched {
@@ -1726,6 +1706,9 @@ mod tests {
             pieces_checked: 4,
             bytes_checked: 4096,
             mismatches: vec![],
+            mismatch_count: 0,
+            covered_bytes: 4096,
+            image_bytes: 4096,
         };
         let mut method = "file hashed".to_string();
         let r = with_pieces(
@@ -1742,7 +1725,9 @@ mod tests {
                 length: 1024,
                 expected_sha256: "a".repeat(64),
                 computed_sha256: "b".repeat(64),
+                bytes_present: 1024,
             }],
+            mismatch_count: 1,
             ..ok.clone()
         };
         let r = with_pieces(
@@ -1753,12 +1738,27 @@ mod tests {
         let VerificationResult::Mismatched { details, .. } = r else {
             panic!("{r:?}")
         };
+        assert!(details.contains("piece 2 (bytes 2048-3071)"), "{details}");
+        // Image bytes after the last piece are not vouched for
+        let short = PiecesReport {
+            image_bytes: 5000,
+            ..ok.clone()
+        };
+        let r = with_pieces(
+            VerificationResult::NotPossible { reason: "r".into() },
+            &short,
+            &mut "m".to_string(),
+        );
+        let VerificationResult::Mismatched { details, .. } = r else {
+            panic!("{r:?}")
+        };
         assert!(
-            details.contains("piece 2 (offset 2048, 1024 bytes)"),
+            details.contains("904 bytes after the last piece"),
             "{details}"
         );
         let empty = PiecesReport {
             pieces_checked: 0,
+            covered_bytes: 0,
             ..ok
         };
         let r = with_pieces(
