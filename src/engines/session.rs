@@ -37,6 +37,7 @@ pub use crate::engines::progress::ProgressSink;
 pub use crate::models::config::EngineKind;
 pub use crate::signals::StopFlags;
 
+use crate::discovery::safety::system_reasons_for;
 use crate::discovery::writeprotect;
 use crate::engines::audit::{self, FinishedGuard, StartedRecord};
 use crate::engines::error::{AcquisitionError, ErrorKind};
@@ -424,35 +425,6 @@ struct Safety {
     errors: Vec<AcquisitionError>,
 }
 
-/// Why the disk(s) a source sits on belong to the running system: dfcore's
-/// system detection plus dfdisk's critical mount points (§14).
-fn system_disk_reasons(
-    flat: &[dfcore::lsblk::FlatDevice],
-    path: &str,
-    dev: Option<DevNum>,
-) -> Vec<String> {
-    fn critical(dev: &dfcore::lsblk::BlockDevice, out: &mut Vec<String>) {
-        for m in dev.mounts() {
-            if crate::discovery::SafetyChecker::is_critical_mount(m)
-                && !dfcore::lsblk::is_mount_system(m)
-            {
-                out.push(format!("{} mounted at {}", dev.dev_path(), m));
-            }
-        }
-        for c in dev.children.iter().flatten() {
-            critical(c, out);
-        }
-    }
-    let hits = dfcore::lsblk::lookup(flat, path, dev);
-    let mut reasons = Vec::new();
-    for root in dfcore::lsblk::roots_of(flat, &hits) {
-        reasons.extend(dfcore::lsblk::system_reasons(&root.device));
-        critical(&root.device, &mut reasons);
-    }
-    reasons.dedup();
-    reasons
-}
-
 /// Step 3 without the exclusive open: registry by pinned device number,
 /// system disk, active swap (R8), mounts and holders in the source tree.
 fn source_safety(
@@ -498,7 +470,7 @@ fn source_safety(
                 {
                     errors.push(AcquisitionError::from(e));
                 }
-                let reasons = system_disk_reasons(&flat, &identity.canonical_path, pinned);
+                let reasons = system_reasons_for(&flat, &identity.canonical_path, pinned);
                 if !reasons.is_empty() {
                     errors.push(AcquisitionError::refused(format!(
                         "{} is on a disk of the running system ({}); dfdisk never acquires the system it runs on",
