@@ -227,6 +227,8 @@ impl TuiBackend for Fake {
             unmounted: device.mountpoints.clone(),
             holders: Vec::new(),
             audit_hash: Some("h".into()),
+            mounts_before: device.mountpoints.clone(),
+            ..Default::default()
         })
     }
 
