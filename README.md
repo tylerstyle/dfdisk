@@ -75,8 +75,8 @@ never choose it.
 
 | Verdict | Exit code | Meaning |
 |---------|----------:|---------|
-| VERIFIED | 0 | complete, no read errors, the image re-read digests equal the digests computed while reading the source |
-| COMPLETE, NOT VERIFIED | 9 | complete, no read errors, but nothing independent to compare with (rescue without `--verify-source`) |
+| VERIFIED | 0 | complete, no read errors, the image re-read digests equal the digests computed while reading the source (a rescue: those of a second read of the source) |
+| COMPLETE, NOT VERIFIED | 9 | complete, no read errors, but nothing independent to compare with (for example a rescue without `--verify-source`) |
 | COMPLETED WITH READ ERRORS | 7 | full length written, some sectors unreadable and replaced by zeros; the digests describe the image with the zeros, not the medium |
 | INCOMPLETE | 6 | not all of the source was acquired (stopped early, untried areas, source lost or changed, destination full) |
 | HASH MISMATCH | 5 | a recomputed digest differs (image, or a second read of the source) |
@@ -86,7 +86,10 @@ never choose it.
 "ALL HASHES MATCH" is printed only for VERIFIED. Images are fsynced and dropped
 from the page cache (POSIX_FADV_DONTNEED) before they are verified, so the
 verification reads them back from the destination rather than from memory; the
-RAW engine re-reads with `O_DIRECT` where the filesystem supports it.
+RAW engine re-reads with `O_DIRECT` where the filesystem supports it. An image
+that cannot be fsynced fails the verification (exit 4); for one that cannot be
+dropped from the page cache the verification method says that the re-read may
+have come from memory.
 
 ### Evidence handling
 
