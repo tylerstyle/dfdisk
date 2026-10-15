@@ -2,6 +2,8 @@
 //! of every command that can end with a verdict lists its exit codes (§2).
 
 use crate::cli::size::{parse_piece_size, parse_size, PieceSize};
+use crate::engines::verify::parse_digest;
+use crate::models::config::HashAlgorithm;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -71,7 +73,7 @@ image (<base>: the image file name without its extension) and an audit record.
 
 Exit codes:
   0  every digest compared (expected, stored in the E01, every piece) matches
-  2  usage error
+  2  usage error (for example a digest that is not 32/40/64 hex digits)
   4  verification failed: the image could not be read completely, or an expected
      digest was not computed
   5  hash mismatch (a digest or a piece differs)
@@ -100,6 +102,21 @@ Exit codes:
   2  usage error
   3  refused (protected device, system mount, swap, unidentifiable device)
   4  an unmount failed or a mount remained";
+
+/// `--md5`: 32 hex digits (a malformed digest is a usage error, exit 2).
+fn parse_md5(s: &str) -> Result<String, String> {
+    parse_digest(HashAlgorithm::MD5, s)
+}
+
+/// `--sha1`: 40 hex digits.
+fn parse_sha1(s: &str) -> Result<String, String> {
+    parse_digest(HashAlgorithm::SHA1, s)
+}
+
+/// `--sha256`: 64 hex digits.
+fn parse_sha256(s: &str) -> Result<String, String> {
+    parse_digest(HashAlgorithm::SHA256, s)
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -485,16 +502,16 @@ pub struct VerifyArgs {
     /// segment (.E01/.Ex01)
     pub image: PathBuf,
 
-    /// Expected MD5
-    #[arg(long, value_name = "HEX")]
+    /// Expected MD5 (32 hex digits)
+    #[arg(long, value_name = "HEX", value_parser = parse_md5)]
     pub md5: Option<String>,
 
-    /// Expected SHA-1
-    #[arg(long, value_name = "HEX")]
+    /// Expected SHA-1 (40 hex digits)
+    #[arg(long, value_name = "HEX", value_parser = parse_sha1)]
     pub sha1: Option<String>,
 
-    /// Expected SHA-256
-    #[arg(long, value_name = "HEX")]
+    /// Expected SHA-256 (64 hex digits)
+    #[arg(long, value_name = "HEX", value_parser = parse_sha256)]
     pub sha256: Option<String>,
 
     /// Take the expected digests from this dfdisk report (<base>.info.json)

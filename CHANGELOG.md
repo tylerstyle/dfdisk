@@ -171,7 +171,9 @@ and when something was not done the report says so.
   sector is located exactly, interrupted reads are retried, and
   `--on-read-error zero-fill` continues over unreadable sectors.
 - **M12** `dfdisk verify`: a requested digest that was not computed is a failure,
-  never a pass; `.Ex01` and `.E02` segment families are recognised as EWF.
+  never a pass; `.Ex01` and `.E02` segment families are recognised as EWF; an
+  expected digest that is not 32/40/64 hex digits is a usage error (exit 2)
+  instead of a HASH MISMATCH with an addendum.
 - Low: `-r` above 255 is a usage error instead of silently becoming 2; `-m` and
   `-M` (media type and flags) are set from the source; firmware and other device
   strings are sanitised; false README claims removed; runtime tools are no longer

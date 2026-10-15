@@ -686,6 +686,32 @@ fn verify_exit_codes() {
     let missing = run(&["verify", "/nonexistent/image.raw", "--md5", &md5]);
     assert_eq!(missing.status.code(), Some(2));
 
+    // A malformed digest is a usage error (exit 2), never a mismatch, and
+    // writes no addendum (T5)
+    let addenda = || {
+        std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".verify-"))
+            .count()
+    };
+    let before = addenda();
+    for (flag, bad) in [
+        ("--md5", "xyz"),
+        ("--md5", &md5[..31]),
+        ("--sha1", md5.as_str()),
+        ("--sha256", "zz"),
+    ] {
+        let o = run(&["verify", img, flag, bad]);
+        let (_, stderr) = text(&o);
+        assert_eq!(o.status.code(), Some(2), "{flag} {bad}: {stderr}");
+        assert!(stderr.contains("hexadecimal digits"), "{stderr}");
+    }
+    assert_eq!(addenda(), before, "no addendum for a usage error");
+    // Upper case and surrounding blanks are fine
+    let upper = run(&["verify", img, "--md5", &format!(" {} ", md5.to_uppercase())]);
+    assert_eq!(upper.status.code(), Some(0), "{:?}", text(&upper));
+
     // --pieces does not apply to EWF images
     std::fs::write(
         tmp.path().join("x.pieces.tsv"),

@@ -98,7 +98,50 @@ pub struct ExpectedHashes {
     pub report_pieces: Option<(String, String)>,
 }
 
+/// Hex digits of a digest of `algorithm`: 32 (MD5), 40 (SHA-1), 64 (SHA-256).
+pub fn digest_hex_len(algorithm: HashAlgorithm) -> usize {
+    match algorithm {
+        HashAlgorithm::MD5 => 32,
+        HashAlgorithm::SHA1 => 40,
+        HashAlgorithm::SHA256 => 64,
+    }
+}
+
+/// `value` as an expected digest of `algorithm`: surrounding blanks removed,
+/// lower case; `Err` (a sentence) unless it is exactly the right number of
+/// hex digits. A malformed value is a usage error, never a mismatch (T5).
+pub fn parse_digest(algorithm: HashAlgorithm, value: &str) -> Result<String, String> {
+    let v = value.trim();
+    let want = digest_hex_len(algorithm);
+    if v.len() != want || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{} must be {want} hexadecimal digits, got {:?} ({} characters)",
+            algorithm.label(),
+            crate::models::text::sanitize_line(v),
+            v.chars().count()
+        ));
+    }
+    Ok(v.to_ascii_lowercase())
+}
+
 impl ExpectedHashes {
+    /// Every expected value is a well-formed digest of its algorithm
+    /// ([`parse_digest`]); `Err` is a usage error naming where it came from.
+    pub fn validate(&self) -> Result<(), AcquisitionError> {
+        for alg in [
+            HashAlgorithm::MD5,
+            HashAlgorithm::SHA1,
+            HashAlgorithm::SHA256,
+        ] {
+            if let Some(v) = self.get(alg) {
+                parse_digest(alg, v).map_err(|e| {
+                    AcquisitionError::usage(format!("expected digest from {}: {e}", self.source))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Digests given by the examiner (blank values ignored).
     pub fn given(md5: Option<String>, sha1: Option<String>, sha256: Option<String>) -> Self {
         let clean = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
@@ -144,7 +187,9 @@ impl ExpectedHashes {
                 path.display()
             ))
         })?;
-        Ok(Self::from_report(&report, path.display().to_string()))
+        let expected = Self::from_report(&report, path.display().to_string());
+        expected.validate()?;
+        Ok(expected)
     }
 
     /// The digests stored in an EWF image, as a reference.
@@ -1037,6 +1082,9 @@ pub async fn verify_image(
     stop: &StopFlags,
     mut on_event: impl FnMut(VerifyEvent),
 ) -> Result<ImageVerification, AcquisitionError> {
+    // A malformed expected digest is a usage error before anything is read
+    // or written, never a mismatch with an addendum and an audit record
+    expected.validate()?;
     if !image.is_file() {
         return Err(AcquisitionError::usage(format!(
             "image not found or not a regular file: {}",
@@ -1560,6 +1608,64 @@ mod tests {
             audit_log: Some(log.to_path_buf()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn digests_are_checked_for_hex_and_length() {
+        assert_eq!(
+            parse_digest(HashAlgorithm::MD5, &format!(" {} ", MD5.to_uppercase())).unwrap(),
+            MD5
+        );
+        assert_eq!(parse_digest(HashAlgorithm::SHA1, SHA1).unwrap(), SHA1);
+        assert_eq!(parse_digest(HashAlgorithm::SHA256, SHA256).unwrap(), SHA256);
+        for (alg, bad) in [
+            (HashAlgorithm::MD5, "xyz"),
+            (HashAlgorithm::MD5, &MD5[..31]),
+            (HashAlgorithm::MD5, SHA1),
+            (HashAlgorithm::SHA1, MD5),
+            (HashAlgorithm::SHA256, &format!("{}g", &SHA256[..63])),
+            (HashAlgorithm::MD5, "0x5eb63bbbe01eeed093cb22bb8f5acd"),
+        ] {
+            let e = parse_digest(alg, bad).unwrap_err();
+            assert!(e.contains("hexadecimal digits"), "{e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_expected_digest_is_a_usage_error_not_a_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("x.raw");
+        std::fs::write(&image, b"hello world").unwrap();
+        let log = tmp.path().join("audit.jsonl");
+        let expected = ExpectedHashes::given(Some("not-a-digest".into()), None, None);
+        let e = verify_image(&image, &expected, &opts(&log), &StopFlags::new(), |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Usage, "{e}");
+        assert!(
+            e.message.contains("MD5 must be 32 hexadecimal digits"),
+            "{e}"
+        );
+        // Nothing was written: no addendum, no audit record
+        assert!(!log.exists());
+        let names: Vec<_> = std::fs::read_dir(tmp.path()).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        // A report with a malformed digest is refused the same way
+        let mut r = crate::models::info_report::ForensicInfoReport::new(
+            crate::models::config::EngineKind::Raw,
+            &crate::models::case::CaseMetadata::default(),
+            Default::default(),
+            crate::models::config::EffectiveConfig::build(
+                &crate::models::config::AcquisitionConfig::raw("/x"),
+                None,
+            ),
+        );
+        r.acquisition_hashes.sha256 = Some("abc".into());
+        let p = tmp.path().join("r.info.json");
+        std::fs::write(&p, r.to_json()).unwrap();
+        let e = ExpectedHashes::from_report_json(&p).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Usage);
+        assert!(e.message.contains("SHA-256 must be 64"), "{e}");
     }
 
     #[tokio::test]
