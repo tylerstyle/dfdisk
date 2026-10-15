@@ -107,7 +107,7 @@ and when something was not done the report says so.
   dies in a way it cannot handle (SIGKILL, the OOM killer, a crash:
   `PR_SET_PDEATHSIG`) and does not run on unsupervised.
 - **H3** The converter overwrote outputs and verified nothing: existing outputs
-  are refused before any tool runs, destination checks apply, the output is
+  are refused before any tool writes, destination checks apply, the output is
   verified against the source digests, it writes `<base>.conversion.info` /
   `.conversion.info.json` and audit records, abort works, sizes that are not a
   multiple of 512 bytes are refused, split RAW inputs are converted completely
