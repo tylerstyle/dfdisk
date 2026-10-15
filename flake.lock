@@ -3,11 +3,11 @@
     "dfcore": {
       "flake": false,
       "locked": {
-        "lastModified": 1791731534,
-        "narHash": "sha256-mzwV620LnaWlUM9PawWg3pg04U6FrvAfk9VGyjFC0Ek=",
+        "lastModified": 1792010220,
+        "narHash": "sha256-CUcFeUqfEKERS9RU9Y039uP/1MAeMXiKRkIWgfiClLU=",
         "owner": "tylerstyle",
         "repo": "dfcore",
-        "rev": "ffce902b0119830f70211ec3efc3512c8bf7f365",
+        "rev": "d1a97cd05bbf6fb95123f9236fae37ea352926cf",
         "type": "github"
       },
       "original": {

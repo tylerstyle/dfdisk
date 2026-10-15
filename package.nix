@@ -59,7 +59,7 @@ let
 in
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "dfdisk";
-  version = "0.1.10";
+  version = "0.2.0";
 
   inherit src;
   sourceRoot = "dfdisk-src/dfdisk";

@@ -1,6 +1,6 @@
 [package]
 name = "dfdisk"
-version = "0.1.10"
+version = "0.2.0"
 edition = "2021"
 # Minimum supported Rust version, checked by the CI "MSRV" job with the locked
 # dependencies (ratatui 0.30 and time 0.3.55 need 1.88)

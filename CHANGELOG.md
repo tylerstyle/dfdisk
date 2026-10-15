@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-10-15
 
 dfdisk 0.2.0 is a rework driven by a review of 0.1.10 (items C1-C2,
 H1-H10, M1-M12 and feature proposals F1-F12 below). Its reports are meant to be
