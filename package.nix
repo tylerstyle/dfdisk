@@ -1,13 +1,17 @@
 { lib
+, stdenv
 , rustPlatform
 , runCommand
 , makeWrapper
-, pkg-config
-, libewf
-, smartmontools
+  # External tools dfdisk runs. None is linked: they go on the wrapper's PATH
+  # only (and, where tests need them, into the check phase).
+, libewf # ewfacquire, ewfacquirestream, ewfverify, ewfinfo, ewfexport
 , ddrescue
-, util-linux
-, systemd
+, smartmontools # smartctl
+, util-linux # lsblk, blockdev, umount
+, systemd # udevadm, timedatectl
+, hdparm # hdparm -N, --dco-identify (HPA/DCO, read-only queries)
+, nvme-cli # nvme id-ns
   # dfcore is a sibling path dependency (../dfcore); flakes pass their input
 , dfcoreSrc ? ../dfcore
   # Source revisions embedded in the binary and every report (`dfdisk --version`);
@@ -17,6 +21,16 @@
 }:
 
 let
+  runtimeTools = [
+    libewf
+    ddrescue
+    smartmontools
+    util-linux
+    systemd
+    hdparm
+    nvme-cli
+  ];
+
   ownSrc = lib.fileset.toSource {
     root = ./.;
     fileset = lib.fileset.unions [
@@ -61,29 +75,32 @@ rustPlatform.buildRustPackage (finalAttrs: {
   };
 
   nativeBuildInputs = [
-    pkg-config
     makeWrapper
-    util-linux
   ];
 
-  buildInputs = [
+  # Tests that need external tools run against the real ones here: libewf
+  # (E01 engine, converter, verify), ddrescue (rescue engine) and a C compiler
+  # for the LD_PRELOAD fake-device shim. DFDISK_REQUIRE_TOOLS=1 turns a missing
+  # tool into a failing test instead of a skipped one.
+  nativeCheckInputs = [
     libewf
-    smartmontools
     ddrescue
-    util-linux
-    systemd
+    stdenv.cc
   ];
+
+  preCheck = ''
+    export DFDISK_REQUIRE_TOOLS=1
+  '';
 
   postInstall = ''
     wrapProgram $out/bin/dfdisk \
-      --prefix PATH : ${lib.makeBinPath [
-        libewf
-        smartmontools
-        ddrescue
-        util-linux
-        systemd
-      ]}
+      --prefix PATH : ${lib.makeBinPath runtimeTools}
   '';
+
+  passthru = {
+    # The wrapper's PATH; the NUR recipe has to list the same tools
+    inherit runtimeTools;
+  };
 
   meta = {
     description = "Modern forensic disk imaging, damaged media rescue and conversion CLI/TUI tool";

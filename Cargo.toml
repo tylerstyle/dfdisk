@@ -2,6 +2,9 @@
 name = "dfdisk"
 version = "0.1.10"
 edition = "2021"
+# Minimum supported Rust version, checked by the CI "MSRV" job with the locked
+# dependencies (ratatui 0.30 and time 0.3.55 need 1.88)
+rust-version = "1.88"
 authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
 description = "Modern forensic disk imaging, damaged media rescue and conversion CLI/TUI tool"
 license = "MIT OR Apache-2.0"
@@ -14,20 +17,32 @@ categories = ["command-line-utilities"]
 [package.metadata.deb]
 name = "dfdisk"
 maintainer = "tylerstyle <tylerstyle@users.noreply.github.com>"
-copyright = "2026, tylerstyle"
-license-file = ["LICENSE-MIT", "4"]
+copyright = "2026 tylerstyle"
+# Debian-format copyright file covering both licenses (MIT OR Apache-2.0); it
+# carries its own header, so cargo-deb installs it unchanged
+license-file = ["packaging/deb/copyright", "0"]
+# Lines end in " \": a TOML line-ending backslash also drops the leading
+# spaces of the next line, so the space has to come before it
 extended-description = """\
-dfdisk is a high-performance terminal utility designed for DFIR examiners,\
- law enforcement investigators, and forensic technicians. It combines\
- hardware discovery, system safety guardrails, automated evidence naming,\
- dual-hash verification (MD5/SHA1/SHA256), and bi-directional conversion\
- between Expert Witness Format (E01) and RAW images with a Ratatui TUI dashboard."""
-depends = "ewf-tools | libewf-tools, gddrescue, smartmontools, util-linux, udev"
+dfdisk acquires storage devices for forensic examination: E01 images through \
+libewf (ewfacquire), RAW images read and hashed by dfdisk itself, and damaged \
+media through GNU ddrescue. It pins the identity of the source, refuses \
+mounted, claimed and system devices, by default sets the kernel read-only \
+flag on the source, records HPA/DCO and SMART state, re-reads the written \
+image after flushing it to disk, and writes a text and a JSON report whose \
+verdict and exit code state what was acquired and verified, including every \
+unreadable range. Interactive terminal UI and scriptable CLI."""
+# $auto: the packages of the shared libraries the binary links (libc, libgcc_s),
+# resolved by cargo-deb on the build host; the rest are the tools dfdisk runs
+depends = "$auto, ewf-tools, gddrescue, smartmontools, util-linux, udev, hdparm, nvme-cli"
 section = "utils"
 priority = "optional"
 assets = [
     ["target/release/dfdisk", "usr/bin/dfdisk", "755"],
     ["README.md", "usr/share/doc/dfdisk/README.md", "644"],
+    ["CHANGELOG.md", "usr/share/doc/dfdisk/CHANGELOG.md", "644"],
+    ["docs/exit-codes.md", "usr/share/doc/dfdisk/exit-codes.md", "644"],
+    ["docs/report-format.md", "usr/share/doc/dfdisk/report-format.md", "644"],
     ["LICENSE-MIT", "usr/share/doc/dfdisk/LICENSE-MIT", "644"],
     ["LICENSE-APACHE", "usr/share/doc/dfdisk/LICENSE-APACHE", "644"],
 ]
