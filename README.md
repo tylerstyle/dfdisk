@@ -545,6 +545,9 @@ cargo test
 # release lines (nixpkgs#libewf-legacy is the Debian/Ubuntu ewf-tools line)
 DFDISK_REQUIRE_TOOLS=1 nix shell nixpkgs#libewf nixpkgs#ddrescue nixpkgs#gcc -c cargo test --locked
 DFDISK_REQUIRE_TOOLS=1 nix shell nixpkgs#libewf-legacy nixpkgs#ddrescue nixpkgs#gcc -c cargo test --locked
+# and with Ubuntu 22.04's ewf-tools 20140807 and gddrescue 1.23 (podman or
+# docker; the test binaries built here run in the container as your user)
+scripts/test-ubuntu.sh
 
 # Package builds; they run the whole test suite with the real tools
 nix build .#default .#checks.x86_64-linux.libewf-legacy
