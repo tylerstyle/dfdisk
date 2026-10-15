@@ -652,7 +652,14 @@ impl App {
     /// must run inside a tokio runtime), periodic refresh, the examiner's
     /// case profile, SSH warning.
     pub fn new() -> Self {
+        Self::with_controller(AbortController::new())
+    }
+
+    /// [`new`](Self::new) with the process' abort controller (the one the
+    /// signal listener applies signals to).
+    pub fn with_controller(controller: AbortController) -> Self {
         let mut app = Self::with_backend(Vec::new(), Arc::new(HostBackend));
+        app.controller = controller;
         app.auto_refresh = true;
         app.is_root = is_root();
         if let Some(path) = profile::default_profile_path() {

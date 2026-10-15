@@ -19,6 +19,7 @@ pub mod input;
 pub mod profile;
 pub mod ui;
 
+use crate::signals::{AbortController, SignalListener};
 use app::App;
 use crossterm::{
     execute,
@@ -37,7 +38,21 @@ pub fn restore_terminal() {
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
 }
 
+/// Run the TUI with its own [`AbortController`] and signal listener (the
+/// listener is installed here, once for the process).
 pub async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
+    let controller = AbortController::new();
+    let listener = controller.install().ok();
+    run_tui_with(controller, listener).await
+}
+
+/// Run the TUI with the caller's controller and listener, for a `main` that
+/// installs the process' signal listener itself (two listeners would apply
+/// every signal twice: one SIGINT would count as abort and force).
+pub async fn run_tui_with(
+    controller: AbortController,
+    listener: Option<SignalListener>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Restore the terminal if a panic occurs
     let prev_hook = std::sync::Arc::new(std::panic::take_hook());
     let hook_clone = std::sync::Arc::clone(&prev_hook);
@@ -46,7 +61,7 @@ pub async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
         hook_clone(panic_info);
     }));
 
-    let res = run_tui_inner().await;
+    let res = run_tui_inner(controller, listener).await;
 
     restore_terminal();
     let _ = std::panic::take_hook();
@@ -62,10 +77,11 @@ pub async fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Runs the UI; returns a line for the terminal when a result was not seen.
-async fn run_tui_inner() -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let mut app = App::new();
-    // Once per process: tokio keeps the signals caught after a listener drops
-    let mut listener = app.controller.install().ok();
+async fn run_tui_inner(
+    controller: AbortController,
+    mut listener: Option<SignalListener>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut app = App::with_controller(controller);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
