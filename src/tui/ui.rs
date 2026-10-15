@@ -4,7 +4,7 @@
 //! sized to their content; inputs scroll horizontally by display width.
 
 use crate::engines::preflight::is_memory_fs;
-use crate::models::config::EngineKind;
+use crate::models::config::{EffectiveConfig, EngineKind};
 use crate::models::conversion::ConversionTarget;
 use crate::models::outcome::Outcome;
 use crate::models::telemetry::AcquisitionStatus;
@@ -1084,7 +1084,14 @@ pub fn sheet_lines(app: &App) -> Vec<Line<'static>> {
             out.push(Line::raw(""));
             out.push(section("ENGINE AND SETTINGS"));
             out.push(sheet_row("Engine", engine_choice(request.engine()), strong));
-            match check.as_ref().and_then(|c| c.effective_config.as_ref()) {
+            // The settings of the run as it will start, for the source the
+            // check identified. Not the check's own: its dry run sends no SMART
+            // command, so its configuration says SMART off
+            let effective = check
+                .as_ref()
+                .filter(|c| c.effective_config.is_some())
+                .map(|c| EffectiveConfig::build(&request.config, c.identity.as_ref()));
+            match effective {
                 Some(eff) => {
                     // The engine is the row above
                     for (k, v) in eff.rows().into_iter().filter(|(k, _)| k != "Engine") {

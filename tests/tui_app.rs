@@ -596,6 +596,37 @@ async fn a_source_without_serial_is_confirmed_with_the_evidence_number() {
     assert_eq!(app.screen, Screen::Running);
 }
 
+fn sheet_text(app: &App) -> Vec<String> {
+    dfdisk::tui::ui::sheet_lines(app)
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect()
+}
+
+#[tokio::test]
+async fn the_sheet_shows_the_smart_policy_the_run_uses() {
+    let fake = Fake::new(vec![evidence()]);
+    let mut app = app_with(&fake);
+    to_case_setup(&mut app, "/mnt/case");
+    assert_eq!(app.form.smart, SmartPolicy::Basic, "form default");
+    to_confirm(&mut app).await;
+    // The dry run itself sends no SMART command
+    assert_eq!(fake.s().check_requests[0].config.smart, SmartPolicy::Off);
+    let smart: Vec<String> = sheet_text(&app)
+        .into_iter()
+        .filter(|l| l.contains("SMART"))
+        .collect();
+    assert_eq!(smart.len(), 1, "{smart:?}");
+    assert!(smart[0].trim_end().ends_with("basic"), "{smart:?}");
+    typ(&mut app, "kd7y");
+    app.handle_key(key(KeyCode::Enter));
+    pump(&mut app, "result", |a| a.screen == Screen::Result).await;
+    assert_eq!(
+        fake.s().acquire_requests[0].config.smart,
+        SmartPolicy::Basic
+    );
+}
+
 #[tokio::test]
 async fn a_refused_check_cannot_be_started() {
     let fake = Fake::new(vec![evidence()]);
