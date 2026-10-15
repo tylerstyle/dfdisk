@@ -44,11 +44,11 @@ A second SIGINT kills external tools at once; the report is still written. SIGHU
 report is written.
 
 The exit code is the verdict of the report (0, 4-9; 4 when the verification
-could not run or complete), or 2, 3 or 4 when no acquisition ran. With
---rescue-to-e01 it is the more severe of the rescue and the conversion, from
-most to least severe: 1, 2, 8, 5, 4, 3, 6, 7, 9, 0; a conversion that could not
-start after the rescue (usage error, refusal) counts as 4, and a source that is
-not a whole number of 512-byte sectors is a usage error (2) before the rescue
+could not run or complete), or 2, 3, 4 or 8 (aborted) when no acquisition ran.
+With --rescue-to-e01 it is the more severe of the rescue and the conversion,
+from most to least severe: 1, 2, 8, 5, 4, 3, 6, 7, 9, 0; a conversion that could
+not start after the rescue (usage error, refusal) counts as 4, and a source that
+is not a whole number of 512-byte sectors is a usage error (2) before the rescue
 starts.
 
 ",
@@ -96,7 +96,8 @@ name without its extensions) and audit records. SIGINT, SIGTERM and SIGQUIT abor
 it (exit 8).
 
 Exit codes: the verdict of the conversion report (0, 4, 5, 6, 7, 8, 9), or 2
-(usage), 3 (refused) or 4 (failed) when no conversion ran; see dfdisk --help.";
+(usage), 3 (refused), 4 (failed) or 8 (aborted) when no conversion ran; see
+dfdisk --help.";
 
 const UNMOUNT_AFTER_HELP: &str = "\
 Unmounts every filesystem of the device and of everything stacked on it
