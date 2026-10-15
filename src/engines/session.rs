@@ -58,7 +58,7 @@ use crate::models::identity::{SerialSource, SourceIdentity};
 use crate::models::info_report::{
     compare_digest_sets, sync_dir, AuditInfo, AuditStatus, FileDigest, ForensicInfoReport,
     HashResults, IdentityCheck, PiecewiseInfo, ReportFiles, SessionInfo, VerificationInfo,
-    RESERVE_SUFFIX,
+    INFO_JSON_SUFFIX, INFO_SUFFIX, RESERVE_SUFFIX,
 };
 use crate::models::outcome::{AcquisitionFacts, ReadErrorTable, VerificationResult};
 use crate::models::protection::{RegistryPresence, WriteProtection};
@@ -834,29 +834,66 @@ fn new_outputs(dir: &Path, base: &str, except: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The engine failed (`Err`). When it wrote anything, the run still gets a
-/// report (stop reason = the error, or aborted); otherwise the error stands.
+/// Whether `path` is an image file `engine` writes (R-1): `<base>.raw` for
+/// RAW and rescue, EWF segments (`.E01`, ..., `.EAA`, ..., `.FAA`, ...) for
+/// E01. Reports, kept session reports, maps, identity records, tool logs,
+/// pieces and SMART files are never images.
+fn is_image_file(engine: EngineKind, base: &str, path: &Path) -> bool {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return false;
+    };
+    match engine {
+        EngineKind::Raw | EngineKind::Rescue => name == format!("{base}{}", rescue::IMAGE_SUFFIX),
+        EngineKind::Ewf => {
+            ewf::is_ewf_segment(base, &name)
+                && name
+                    .get(base.len() + 1..)
+                    .and_then(|ext| ext.bytes().next())
+                    .is_some_and(|b| b.is_ascii_alphabetic())
+        }
+    }
+}
+
+/// The engine failed (`Err`). A refusal stands as it is (the engine decided
+/// the run must not happen; nothing it kept is a result). Otherwise, when it
+/// wrote anything, the run still gets a report (stop reason = the error, or
+/// aborted) that lists the image files of this engine as images and every
+/// other file it left (map, identity record, tool log, kept reports) as
+/// auxiliary files; when it wrote nothing, the error stands.
 fn engine_error_output(
     ctx: &EngineContext,
     err: AcquisitionError,
     preexisting: &[PathBuf],
     session_files: &[PathBuf],
 ) -> Result<EngineOutput, AcquisitionError> {
+    if err.kind == ErrorKind::Refused {
+        return Err(err);
+    }
     let written = new_outputs(&ctx.output_dir, &ctx.base_name, preexisting);
     if written.is_empty() {
         return Err(err);
     }
     let aborted = err.kind == ErrorKind::Aborted || ctx.is_aborted();
-    let image_files: Vec<PathBuf> = written
+    // The reports about to be written are not files of the engine
+    let reports = [
+        format!("{}{INFO_SUFFIX}", ctx.base_name),
+        format!("{}{INFO_JSON_SUFFIX}", ctx.base_name),
+    ];
+    let (image_files, auxiliary_files): (Vec<PathBuf>, Vec<PathBuf>) = written
         .into_iter()
         .filter(|p| !session_files.contains(p))
         .chain(preexisting.iter().cloned())
-        .collect();
+        .filter(|p| {
+            p.file_name()
+                .is_none_or(|n| !reports.iter().any(|r| n.to_string_lossy() == r.as_str()))
+        })
+        .partition(|p| is_image_file(ctx.engine, &ctx.base_name, p));
     let mut out = EngineOutput {
         expected_bytes: ctx.expected_bytes(),
         read_errors: ReadErrorTable::new(ctx.sector_size(), "engine stopped with an error"),
         aborted,
         image_files,
+        auxiliary_files,
         ..Default::default()
     };
     if !aborted {
@@ -871,6 +908,10 @@ fn engine_error_output(
         err.kind.label(),
         err.message
     ));
+    if out.image_files.is_empty() {
+        out.notes
+            .push("the engine left no image file; only its other files are listed".into());
+    }
     Ok(out)
 }
 

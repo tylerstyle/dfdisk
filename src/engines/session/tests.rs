@@ -1468,6 +1468,120 @@ async fn engine_failures_report_what_exists() {
         .contains("exit code Some(1)"));
     assert_eq!(report.image_files.len(), 1);
     assert!(report.image_files[0].ends_with(".raw"));
+
+    // R-1: only the engine's image files are images; a map, an identity
+    // record or a tool log is an auxiliary file (with its digest)
+    let mut fake = Fake::new();
+    fake.engine = Some(Box::new(|ctx| {
+        for suffix in [".raw", ".map", ".identity.json"] {
+            std::fs::write(ctx.output_path(suffix), b"x").unwrap();
+        }
+        Err(AcquisitionError::failed("ddrescue ended abnormally"))
+    }));
+    let config = AcquisitionConfig {
+        smart: SmartPolicy::Off,
+        ..AcquisitionConfig::rescue(fake.out())
+    };
+    let report = run_fake(&fake, config).await.0.unwrap();
+    assert_eq!(
+        report.image_files,
+        [format!("{}/{BASE}.raw", fake.out().display())]
+    );
+    let aux: Vec<&str> = report
+        .auxiliary_files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect();
+    assert!(aux.iter().any(|p| p.ends_with(".map")), "{aux:?}");
+    assert!(aux.iter().any(|p| p.ends_with(".identity.json")), "{aux:?}");
+
+    // An E01 that stopped before its first segment: the log is no image
+    let mut fake = Fake::new();
+    fake.engine = Some(Box::new(|ctx| {
+        std::fs::write(ctx.output_path(".ewfacquire.log"), b"log").unwrap();
+        Err(AcquisitionError::failed(
+            "ewfacquire failed with exit code Some(1)",
+        ))
+    }));
+    fake.verify = Some(Box::new(|_, out| {
+        assert!(out.image_files.is_empty(), "{:?}", out.image_files);
+        (
+            VerificationResult::Failed {
+                reason: "ewfacquire produced no segment file".into(),
+            },
+            HashResults::default(),
+        )
+    }));
+    let config = AcquisitionConfig {
+        smart: SmartPolicy::Off,
+        ..AcquisitionConfig::for_engine(EngineKind::Ewf, fake.out())
+    };
+    let report = run_fake(&fake, config).await.0.unwrap();
+    assert!(report.image_files.is_empty(), "{:?}", report.image_files);
+    assert!(report.auxiliary_files[0].path.ends_with(".ewfacquire.log"));
+    assert_eq!(report.outcome, Outcome::Incomplete);
+
+    // A refusal from the engine stands: no report, even if files exist
+    let mut fake = Fake::new();
+    fake.engine = Some(Box::new(|ctx| {
+        std::fs::write(ctx.output_path(".info.session-1"), b"kept report").unwrap();
+        Err(AcquisitionError::refused(
+            "the map belongs to another device; refusing to resume",
+        ))
+    }));
+    let config = AcquisitionConfig {
+        smart: SmartPolicy::Off,
+        ..AcquisitionConfig::rescue(fake.out())
+    };
+    let e = run_fake(&fake, config).await.0.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Refused, "{e}");
+    assert!(!fake.out().join(format!("{BASE}.info")).exists());
+}
+
+#[test]
+fn engine_files_are_classified_by_engine() {
+    let base = "c_ea01_e1_S";
+    let p = |n: &str| PathBuf::from(format!("/out/{n}"));
+    for (engine, image, not_image) in [
+        (
+            EngineKind::Raw,
+            vec![format!("{base}.raw")],
+            vec![format!("{base}.pieces.tsv"), format!("{base}.info")],
+        ),
+        (
+            EngineKind::Rescue,
+            vec![format!("{base}.raw")],
+            vec![
+                format!("{base}.map"),
+                format!("{base}.identity.json"),
+                format!("{base}.info.session-1"),
+                format!("{base}.info.session-1.json"),
+                format!("{base}.smart-after.json"),
+            ],
+        ),
+        (
+            EngineKind::Ewf,
+            vec![
+                format!("{base}.E01"),
+                format!("{base}.E99"),
+                format!("{base}.EAA"),
+                format!("{base}.FAA"),
+            ],
+            vec![
+                format!("{base}.ewfacquire.log"),
+                format!("{base}.info.json"),
+                format!("{base}.001"),
+                format!("{base}.raw"),
+            ],
+        ),
+    ] {
+        for n in image {
+            assert!(is_image_file(engine, base, &p(&n)), "{engine:?} {n}");
+        }
+        for n in not_image {
+            assert!(!is_image_file(engine, base, &p(&n)), "{engine:?} {n}");
+        }
+    }
 }
 
 #[tokio::test]
