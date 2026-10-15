@@ -39,6 +39,7 @@
 use crate::discovery::writeprotect;
 use crate::engines::audit;
 use crate::engines::error::{AcquisitionError, ErrorKind};
+use crate::engines::ewf;
 use crate::engines::preflight::{self, DestinationFacts, DestinationRules};
 use crate::engines::process::{self, ProcessEvent, ProcessOutcome, ProcessSpec, StreamTag};
 use crate::engines::progress::ProgressSink;
@@ -455,12 +456,13 @@ pub fn ewf_segments(path: &Path) -> Result<Vec<SourceFile>, AcquisitionError> {
         )));
     }
     let dir = parent_dir(path);
-    let mut segments: Vec<(u32, PathBuf)> = siblings(&dir, stem)
-        .into_iter()
+    let sibs = siblings(&dir, stem);
+    let mut segments: Vec<(u32, PathBuf)> = sibs
+        .iter()
         .filter_map(|(e, p)| {
-            ewf_segment_number(&e)
+            ewf_segment_number(e)
                 .filter(|(f, _)| *f == family)
-                .map(|(_, n)| (n, p))
+                .map(|(_, n)| (n, p.clone()))
         })
         .collect();
     segments.sort();
@@ -480,18 +482,65 @@ pub fn ewf_segments(path: &Path) -> Result<Vec<SourceFile>, AcquisitionError> {
             )));
         }
     }
-    if segments.is_empty() {
+    let Some(first) = segments.first().map(|(_, p)| p.clone()) else {
         return Err(usage(format!("{} does not exist", path.display())));
-    }
-    segments
+    };
+    // Beyond .EZZ libewf continues with .FAA ... .ZZZ: follow its naming
+    let first_ext = first
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut paths: Vec<PathBuf> = segments.into_iter().map(|(_, p)| p).collect();
+    paths.extend(segment_chain(
+        &sibs,
+        &first_ext,
+        paths.len() as u32 + 1,
+        stem,
+    )?);
+    paths
         .into_iter()
-        .map(|(_, p)| {
+        .map(|p| {
             Ok(SourceFile {
                 bytes: file_size(&p)?,
                 path: p,
             })
         })
         .collect()
+}
+
+/// Segments `from`, `from + 1`, ... of the family whose first segment has
+/// the extension `first_ext`, named as libewf names them
+/// ([`ewf::segment_extension`]), among `sibs` (compared without regard to
+/// case), up to the first number that does not exist (libewf reads a family
+/// the same way).
+fn segment_chain(
+    sibs: &[(String, PathBuf)],
+    first_ext: &str,
+    from: u32,
+    stem: &str,
+) -> Result<Vec<PathBuf>, AcquisitionError> {
+    let mut out = Vec::new();
+    let mut n = from;
+    while let Some(ext) = ewf::segment_extension(first_ext, n) {
+        let found: Vec<&PathBuf> = sibs
+            .iter()
+            .filter(|(e, _)| e.eq_ignore_ascii_case(&ext))
+            .map(|(_, p)| p)
+            .collect();
+        match found.as_slice() {
+            [] => break,
+            [p] => out.push((*p).clone()),
+            [a, b, ..] => {
+                return Err(usage(format!(
+                    "the EWF set {stem} is ambiguous: {} and {} are the same segment",
+                    a.display(),
+                    b.display()
+                )))
+            }
+        }
+        n += 1;
+    }
+    Ok(out)
 }
 
 /// Output files of a conversion named `base` in `dir`, compared without
@@ -527,18 +576,55 @@ pub fn existing_conversion_outputs(
     found
 }
 
-/// E01 segments a conversion named `base` wrote into `dir`, in order.
+/// E01 segments a conversion named `base` wrote into `dir`, in order: the
+/// segments as libewf names them (`.E01` .. `.EZZ`, `.FAA` ...) from the
+/// first on, then any other `.E..` segment (after a gap).
 fn written_segments(dir: &Path, base: &str) -> Vec<PathBuf> {
-    let mut segs: Vec<(u32, PathBuf)> = siblings(dir, base)
+    let sibs = siblings(dir, base);
+    let mut out = segment_chain(&sibs, "E01", 1, base).unwrap_or_default();
+    let mut rest: Vec<(u32, PathBuf)> = sibs
         .into_iter()
+        .filter(|(_, p)| !out.contains(p))
         .filter_map(|(e, p)| {
             ewf_segment_number(&e)
                 .filter(|(f, _)| f == "e")
                 .map(|(_, n)| (n, p))
         })
         .collect();
-    segs.sort();
-    segs.into_iter().map(|(_, p)| p).collect()
+    rest.sort();
+    out.extend(rest.into_iter().map(|(_, p)| p));
+    out
+}
+
+/// Files in `dir` named like segments past `.EZZ` (`.FAA` ...) that an E01
+/// conversion of `source_bytes` with segments of `segment_bytes` could
+/// write: ewfacquire -u would overwrite them. Bounded by the number of
+/// segments the output can need (1 % overhead and one more), so a source
+/// like `x.RAW` is never taken for segment 9,000-something.
+fn existing_late_segments(
+    dir: &Path,
+    base: &str,
+    source_bytes: u64,
+    segment_bytes: Option<u64>,
+) -> Vec<PathBuf> {
+    const FIRST_LATE: u32 = 776;
+    let Some(seg) = segment_bytes.filter(|s| *s > 0) else {
+        return Vec::new();
+    };
+    let most = (source_bytes / 100 * 101 / seg).saturating_add(2);
+    let most = u32::try_from(most).unwrap_or(u32::MAX);
+    if most < FIRST_LATE {
+        return Vec::new();
+    }
+    let names: std::collections::HashSet<String> = (FIRST_LATE..=most)
+        .map_while(|n| ewf::segment_extension("E01", n))
+        .map(|e| e.to_ascii_lowercase())
+        .collect();
+    siblings(dir, base)
+        .into_iter()
+        .filter(|(e, _)| names.contains(&e.to_ascii_lowercase()))
+        .map(|(_, p)| p)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,7 +1758,15 @@ fn check_destination(
         resumed_image_bytes: 0,
     };
     let notes = preflight::evaluate(&rules, &facts)?;
-    let existing = existing_conversion_outputs(&plan.output_dir, &plan.base_name, plan.target);
+    let mut existing = existing_conversion_outputs(&plan.output_dir, &plan.base_name, plan.target);
+    if plan.target == ConversionTarget::E01 {
+        existing.extend(existing_late_segments(
+            &plan.output_dir,
+            &plan.base_name,
+            plan.expected_bytes,
+            req.split_size.bytes(),
+        ));
+    }
     if !existing.is_empty() {
         let list = existing
             .iter()
@@ -3009,6 +3103,40 @@ mod tests {
         let l = touch(d, "y.L01", 10);
         let e = ewf_segments(&l).unwrap_err();
         assert!(e.message.contains("logical evidence"), "{e}");
+    }
+
+    #[test]
+    fn ewf_families_beyond_ezz_are_complete() {
+        // C-2: 811 segments, as ewfacquire writes 811 MiB with -S 1MiB
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let names: Vec<String> = (1..=811)
+            .map(|n| ewf::segment_extension("E01", n).unwrap())
+            .collect();
+        assert_eq!(names[774], "EZZ");
+        assert_eq!(names[775], "FAA");
+        assert_eq!(names[810], "FBJ");
+        for ext in &names {
+            touch(d, &format!("x.{ext}"), 1);
+        }
+        touch(d, "x.raw", 1);
+        touch(d, "x.RAW", 1);
+        let set = ewf_segments(&d.join("x.E01")).unwrap();
+        assert_eq!(set.len(), 811);
+        assert!(set[775].path.ends_with("x.FAA"));
+        assert!(set[810].path.ends_with("x.FBJ"));
+        let written = written_segments(d, "x");
+        assert_eq!(written.len(), 811);
+        assert_eq!(
+            written,
+            set.iter().map(|f| f.path.clone()).collect::<Vec<_>>()
+        );
+        // Existing late segments refuse an E01 output that can reach them,
+        // never a source named like one when it cannot
+        let late = existing_late_segments(d, "x", 811 << 20, Some(1 << 20));
+        assert_eq!(late.len(), 811 - 775, "{late:?}");
+        assert!(existing_late_segments(d, "x", 3 << 20, Some(1 << 20)).is_empty());
+        assert!(existing_late_segments(d, "x", 811 << 20, None).is_empty());
     }
 
     #[test]

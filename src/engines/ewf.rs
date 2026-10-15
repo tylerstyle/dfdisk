@@ -736,6 +736,51 @@ pub fn is_ewf_segment(base_name: &str, file_name: &str) -> bool {
     }
 }
 
+/// libewf's extension of segment `number` (1-based) in the family whose
+/// first segment has the extension `first` (`E01`, `e01`, `s01`, `L01`,
+/// `Ex01`, `Lx01`; the case of `first` is kept), as
+/// libewf_filename_set_extension names them: 1..99 two digits (`E01` ..
+/// `E99`), from 100 on two letters (`EAA` .. `EZZ`), then the lead letter
+/// counts up (`FAA` .. `ZZZ`). `None` past the last name libewf can form
+/// or for an extension that is no first segment.
+pub fn segment_extension(first: &str, number: u32) -> Option<String> {
+    let b = first.as_bytes();
+    let (lead, x) = match b {
+        [lead, b'0', b'1'] if lead.is_ascii_alphabetic() => (*lead, None),
+        [lead, x @ (b'x' | b'X'), b'0', b'1'] if lead.is_ascii_alphabetic() => (*lead, Some(*x)),
+        _ => return None,
+    };
+    if number == 0 {
+        return None;
+    }
+    let (first_letter, last_lead) = if lead.is_ascii_uppercase() {
+        (b'A', b'Z')
+    } else {
+        (b'a', b'z')
+    };
+    let (lead, tail) = if number <= 99 {
+        (
+            lead,
+            [b'0' + (number / 10) as u8, b'0' + (number % 10) as u8],
+        )
+    } else {
+        let mut n = number - 100;
+        let second = first_letter + (n % 26) as u8;
+        n /= 26;
+        let first_of_two = first_letter + (n % 26) as u8;
+        n /= 26;
+        let lead = u32::from(lead) + n;
+        if lead > u32::from(last_lead) {
+            return None;
+        }
+        (lead as u8, [first_of_two, second])
+    };
+    let mut out = vec![lead];
+    out.extend(x);
+    out.extend(tail);
+    String::from_utf8(out).ok()
+}
+
 /// Segment files of `base` in `dir`, in libewf order (`.E01` < `.E99` <
 /// `.EAA` < `.EZZ` < `.FAA`).
 pub fn find_segments(dir: &Path, base: &str) -> Vec<PathBuf> {
@@ -2732,6 +2777,47 @@ mod tests {
             .map(|p| p.extension().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["E01", "E02", "E99", "EAA", "EAB", "EZZ", "FAA"]);
+    }
+
+    #[test]
+    fn segment_extensions_follow_libewf() {
+        for (n, ext) in [
+            (1, "E01"),
+            (9, "E09"),
+            (99, "E99"),
+            (100, "EAA"),
+            (101, "EAB"),
+            (126, "EBA"),
+            (775, "EZZ"),
+            (776, "FAA"),
+            (811, "FBJ"),
+            (14_971, "ZZZ"),
+        ] {
+            assert_eq!(segment_extension("E01", n).as_deref(), Some(ext), "{n}");
+        }
+        assert_eq!(segment_extension("E01", 14_972), None);
+        assert_eq!(segment_extension("E01", 0), None);
+        assert_eq!(segment_extension("e01", 776).as_deref(), Some("faa"));
+        assert_eq!(segment_extension("s01", 100).as_deref(), Some("saa"));
+        assert_eq!(segment_extension("s01", 776).as_deref(), Some("taa"));
+        assert_eq!(segment_extension("Ex01", 2).as_deref(), Some("Ex02"));
+        assert_eq!(segment_extension("Ex01", 776).as_deref(), Some("FxAA"));
+        assert_eq!(segment_extension("E02", 1), None);
+        assert_eq!(segment_extension("raw", 1), None);
+        // The E01 engine recognises every name of the sequence, in order
+        let mut previous: Option<String> = None;
+        for n in 1..=2000 {
+            let ext = segment_extension("E01", n).unwrap();
+            assert!(is_ewf_segment("b", &format!("b.{ext}")), "{ext}");
+            let key = segment_order(Path::new(&format!("b.{ext}")));
+            if let Some(p) = &previous {
+                assert!(
+                    segment_order(Path::new(&format!("b.{p}"))) < key,
+                    "{p} < {ext}"
+                );
+            }
+            previous = Some(ext);
+        }
     }
 
     #[test]
