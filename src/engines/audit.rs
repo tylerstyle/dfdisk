@@ -3,8 +3,11 @@
 //! audit anchor) and "acquisition_finished" on every path afterwards, carrying
 //! the outcome, exit code, read-error summary, every known digest, the SHA-256
 //! of both reports and the files ([`FinishedGuard`] writes it even when the run
-//! ends by an error, a cancellation or a panic). Refusals are recorded by their
-//! [`ErrorKind`](crate::engines::ErrorKind), never by message text.
+//! ends by an error, a cancellation or a panic, or when the report could not
+//! be written). Refusals are recorded by their
+//! [`ErrorKind`](crate::engines::ErrorKind), never by message text. The
+//! top-level outcome of a record with a verdict is `error` for MISMATCH,
+//! INCOMPLETE, ABORTED and VERIFICATION FAILED ([`outcome_for_exit_code`]).
 //!
 //! A refusal before "started" (identity, source safety, destination) is one
 //! "acquisition_refused" record ([`refused`]). Further records: [`unmount`],
@@ -170,10 +173,32 @@ fn read_error_summary(report: &ForensicInfoReport) -> Value {
     })
 }
 
+/// The top-level outcome of a record of a run that ended with a verdict
+/// (acquisition, conversion, verification): `error` for exit codes 4
+/// (verification failed), 5 (mismatch), 6 (incomplete) and 8 (aborted), `ok`
+/// for 0 (verified), 7 (completed with read errors) and 9 (complete, not
+/// verified); any other code is an error.
+pub fn outcome_for_exit_code(code: i32) -> Outcome {
+    use crate::models::outcome::exit_code as x;
+    match code {
+        x::VERIFIED | x::READ_ERRORS | x::UNVERIFIED => Outcome::Ok,
+        _ => Outcome::Error,
+    }
+}
+
+/// "VERIFIED (exit code 0)": the record message of a verdict.
+fn verdict_message(outcome: crate::models::outcome::Outcome, exit_code: i32) -> String {
+    format!("{} (exit code {exit_code})", outcome.label())
+}
+
 /// Details of the "acquisition_finished" record of a run with a report
 /// (pure): outcome, exit code, read-error summary, every digest, the report
-/// digests and the files.
-pub fn finished_details(report: &ForensicInfoReport, files: &ReportFiles) -> Map<String, Value> {
+/// digests (null when the report could not be written, `files` = `None`)
+/// and the files.
+pub fn finished_details(
+    report: &ForensicInfoReport,
+    files: Option<&ReportFiles>,
+) -> Map<String, Value> {
     let mut d = Map::new();
     let mut put = |k: &str, v: Value| {
         d.insert(k.to_string(), v);
@@ -231,10 +256,17 @@ pub fn finished_details(report: &ForensicInfoReport, files: &ReportFiles) -> Map
                 .unwrap_or(Value::Null),
         );
     }
-    put("report_file", json!(files.text.to_string_lossy()));
-    put("report_json_file", json!(files.json.to_string_lossy()));
-    put("report_sha256", json!(files.text_sha256));
-    put("report_json_sha256", json!(files.json_sha256));
+    put("report_written", json!(files.is_some()));
+    put(
+        "report_file",
+        json!(files.map(|f| f.text.to_string_lossy().into_owned())),
+    );
+    put(
+        "report_json_file",
+        json!(files.map(|f| f.json.to_string_lossy().into_owned())),
+    );
+    put("report_sha256", json!(files.map(|f| &f.text_sha256)));
+    put("report_json_sha256", json!(files.map(|f| &f.json_sha256)));
     put("files", json!(report.image_files));
     put(
         "auxiliary_files",
@@ -322,18 +354,41 @@ impl FinishedGuard {
         r
     }
 
-    /// The run produced a report (any outcome, aborted included).
+    /// The run produced a report (any outcome, aborted included). The
+    /// record's outcome is `error` for verdicts 4, 5, 6 and 8
+    /// ([`outcome_for_exit_code`]).
     pub fn report(
         mut self,
         report: &ForensicInfoReport,
         files: &ReportFiles,
     ) -> Result<String, String> {
-        let message = format!(
-            "{} (exit code {})",
-            report.outcome.label(),
-            report.exit_code
+        let event = self.event(
+            outcome_for_exit_code(report.exit_code),
+            Some(verdict_message(report.outcome, report.exit_code)),
+            finished_details(report, Some(files)),
         );
-        let event = self.event(Outcome::Ok, Some(message), finished_details(report, files));
+        self.write(event)
+    }
+
+    /// The run reached a verdict but its report could not be written
+    /// (`err`): the record carries everything the report would have (the
+    /// digests, the read errors, the files), the report digests are null,
+    /// `report_written` is false, `exit_code` is the process exit code of
+    /// `err` and `verdict_exit_code` that of the verdict.
+    pub fn report_not_written(
+        mut self,
+        report: &ForensicInfoReport,
+        err: &AcquisitionError,
+    ) -> Result<String, String> {
+        let mut details = finished_details(report, None);
+        details.insert("exit_code".into(), json!(err.exit_code()));
+        details.insert("verdict_exit_code".into(), json!(report.exit_code));
+        details.insert(
+            "error_kind".into(),
+            serde_json::to_value(err.kind).unwrap_or_default(),
+        );
+        details.insert("error".into(), json!(err.message));
+        let event = self.event(err.audit_outcome(), Some(err.message.clone()), details);
         self.write(event)
     }
 
@@ -430,9 +485,10 @@ pub fn image_verification(
         serde_json::to_value(result).unwrap_or_default(),
     );
     event.details.insert("exit_code".into(), json!(exit_code));
-    if let VerificationResult::Failed { reason } = result {
-        event = event.outcome(Outcome::Error, Some(reason.clone()));
-    }
+    event = event.outcome(
+        outcome_for_exit_code(exit_code),
+        Some(format!("{} (exit code {exit_code})", result.describe())),
+    );
     append(log, event)
 }
 
@@ -466,7 +522,23 @@ pub fn conversion_finished(
 ) -> Result<String, String> {
     let mut event = Event::new(TOOL, VERSION, action::CONVERSION_FINISHED);
     match result {
-        Ok(details) => event.details = details,
+        Ok(details) => {
+            // The verdict decides the record's outcome, as for acquisitions
+            if let Some(code) = details
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .and_then(|c| i32::try_from(c).ok())
+            {
+                let message = details
+                    .get("outcome")
+                    .cloned()
+                    .and_then(|o| serde_json::from_value::<crate::models::outcome::Outcome>(o).ok())
+                    .map(|o| verdict_message(o, code))
+                    .unwrap_or_else(|| format!("exit code {code}"));
+                event = event.outcome(outcome_for_exit_code(code), Some(message));
+            }
+            event.details = details;
+        }
         Err(e) => {
             event = event
                 .detail(
@@ -681,14 +753,126 @@ mod tests {
             text_sha256: "t".into(),
             json_sha256: "j".into(),
         };
-        let d = finished_details(&r, &files);
+        let d = finished_details(&r, Some(&files));
         assert_eq!(d["outcome"], serde_json::to_value(r.outcome).unwrap());
         assert_eq!(d["exit_code"], r.exit_code);
         assert_eq!(d["read_errors"]["substituted_sectors"], 1);
         assert_eq!(d["acquisition_hashes"]["md5"], "aa");
         assert_eq!(d["report_sha256"], "t");
         assert_eq!(d["report_json_sha256"], "j");
+        assert_eq!(d["report_written"], true);
         assert_eq!(d["files"][0], "/out/x.raw");
+        // Without a written report: everything else, report digests null
+        let d = finished_details(&r, None);
+        assert_eq!(d["report_written"], false);
+        assert!(d["report_sha256"].is_null() && d["report_file"].is_null());
+        assert_eq!(d["acquisition_hashes"]["md5"], "aa");
+        assert_eq!(d["files"][0], "/out/x.raw");
+    }
+
+    #[test]
+    fn records_with_a_verdict_are_errors_unless_the_verdict_is_good() {
+        use crate::models::outcome::Outcome as Verdict;
+        let ok: Vec<i32> = Verdict::ALL
+            .iter()
+            .map(Verdict::exit_code)
+            .filter(|c| outcome_for_exit_code(*c) == Outcome::Ok)
+            .collect();
+        assert_eq!(ok, [0, 9, 7]);
+        for code in [1, 2, 3, 4, 5, 6, 8] {
+            assert_eq!(outcome_for_exit_code(code), Outcome::Error, "{code}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let id = identity();
+        let eff = EffectiveConfig::build(&AcquisitionConfig::raw("/out"), Some(&id));
+        let files = ReportFiles {
+            text: "/out/x.info".into(),
+            json: "/out/x.info.json".into(),
+            text_sha256: "t".into(),
+            json_sha256: "j".into(),
+        };
+        let guard = |anchor: &str| {
+            FinishedGuard::new(
+                &log,
+                identity().device_identity(),
+                EngineKind::Raw,
+                Some(anchor.into()),
+                ProgressSink::disconnected(),
+            )
+        };
+        // INCOMPLETE: an error record with the verdict as its message
+        let mut r = ForensicInfoReport::new(EngineKind::Raw, &case(), id.clone(), eff.clone());
+        r.bytes_acquired = 512;
+        r.apply_classification();
+        guard("a").report(&r, &files).unwrap();
+        // VERIFIED: ok
+        r.bytes_acquired = r.expected_bytes;
+        r.verification.result = VerificationResult::Matched { method: "m".into() };
+        r.apply_classification();
+        assert_eq!(r.exit_code, 0);
+        guard("b").report(&r, &files).unwrap();
+        // The report could not be written: an error record that still
+        // carries the verdict and the digests
+        r.acquisition_hashes.md5 = Some("aa".into());
+        guard("c")
+            .report_not_written(&r, &AcquisitionError::failed("disk full"))
+            .unwrap();
+        // A verification: mismatch is an error, with a message
+        image_verification(
+            &log,
+            Path::new("/x.raw"),
+            &VerificationResult::Mismatched {
+                method: "m".into(),
+                details: "MD5 differs".into(),
+            },
+            5,
+            Map::new(),
+        )
+        .unwrap();
+        image_verification(
+            &log,
+            Path::new("/x.raw"),
+            &VerificationResult::Matched { method: "m".into() },
+            0,
+            Map::new(),
+        )
+        .unwrap();
+        // A conversion with a verdict
+        let mut d = Map::new();
+        d.insert("outcome".into(), json!("aborted"));
+        d.insert("exit_code".into(), json!(8));
+        conversion_finished(&log, Path::new("/a"), Path::new("/b"), None, Ok(d)).unwrap();
+
+        let recs = records(&log);
+        let got: Vec<(&str, &str)> = recs
+            .iter()
+            .map(|r| {
+                (
+                    r["outcome"].as_str().unwrap(),
+                    r["message"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(got[0], ("error", "INCOMPLETE (exit code 6)"));
+        assert_eq!(got[1], ("ok", "VERIFIED (exit code 0)"));
+        assert_eq!(got[2], ("error", "disk full"));
+        assert_eq!(recs[2]["details"]["report_written"], false);
+        assert_eq!(recs[2]["details"]["exit_code"], 4);
+        assert_eq!(recs[2]["details"]["verdict_exit_code"], 0);
+        assert_eq!(recs[2]["details"]["outcome"], "verified");
+        assert_eq!(recs[2]["details"]["acquisition_hashes"]["md5"], "aa");
+        assert!(recs[2]["details"]["report_sha256"].is_null());
+        assert_eq!(got[3].0, "error");
+        assert!(
+            got[3].1.starts_with("MISMATCH (m): MD5 differs"),
+            "{}",
+            got[3].1
+        );
+        assert_eq!(got[4], ("ok", "matched (m) (exit code 0)"));
+        assert_eq!(got[5], ("error", "ABORTED (exit code 8)"));
+        assert!(dfcore::audit::verify(&log).is_ok());
     }
 
     #[test]

@@ -187,6 +187,10 @@ impl FakeHost {
 }
 
 impl SessionHost for FakeHost {
+    fn find_tool(&self, program: &str) -> Option<PathBuf> {
+        Some(PathBuf::from("/fake/bin").join(program))
+    }
+
     fn probe_identity(&self, path: &str) -> Result<SourceIdentity, String> {
         match &self.probe_error {
             Some(e) => Err(e.clone()),
@@ -611,7 +615,6 @@ fn every_new_flag_reaches_the_configuration() {
         "full",
         "--write-protect",
         "off",
-        "--allow-holders",
         "--allow-tmpfs",
         "--allow-low-space",
         "--refuse-hidden-areas",
@@ -645,7 +648,27 @@ fn every_new_flag_reaches_the_configuration() {
     assert!(c.verify_source);
     assert_eq!(c.smart, SmartPolicy::Full);
     assert_eq!(c.write_protect, WriteProtectPolicy::Off);
-    assert!(c.allow_holders && c.allow_tmpfs && c.allow_low_space && c.refuse_hidden_areas);
+    assert!(c.allow_tmpfs && c.allow_low_space && c.refuse_hidden_areas);
+    // --allow-holders is gone (a holder claims the source; it could never apply)
+    let e = Cli::try_parse_from([
+        "dfdisk",
+        "acquire",
+        "/dev/sdx",
+        "-o",
+        "/tmp/x",
+        "-C",
+        "C",
+        "-E",
+        "E",
+        "-e",
+        "X",
+        "--allow-holders",
+    ])
+    .unwrap_err();
+    assert!(
+        e.use_stderr(),
+        "an unknown argument is a usage error (exit 2)"
+    );
     assert_eq!(c.expect.serial.as_deref(), Some("S123"));
     assert_eq!(c.expect.wwn.as_deref(), Some("0x5000c500a1b2c3d4"));
     assert_eq!(c.expect.size, Some(1 << 30));
@@ -848,9 +871,23 @@ fn rescue_to_e01_converts_complete_rescues_only() {
     no_image.image_files.clear();
     assert!(plan_conversion(&no_image, &case, e01).is_err());
     assert_eq!(ConversionStep::Skipped("x".into()).exit_code(), 0);
+    // I2: after a written rescue, a conversion that could not start is
+    // FAILED (4), never 2 or 3 ("nothing was written")
     assert_eq!(
         ConversionStep::Failed(AcquisitionError::refused("x")).exit_code(),
-        3
+        4
+    );
+    assert_eq!(
+        ConversionStep::Failed(AcquisitionError::usage("x")).exit_code(),
+        4
+    );
+    assert_eq!(
+        ConversionStep::Failed(AcquisitionError::aborted("x")).exit_code(),
+        8
+    );
+    assert_eq!(
+        ConversionStep::Failed(AcquisitionError::failed("x")).exit_code(),
+        4
     );
 }
 
@@ -905,4 +942,25 @@ fn the_selection_summary_is_sanitised() {
     );
     assert!(lines.contains("major:minor : 8:16"), "{lines}");
     assert!(lines.contains("1073741824 bytes (1 GiB)"), "{lines}");
+}
+
+#[tokio::test]
+async fn a_panic_exits_1_not_101() {
+    // T6: the documented internal-error code, with the result of a run that
+    // did not panic passed through unchanged
+    assert_eq!(super::exit_code_or_internal_error(async { 7 }).await, 7);
+    let code = super::exit_code_or_internal_error(async {
+        if std::hint::black_box(true) {
+            panic!("injected for the test");
+        }
+        0
+    })
+    .await;
+    assert_eq!(code, crate::models::outcome::exit_code::INTERNAL_ERROR);
+    let code = super::exit_code_or_internal_error(async {
+        let v: Vec<u8> = Vec::new();
+        i32::from(v[std::hint::black_box(3)])
+    })
+    .await;
+    assert_eq!(code, 1);
 }

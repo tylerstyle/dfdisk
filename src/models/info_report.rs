@@ -90,6 +90,23 @@ pub fn compare_digests(
     image: &HashResults,
     method: &str,
 ) -> VerificationResult {
+    compare_digest_sets(
+        selection,
+        ("acquisition", acquisition),
+        ("recomputed", image),
+        method,
+    )
+}
+
+/// [`compare_digests`] with the two sides named by what they are (e.g.
+/// `("image", ..)` and `("second read", ..)`), so a mismatch says what was
+/// compared: "MD5 image <a> but second read <b>".
+pub fn compare_digest_sets(
+    selection: HashSelection,
+    (reference_name, reference): (&str, &HashResults),
+    (recomputed_name, recomputed): (&str, &HashResults),
+    method: &str,
+) -> VerificationResult {
     if selection.is_empty() {
         return VerificationResult::Failed {
             reason: "no digest was selected".into(),
@@ -98,19 +115,21 @@ pub fn compare_digests(
     let mut mismatches = Vec::new();
     let mut missing = Vec::new();
     for alg in selection.algorithms() {
-        match (acquisition.get(alg), image.get(alg)) {
+        match (reference.get(alg), recomputed.get(alg)) {
             (Some(a), Some(b)) if !a.eq_ignore_ascii_case(b) => mismatches.push(format!(
-                "{} acquisition {} but recomputed {}",
+                "{} {reference_name} {a} but {recomputed_name} {b}",
                 alg.label(),
-                a,
-                b
             )),
             (Some(_), Some(_)) => {}
-            (None, _) => missing.push(format!(
+            (None, _) if reference_name == "acquisition" => missing.push(format!(
                 "{} was not computed during the acquisition",
                 alg.label()
             )),
-            (_, None) => missing.push(format!("{} was not recomputed", alg.label())),
+            (None, _) => missing.push(format!("{} has no {reference_name} digest", alg.label())),
+            (_, None) if recomputed_name == "recomputed" => {
+                missing.push(format!("{} was not recomputed", alg.label()))
+            }
+            (_, None) => missing.push(format!("{} has no {recomputed_name} digest", alg.label())),
         }
     }
     if !mismatches.is_empty() {
@@ -431,21 +450,127 @@ impl ForensicInfoReport {
     pub fn verdict_lines(&self) -> Vec<String> {
         let mut lines = vec![
             format!("{} (exit code {})", self.outcome.label(), self.exit_code),
-            self.outcome.explanation_for(self.engine).to_string(),
+            self.explanation(),
         ];
         lines.extend(self.key_numbers());
         lines.push(format!("Timestamps: {}", self.clock.label()));
         lines
     }
 
+    /// What the verdict means for this run, in one or two sentences, chosen
+    /// by what actually happened (T2): what was compared, why the run is
+    /// incomplete, whether any digest exists. Falls back to
+    /// [`Outcome::explanation_for`] where that is true as it stands.
+    pub fn explanation(&self) -> String {
+        let rescue = self.engine == EngineKind::Rescue;
+        let digests = if self.acquisition_hashes.is_empty() && self.image_hashes.is_empty() {
+            "no digest was computed for it"
+        } else {
+            "its digests cover only what was acquired"
+        };
+        let reread = self.verification.source_reread.as_ref();
+        match self.outcome {
+            Outcome::Verified
+                if self.acquisition_hashes.is_empty()
+                    && matches!(reread, Some(VerificationResult::Matched { .. })) =>
+            {
+                // No stream digest (ddrescue): the second read verified it
+                format!(
+                    "{} every sector of the source without read errors, and the digests of the written image equal those of a second, independent read of the source (--verify-source).",
+                    if rescue {
+                        "ddrescue rescued"
+                    } else {
+                        "dfdisk acquired"
+                    }
+                )
+            }
+            Outcome::CompleteUnverified if rescue => match reread {
+                Some(VerificationResult::NotPossible { reason }) => format!(
+                    "ddrescue rescued every sector of the source, but it does not compute digests while reading and the second read of the source was not possible ({reason}), so the image digests are not confirmed against the source."
+                ),
+                _ => self.outcome.explanation_for(self.engine).to_string(),
+            },
+            Outcome::Incomplete => {
+                let lead = "Not all of the source was acquired:";
+                if self.identity_check.end_ok == Some(false) {
+                    format!(
+                        "{lead} the source device changed or disappeared during the acquisition, so the image holds only what was read before that and {digests}."
+                    )
+                } else if rescue
+                    && self.stop_reason.is_none()
+                    && self.read_errors.unread_bytes() > 0
+                {
+                    // R12: the map really lists unread or unfinished areas
+                    self.outcome.explanation_for(self.engine).to_string()
+                } else if self.stop_reason.is_some() {
+                    format!(
+                        "{lead} the acquisition stopped before the end (the reason follows), so the image is partial and {digests}."
+                    )
+                } else {
+                    format!(
+                        "{lead} some areas of the source are not in the image, so {digests}."
+                    )
+                }
+            }
+            Outcome::Mismatch => match reread {
+                Some(VerificationResult::Mismatched { .. }) if self.acquisition_hashes.is_empty() => {
+                    "The digests of the written image differ from those of a second read of the source: the image does not reproduce the source as it read the second time; the image may be damaged, or the source changed or reads unstably.".to_string()
+                }
+                Some(VerificationResult::Mismatched { .. }) => {
+                    "The digests of a second read of the source differ from those computed while reading it for the acquisition: the source changed or reads unstably, so the acquired data cannot be reproduced from it.".to_string()
+                }
+                _ => "A digest recomputed from the written image differs from the digest computed while reading the source: the image does not reproduce the acquired data.".to_string(),
+            },
+            Outcome::Aborted => {
+                let lead = "The acquisition was stopped by the examiner or by a signal before it finished";
+                if self.expected_bytes > 0 && self.bytes_acquired >= self.expected_bytes {
+                    format!(
+                        "{lead}: the whole source had been read, but the run ended before its checks were complete."
+                    )
+                } else {
+                    format!("{lead}; the image is partial and {digests}.")
+                }
+            }
+            outcome => outcome.explanation_for(self.engine).to_string(),
+        }
+    }
+
+    /// "Digests: acquisition stream MD5 <hex>, SHA-256 <hex>; image re-read
+    /// MD5 <hex>, ..." (or "No digest was computed."), for messages that
+    /// must carry the digests when no report could be written.
+    pub fn digest_summary(&self) -> String {
+        let list = |h: &HashResults| {
+            h.present()
+                .iter()
+                .map(|(label, digest)| format!("{label} {digest}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut parts = Vec::new();
+        if !self.acquisition_hashes.is_empty() {
+            parts.push(format!(
+                "acquisition stream {}",
+                list(&self.acquisition_hashes)
+            ));
+        }
+        if !self.image_hashes.is_empty() {
+            parts.push(format!("image re-read {}", list(&self.image_hashes)));
+        }
+        if parts.is_empty() {
+            "No digest was computed.".to_string()
+        } else {
+            format!("Digests: {}.", parts.join("; "))
+        }
+    }
+
     /// The numbers behind the verdict, one sentence each.
     pub fn key_numbers(&self) -> Vec<String> {
         let mut out = Vec::new();
         let pct = if self.expected_bytes > 0 {
-            format!(
-                "{:.1}%, ",
-                self.bytes_acquired as f64 * 100.0 / self.expected_bytes as f64
-            )
+            // Floored to tenths: "100.0%" only when every byte was acquired
+            // (rounding made 99.96% read "100.0%")
+            let tenths = u128::from(self.bytes_acquired) * 1000 / u128::from(self.expected_bytes);
+            format!("{}.{}%, ", tenths / 10, tenths % 10)
         } else {
             String::new()
         };
@@ -469,6 +594,16 @@ impl ForensicInfoReport {
         }
         if self.identity_check.end_ok == Some(false) {
             out.push("The source changed or disappeared during the acquisition.".into());
+        }
+        if let Some(c) = self
+            .capacity
+            .as_ref()
+            .filter(|c| c.hidden_area() == Some(true))
+        {
+            out.push(format!(
+                "HIDDEN AREA on the disk of the source: {}; those sectors are not part of the image.",
+                c.hidden_area_statements().join("; ")
+            ));
         }
         out.push(format!(
             "Verification: {}.",
@@ -827,8 +962,13 @@ impl ForensicInfoReport {
             out,
             "Average Speed",
             format!(
-                "{:.2} MiB/s",
-                self.average_speed_bytes_sec / (1024.0 * 1024.0)
+                "{:.2} MiB/s{}",
+                self.average_speed_bytes_sec / (1024.0 * 1024.0),
+                if self.resume_sessions.is_empty() {
+                    ""
+                } else {
+                    " (this session; see the notes)"
+                }
             ),
         );
         row(
@@ -946,7 +1086,7 @@ impl ForensicInfoReport {
                 out,
                 "Piecewise SHA-256",
                 format!(
-                    "{} of {} in {} (SHA-256 {})",
+                    "{} of up to {} in {} (SHA-256 {})",
                     plural(p.count, "piece", "pieces"),
                     format_iec(p.piece_size),
                     p.file,
@@ -1285,6 +1425,50 @@ mod tests {
     }
 
     #[test]
+    fn the_percentage_never_rounds_up_to_complete() {
+        let mut r = verified();
+        r.expected_bytes = 1_000_000;
+        r.bytes_acquired = 999_999;
+        let first = r.key_numbers().remove(0);
+        assert!(first.contains("(99.9%, "), "{first}");
+        r.bytes_acquired = 1_000_000;
+        assert!(r.key_numbers()[0].contains("(100.0%, "));
+        r.bytes_acquired = 0;
+        assert!(r.key_numbers()[0].contains("(0.0%, "));
+        r.expected_bytes = u64::MAX;
+        r.bytes_acquired = u64::MAX - 1;
+        assert!(r.key_numbers()[0].contains("(99.9%, "));
+    }
+
+    #[test]
+    fn a_known_hidden_area_is_in_the_verdict_banner() {
+        use crate::models::capacity::{AtaCapacity, CapacityInfo};
+        let mut r = verified();
+        let ata = |hpa: bool| AtaCapacity {
+            native_max_sectors: Some(4096),
+            current_max_sectors: Some(if hpa { 2048 } else { 4096 }),
+            hpa_present: Some(hpa),
+            dco_present: Some(false),
+            dco_real_max_sectors: Some(4096),
+            sector_bytes: Some(512),
+        };
+        r.capacity = Some(CapacityInfo {
+            reported_bytes: 1 << 20,
+            ata: Some(ata(true)),
+            method: "hdparm -N".into(),
+            ..Default::default()
+        });
+        let banner = r.verdict_lines().join("\n");
+        assert!(
+            banner.contains("HIDDEN AREA on the disk of the source: ")
+                && banner.contains("those sectors are not part of the image."),
+            "{banner}"
+        );
+        r.capacity.as_mut().unwrap().ata = Some(ata(false));
+        assert!(!r.verdict_lines().join("\n").contains("HIDDEN AREA"));
+    }
+
+    #[test]
     fn capacity_facts_are_in_the_text() {
         use crate::models::capacity::{AtaCapacity, CapacityInfo, NvmeCapacity};
         let mut r = verified();
@@ -1349,9 +1533,14 @@ mod tests {
             count: 1,
         });
         let text = r.render_text();
-        assert!(text.contains("1 piece of 1 GiB in b.pieces.tsv"), "{text}");
+        // The piece size is a maximum: a 1 MiB image has one 1 MiB piece
+        assert!(
+            text.contains("1 piece of up to 1 GiB in b.pieces.tsv"),
+            "{text}"
+        );
+        assert!(!text.contains("1 piece of 1 GiB"), "{text}");
         r.piecewise.as_mut().unwrap().count = 3;
-        assert!(r.render_text().contains("3 pieces of 1 GiB"));
+        assert!(r.render_text().contains("3 pieces of up to 1 GiB"));
     }
 
     #[test]
@@ -1588,6 +1777,114 @@ mod tests {
         assert!(text.contains("ddrescue Retries"));
     }
 
+    /// A rescue report with the given facts applied.
+    fn rescue_report(f: impl FnOnce(&mut ForensicInfoReport)) -> ForensicInfoReport {
+        let src = source();
+        let config = AcquisitionConfig {
+            rescue_mode: true,
+            ..raw_config()
+        };
+        let mut r = ForensicInfoReport::new(
+            EngineKind::Rescue,
+            &case(),
+            src.clone(),
+            EffectiveConfig::build(&config, Some(&src)),
+        );
+        r.bytes_acquired = r.expected_bytes;
+        r.image_hashes = hashes("aa");
+        r.verification.result = VerificationResult::NotPossible {
+            reason: "ddrescue does not hash the source".into(),
+        };
+        f(&mut r);
+        r.apply_classification();
+        r
+    }
+
+    #[test]
+    fn explanations_follow_what_happened() {
+        const MAP_TEXT: &str = "the ddrescue map still lists areas";
+        // R-3: ddrescue ended abnormally with a finished map: the stop reason,
+        // not the map, is the cause
+        let r = rescue_report(|r| {
+            r.stop_reason = Some("ddrescue ended abnormally (exit status 1)".into());
+        });
+        assert_eq!(r.outcome, Outcome::Incomplete);
+        let e = r.explanation();
+        assert!(!e.contains(MAP_TEXT), "{e}");
+        assert!(e.contains("stopped before the end"), "{e}");
+        // ... also when the map has unread areas besides the stop reason
+        let r = rescue_report(|r| {
+            r.stop_reason = Some("ddrescue ended abnormally (exit status 1)".into());
+            r.read_errors.push(0, 4096, RangeKind::Unread);
+        });
+        assert!(!r.explanation().contains(MAP_TEXT));
+        // The identity changed: that is the cause
+        let r = rescue_report(|r| {
+            r.read_errors.push(0, 4096, RangeKind::Unread);
+            r.identity_check.end_ok = Some(false);
+        });
+        let e = r.explanation();
+        assert!(e.contains("changed or disappeared"), "{e}");
+        assert!(!e.contains(MAP_TEXT), "{e}");
+        // Only unfinished map areas: the R12 sentence with its remedy
+        let r = rescue_report(|r| r.read_errors.push(0, 4096, RangeKind::Unread));
+        assert!(r.explanation().contains(MAP_TEXT));
+
+        // Rescue VERIFIED: what was compared is a second read, not a stream
+        // digest (no such digest exists)
+        let r = rescue_report(|r| {
+            r.verification.source_reread = Some(VerificationResult::Matched {
+                method: "second read of the source".into(),
+            });
+            r.verification.result = VerificationResult::Matched {
+                method: "second read of the source".into(),
+            };
+        });
+        assert_eq!(r.outcome, Outcome::Verified);
+        let e = r.explanation();
+        assert!(
+            e.contains("equal those of a second, independent read of the source"),
+            "{e}"
+        );
+        assert!(!e.contains("computed while reading the source"), "{e}");
+
+        // ABORTED: "its digests" only when there are digests (T7)
+        let mut r = verified();
+        r.bytes_acquired = 512;
+        r.aborted = true;
+        r.apply_classification();
+        assert!(r
+            .explanation()
+            .contains("its digests cover only what was acquired"));
+        r.acquisition_hashes = HashResults::default();
+        r.image_hashes = HashResults::default();
+        let e = r.explanation();
+        assert!(e.contains("no digest was computed for it"), "{e}");
+        assert!(!e.contains("its digests"), "{e}");
+        // ... and "partial" only when the image is
+        r.bytes_acquired = r.expected_bytes;
+        let e = r.explanation();
+        assert!(!e.contains("partial"), "{e}");
+        assert!(e.contains("the whole source had been read"), "{e}");
+
+        // A MISMATCH of the image itself
+        let mut r = verified();
+        r.verification.result = VerificationResult::Mismatched {
+            method: "image re-read".into(),
+            details: "MD5 acquisition aa but recomputed bb".into(),
+        };
+        r.apply_classification();
+        assert!(r
+            .explanation()
+            .starts_with("A digest recomputed from the written image differs"));
+        // Every explanation is a sentence
+        for o in Outcome::ALL {
+            let mut r = verified();
+            r.outcome = o;
+            assert!(r.explanation().ends_with('.'), "{o:?}");
+        }
+    }
+
     #[test]
     fn compare_digests_semantics() {
         let all = HashSelection {
@@ -1627,6 +1924,28 @@ mod tests {
             details.contains("MD5 acquisition aa but recomputed bb"),
             "{details}"
         );
+        // Named sides say what was compared (R-4)
+        let VerificationResult::Mismatched { details, .. } = compare_digest_sets(
+            md5_sha256,
+            ("image", &a),
+            ("second read", &hashes("bb")),
+            "m",
+        ) else {
+            panic!()
+        };
+        assert!(
+            details.contains("MD5 image aa but second read bb"),
+            "{details}"
+        );
+        let VerificationResult::Failed { reason } = compare_digest_sets(
+            md5_sha256,
+            ("image", &HashResults::default()),
+            ("second read", &a),
+            "m",
+        ) else {
+            panic!()
+        };
+        assert!(reason.contains("MD5 has no image digest"), "{reason}");
         assert!(matches!(
             compare_digests(HashSelection::default(), &a, &a, "m"),
             VerificationResult::Failed { .. }

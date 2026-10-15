@@ -20,6 +20,24 @@ use crate::engines::AcquisitionError;
 use crate::signals::AbortController;
 use console::Console;
 
+/// `schema_version` of the JSON documents the CLI prints besides the
+/// reports: `check --json`, `verify --json`, `unmount --json`, the error
+/// object and the `acquire --rescue-to-e01 --json` document
+/// (docs/report-format.md, "Other JSON output").
+pub const CLI_JSON_SCHEMA_VERSION: u32 = 1;
+
+/// `value` (an object) with `schema_version` set to
+/// [`CLI_JSON_SCHEMA_VERSION`].
+pub fn with_schema_version(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = value.as_object_mut() {
+        map.insert(
+            "schema_version".into(),
+            serde_json::json!(CLI_JSON_SCHEMA_VERSION),
+        );
+    }
+    value
+}
+
 /// Run one command (not the TUI) and return its exit code. Acquire, check,
 /// verify and convert listen for SIGINT/SIGTERM/SIGHUP (once per process,
 /// §15); list and unmount keep the default signal behaviour.
@@ -56,6 +74,35 @@ async fn dispatch(
         Commands::Unmount(args) => handle_unmount(args, console).await,
         Commands::Verify(args) => handle_verify(args, controller, &mut listener, console).await,
         Commands::Convert(args) => handle_convert(args, controller, &mut listener, console).await,
+    }
+}
+
+/// Run `run` (a command or the TUI) and turn a panic into exit code 1
+/// (internal error) with a message on stderr, instead of Rust's 101 (T6).
+/// The panic hook has already printed where it happened; unwinding has run
+/// the audit guards ("acquisition_finished" with exit code 1) and the TUI's
+/// hook has restored the terminal.
+pub async fn exit_code_or_internal_error<F>(run: F) -> i32
+where
+    F: std::future::Future<Output = i32>,
+{
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(run).catch_unwind().await {
+        Ok(code) => code,
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".to_string());
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "Error (INTERNAL ERROR): dfdisk stopped on an internal error (panic: {}). This is a bug; please report it.",
+                crate::models::text::sanitize_line(&what)
+            );
+            crate::models::outcome::exit_code::INTERNAL_ERROR
+        }
     }
 }
 

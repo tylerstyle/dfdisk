@@ -51,7 +51,14 @@ case-insensitively (exFAT, NTFS and FAT destinations).
 Image, auxiliary and SMART files are fsynced, together with the directory, and
 dropped from the page cache (POSIX_FADV_DONTNEED) before verification, so the
 verification reads them back from the destination rather than from memory (the
-RAW engine re-reads with `O_DIRECT` where the filesystem allows it).
+RAW engine re-reads with `O_DIRECT` where the filesystem allows it). An image
+file that cannot be opened or fsynced (or a directory fsync that fails) means
+the image may not be on the destination medium: the verification is FAILED
+("the image could not be flushed durably to the destination", exit 4). An image
+that cannot be dropped from the page cache keeps its verdict, but the
+verification method says the re-read may have come from memory. The method
+names the fsync and the eviction only when they succeeded. Problems with
+auxiliary files are listed in the notes.
 
 Auxiliary files (ewfacquire log, pieces file, ddrescue map, SMART JSON) are
 listed in the report with their SHA-256.
@@ -71,7 +78,7 @@ bidirectional overrides) become a space. Missing case values read
 
 | Section | Content |
 |---------|---------|
-| VERDICT | outcome label and exit code, one-sentence explanation, key numbers ("Acquired X of Y bytes", substituted and unread sectors, stop reason, identity change, verification result, second source read), timestamp basis, schema version |
+| VERDICT | outcome label and exit code, one-sentence explanation, key numbers ("Acquired X of Y bytes (P%, …)" with the percentage floored to tenths, so 100.0% only when every byte was acquired; substituted and unread sectors, stop reason, identity change, a known HPA/DCO hidden area, verification result, second source read), timestamp basis, schema version |
 | CASE INFORMATION | case number, EA, evidence number, examiner, authority, description, seal number, seizure time and place, notes |
 | SOURCE IDENTITY | device node, kind (whole disk, partition, device-mapper, decrypted dm-crypt plaintext, md, loop, regular file), kernel name with major:minor and diskseq, parent disk, partition start, vendor/model, firmware, serial with the source it came from and all candidates, a note when the serial may belong to a USB bridge, WWN, attachment, sector sizes, size, identity checks at start and end |
 | WRITE PROTECTION | policy, read-only flags before, nodes dfdisk set read-only (BLKROSET), holders, exclusive open, dfnix registry, mounts before, mounts dfdisk unmounted |
@@ -135,7 +142,7 @@ report prints "(not provided)").
 | `output_dir`, `base_name` | string | where the files are |
 | `started_at`, `ended_at` | string | RFC 3339, UTC, host system clock (see `clock`) |
 | `elapsed_seconds` | number | from the monotonic clock |
-| `average_speed_bytes_sec` | number | bytes acquired per second |
+| `average_speed_bytes_sec` | number | bytes acquired per second of this run; for a resumed rescue only the bytes this session added (a note says how many earlier sessions had rescued) |
 | `expected_bytes` | number | size of the source |
 | `bytes_acquired` | number | bytes of the source in the image |
 | `stop_reason` | string or null | why the run stopped early (source lost, destination full, read error with `--on-read-error stop`, …) |
@@ -180,8 +187,38 @@ source with `--verify-source`; null when there was none) are tagged objects:
 {"status": "failed", "reason": "..."}
 ```
 
-A second source read that differs from the acquisition digests makes the verdict
-MISMATCH ("source changed or unstable").
+A second source read that differs makes the verdict MISMATCH, labelled by what
+was compared: with acquisition digests (E01, RAW) "the source changed or reads
+unstably: MD5 acquisition … but second read …"; without them (rescue, where the
+second read is compared with the image) "the image differs from the source as
+read a second time …: MD5 image … but second read …".
+
+The one-sentence explanation under the verdict is chosen by what happened, not
+only by the verdict: a rescue is INCOMPLETE "because the ddrescue map still
+lists areas that were not tried or not finished" only when the map has such
+areas and nothing else stopped the run (otherwise the explanation names the
+stop or the identity change); a VERIFIED rescue says that its image digests
+equal a second, independent read of the source; an ABORTED or INCOMPLETE run
+says "its digests cover only what was acquired" only when digests exist.
+
+## Other JSON output (`--json`)
+
+With `--json` every command prints one pretty-printed JSON document on stdout
+(progress and messages go to stderr). Check `schema_version` before reading it.
+
+| Command | Document |
+|---------|----------|
+| `acquire --json` | the report `<base>.info.json` (schema 2, above) |
+| `acquire --rescue-to-e01 --json` | `{schema_version: 1, acquisition, conversion, conversion_error, conversion_skipped, exit_code}`: `acquisition` is the rescue report; `conversion` the conversion report or null; `conversion_error` the `error` object below or null (a conversion that could not start); `conversion_skipped` the reason (string) or null; `exit_code` the combined exit code |
+| `convert --json` | the conversion report `<base>.conversion.info.json` (its own `schema_version`) |
+| `list --json` | `schema_version` 1: registry state, active swap, scan notes, `devices` with partitions and stacked devices nested in `children` |
+| `check --json` | `schema_version` 1, `ready` (bool), `device`, `engine`, `output_dir`, `base_name`, `identity` (as `source` in the report), `tool_source_path`, `effective_config`, `write_protection` (as found), `write_protection_plan` (string), `destination` (facts), `capacity`, `smart`, `problems` (`[{step, kind, message}]`; `step` is `request`, `identity`, `source safety`, `exclusive open`, `destination`, `tools` or `capacity`; `kind` is `usage`, `refused` or `failed`), `notes`. Fields that were not reached are null |
+| `verify --json` | `{schema_version: 1, verification, exit_code}`; `verification`: `image`, `read_path`, `segments`, `format` (`ewf`, `raw`), `method`, `computed`, `stored` (digests an EWF image stores), `expected` (`md5`, `sha1`, `sha256`, `source`, `report_image_files`, `report_outcome`, `report_pieces`), `checks` (`[{algorithm, expected, computed, status, reference}]`, `status` `match`, `mismatch` or `not_computed`), `pieces` (or null), `result` (as `verification.result` above), `exit_code`, `started_at`, `ended_at`, `elapsed_seconds`, `clock`, `addendum`, `addendum_sha256`, `audit_record`, `warnings` |
+| `unmount --json` | `schema_version` 1, `device`, `mounts_before`, `unmounted`, `holders`, `audit_record` (hash of the `unmount` record or null), `audit_error`, `notes` |
+| any command that ends with an error | `{schema_version: 1, error: {kind, exit_code, message}}`, `kind` one of `usage`, `refused`, `failed`, `aborted` |
+
+Paths in these documents are absolute (the name as typed, made absolute; not
+resolved through symlinks).
 
 ## Piecewise hashes (`<base>.pieces.tsv`)
 
@@ -215,11 +252,17 @@ lines, `/run/dfnix/audit.jsonl` by default; `DFNIX_AUDIT_LOG` overrides the path
 | Action | When |
 |--------|------|
 | `acquisition_started` | before anything is sent to the device: identity (with major:minor and diskseq), case fields, applied settings, destination, the path tools read the source through. Its hash is the report's **audit anchor**. |
-| `acquisition_finished` | always after a "started" record, also after errors, aborts, signals and panics: outcome, exit code, read-error summary, every known digest, write protection, capacity and SMART summaries, SHA-256 of both reports, the files |
+| `acquisition_finished` | always after a "started" record, also after errors, aborts, signals and panics: outcome, exit code, read-error summary, every known digest, write protection, capacity and SMART summaries, SHA-256 of both reports (`report_written`), the files. When the verdict was reached but the report could not be written, the record still carries all of that except the report digests (null), with `report_written: false`, the error, `exit_code` 4 and the verdict's code as `verdict_exit_code` |
 | `acquisition_refused` | a refusal after the device was selected and before "started" (identity, source safety, destination); nothing was written to the destination |
 | `unmount` | `dfdisk unmount` and `--auto-unmount`: the mounts and what happened to them |
 | `image_verification` | `dfdisk verify` |
 | `conversion_started`, `conversion_finished` | `dfdisk convert` and `--rescue-to-e01`; a conversion refused before it started (usage, destination checks, existing outputs) writes no record |
+
+The top-level `outcome` of a record that carries a verdict
+(`acquisition_finished`, `image_verification`, `conversion_finished`) is `ok`
+for exit codes 0, 7 and 9 and `error` for 4 (verification failed), 5
+(mismatch), 6 (incomplete) and 8 (aborted); its `message` is the verdict with
+its exit code, for example "INCOMPLETE (exit code 6)". Refusals are `refused`.
 
 Usage errors are not recorded (nothing was sent to the device). On dfnix
 (protected-device registry present) an audit log that cannot be written refuses

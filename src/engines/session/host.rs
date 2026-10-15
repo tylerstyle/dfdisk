@@ -63,9 +63,33 @@ pub fn parse_proc_swaps(
         .collect()
 }
 
+/// `program` as an executable file: a path as given, or the first match on
+/// PATH (what the process runner would start).
+pub fn find_on_path(program: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let executable = |p: &Path| {
+        p.metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if program.contains('/') {
+        let p = PathBuf::from(program);
+        return executable(&p).then_some(p);
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(program))
+        .find(|p| executable(p))
+}
+
 /// The host as the session sees it. Every method is one probe or action;
 /// the engine seams default to the real engines.
 pub trait SessionHost: Send + Sync {
+    /// Where the external `program` an engine runs is (default:
+    /// [`find_on_path`]); `None`: it cannot be run on this host.
+    fn find_tool(&self, program: &str) -> Option<PathBuf> {
+        find_on_path(program)
+    }
+
     /// Identity of the source at `path` (§5); `Err` refuses (P2).
     fn probe_identity(&self, path: &str) -> Result<SourceIdentity, String>;
 
@@ -152,6 +176,12 @@ pub trait SessionHost: Send + Sync {
         out: &'a EngineOutput,
     ) -> BoxFuture<'a, (VerificationResult, HashResults)> {
         Box::pin(super::verify(ctx, out))
+    }
+
+    /// Step 10 (default: [`flush_files`](super::flush_files): fsync, page-cache
+    /// eviction, directory fsync).
+    fn flush(&self, files: &[PathBuf], dir: &Path) -> super::FlushReport {
+        super::flush_files(files, dir)
     }
 
     /// Step 11, `--verify-source` (default: positioned reads through the

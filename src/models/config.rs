@@ -313,9 +313,6 @@ pub struct AcquisitionConfig {
     pub smart: SmartPolicy,
     #[serde(default)]
     pub write_protect: WriteProtectPolicy,
-    /// Acquire a source with holders (dm, md, LVM) on it
-    #[serde(default)]
-    pub allow_holders: bool,
     /// Accept a tmpfs/ramfs destination
     #[serde(default)]
     pub allow_tmpfs: bool,
@@ -357,7 +354,6 @@ impl Default for AcquisitionConfig {
             piece_size: Some(DEFAULT_PIECE_SIZE),
             smart: SmartPolicy::Basic,
             write_protect: WriteProtectPolicy::Auto,
-            allow_holders: false,
             allow_tmpfs: false,
             allow_low_space: false,
             refuse_hidden_areas: false,
@@ -726,7 +722,7 @@ mod tests {
         assert_eq!(c.smart, SmartPolicy::Basic);
         assert_eq!(c.write_protect, WriteProtectPolicy::Auto);
         assert_eq!(c.piece_size, Some(DEFAULT_PIECE_SIZE));
-        assert!(!c.allow_holders && !c.allow_tmpfs && !c.allow_low_space);
+        assert!(!c.allow_tmpfs && !c.allow_low_space);
         assert!(raw().validate().is_ok());
         // Older JSON without the new options still loads, with defaults
         let old = r#"{"format":"Raw","output_dir":"/x","compression":"Fast","split_size":"None","calc_md5":true,"calc_sha1":false,"calc_sha256":true,"error_retries":2,"wipe_bad_sectors":true,"rescue_mode":false,"resume":false}"#;

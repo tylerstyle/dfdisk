@@ -6,12 +6,12 @@ codes; the text and JSON reports carry the same code (`exit_code` in
 
 | Code | Name | Meaning |
 |-----:|------|---------|
-| 0 | Verified | The whole source was acquired without read errors, and the digests recomputed from the written image match the digests computed while reading the source. |
-| 1 | Internal error | A bug or an unexpected internal failure. Please report it. |
+| 0 | Verified | The whole source was acquired without read errors, and the digests recomputed from the written image match the digests computed while reading the source (for a rescue, where ddrescue computes none: the digests of a second, independent read of the source with `--verify-source`). |
+| 1 | Internal error | A bug or an unexpected internal failure (including a panic, which is reported as "Error (INTERNAL ERROR): …" rather than with Rust's exit code 101). Please report it. |
 | 2 | Usage error | Invalid arguments or inconsistent options. Nothing was written and nothing was sent to the device. |
 | 3 | Refused | A safety or preflight rule refused the run (see below). Nothing was acquired. |
-| 4 | Failed | The run could not be carried out (for example a required tool is missing), or the verification could not run or complete (outcome VERIFICATION FAILED). |
-| 5 | Mismatch | A digest recomputed from the image, or from a second read of the source, differs from the digest computed during acquisition. |
+| 4 | Failed | The run could not be carried out (for example a required tool is missing: ewfacquire, ewfinfo and ewfverify for E01 and `--rescue-to-e01`, ddrescue for a rescue; this is found after the refusal checks and before anything is written, sent to the device or recorded as started), or the verification could not run or complete (outcome VERIFICATION FAILED). |
+| 5 | Mismatch | A digest recomputed from the image, or from a second read of the source, differs from the digest computed during acquisition (for a rescue: the second read differs from the image). The report says which digests were compared. |
 | 6 | Incomplete | Not all of the source was acquired: the run stopped early, areas were never read, the source was lost or changed, or the destination filled up. |
 | 7 | Completed with read errors | The full length was written, but unreadable sectors were replaced by zeros. The digests describe the image including the substituted sectors, not the original medium. |
 | 8 | Aborted | Stopped by the examiner or by a signal (SIGINT, SIGTERM). |
@@ -46,14 +46,16 @@ applied in this order; the first that matches wins:
 dfdisk refuses, before anything is written to the destination or sent to the
 source device, when for example:
 
+- the device reports a size of 0 bytes (no medium present, or the size is
+  unknown): there is nothing to acquire;
 - the device no longer matches the one that was selected (kernel device number,
   diskseq, serial, WWN or size changed), or does not match `--expect-serial`,
   `--expect-wwn` or `--expect-size`;
 - the device is protected by the dfnix protected-device registry, or the registry
   exists but cannot be read (fail closed);
 - the device is a system disk, is mounted (in dfdisk's mount namespace), holds
-  active swap, or has holders (device-mapper, LVM, md) and `--allow-holders` was
-  not given;
+  active swap, or has holders (device-mapper, LVM, md, LUKS): a holder claims the
+  device, so it has to be closed first (there is no override);
 - the device cannot be opened exclusively (`O_EXCL` returns EBUSY: it is in use,
   for example mounted in another mount namespace);
 - the destination is on the source, on a dfnix evidence mount, on tmpfs/ramfs
@@ -71,9 +73,9 @@ source device, when for example:
 
 | Subcommand | Exit codes |
 |------------|------------|
-| `acquire` | The report's verdict (0, 4–9) once anything was written; 2, 3 or 4 when the run ended before the first write; 8 when aborted before the first write. With `--rescue-to-e01` the more severe of the rescue's and the conversion's code, from most to least severe 1, 2, 8, 5, 4, 3, 6, 7, 9, 0 (a conversion that is skipped because the rescue is not complete adds nothing). |
-| `check` | 0 ready; otherwise the code of the first problem found: 2 usage, 3 refused, 4 a check could not run; 8 interrupted. Writes nothing. |
-| `verify` | 0 every digest compared matches (expected digests, the digests an E01 stores, every piece of `--pieces`); 5 a digest or a piece differs; 4 the verification could not run or a requested digest was not computed (never reported as a pass); 9 nothing to compare against (no expected digest given, none in the report, none stored in the image, no `--pieces`); 2 the image or pieces file does not exist or arguments are invalid; 8 aborted. |
+| `acquire` | The report's verdict (0, 4–9) once anything was written; 2, 3 or 4 when the run ended before the first write; 8 when aborted before the first write. With `--rescue-to-e01` the more severe of the rescue's and the conversion's code, from most to least severe 1, 2, 8, 5, 4, 3, 6, 7, 9, 0 (a conversion that is skipped because the rescue is not complete adds nothing; a conversion that could not start after the rescue wrote its image, because of a usage error or a refusal, counts as 4, never 2 or 3; a source that is not a whole number of 512-byte sectors is a usage error, 2, before the rescue starts). |
+| `check` | 0 ready; otherwise the code of the first problem found: 2 usage, 3 refused, 4 a check could not run or a tool the engine runs is not installed; 8 interrupted. Writes nothing. |
+| `verify` | 0 every digest compared matches (expected digests, the digests an E01 stores, every piece of `--pieces`); 5 a digest or a piece differs; 4 the verification could not run or a requested digest was not computed (never reported as a pass); 9 nothing to compare against (no expected digest given, none in the report, none stored in the image, no `--pieces`); 2 the image or pieces file does not exist, an expected digest is not exactly 32 (MD5), 40 (SHA-1) or 64 (SHA-256) hex digits (also in a `--report`), or arguments are invalid; 8 aborted. |
 | `convert` | The conversion's verdict (0, 4–9; 7 when the source image holds zero-filled sectors of its acquisition); 2 for example a RAW size that is not a multiple of 512 bytes or missing case fields; 3 an output already exists or a destination check refused; 4 a tool could not run. |
 | `unmount` | 0 everything was unmounted and nothing remains mounted (or nothing was mounted); 2 usage (for example a regular file); 3 refused (system mount, protected device, active swap, unidentifiable device); 4 an unmount failed or a mount remained. |
 | `list` | 0, or 4 when the device scan failed. |

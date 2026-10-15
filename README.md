@@ -123,6 +123,8 @@ RAW engine re-reads with `O_DIRECT` where the filesystem supports it.
 
 dfdisk needs these external tools at run time. The Nix package puts them on its
 own PATH; the .deb depends on them; with a tarball you install them yourself.
+An acquisition (and `dfdisk check`) fails with exit code 4 before it writes
+anything or sends anything to the device when a tool its engine runs is missing.
 
 | Tool | Debian / Ubuntu package | Nix package | Used for |
 |------|-------------------------|-------------|----------|
@@ -131,7 +133,8 @@ own PATH; the .deb depends on them; with a tarball you install them yourself.
 | `smartctl` | `smartmontools` | `smartmontools` | SMART snapshots (`--smart`) |
 | `hdparm` | `hdparm` | `hdparm` | HPA/DCO detection (read-only queries) |
 | `nvme` | `nvme-cli` | `nvme-cli` | NVMe namespace capacity |
-| `lsblk`, `blockdev`, `umount` | `util-linux` | `util-linux` | device discovery, unmount |
+| `lsblk` | `util-linux` | `util-linux` | device discovery |
+| `umount` | `mount` | `util-linux` | `dfdisk unmount`, `--auto-unmount` |
 | `udevadm` | `udev` | `systemd` | device identity |
 | `timedatectl` (optional) | `systemd` | `systemd` | NTP state for the report's clock section |
 
@@ -177,7 +180,7 @@ sudo apt install "./dfdisk_${VERSION}-1_amd64.deb"
 ```
 
 The package depends on `ewf-tools`, `gddrescue`, `smartmontools`, `util-linux`,
-`udev`, `hdparm`, `nvme-cli` and the C library it was linked against.
+`mount`, `udev`, `hdparm`, `nvme-cli` and the C library it was linked against.
 
 ### Prebuilt binaries
 
@@ -288,7 +291,7 @@ Acquisition options:
 | `--write-protect auto\|off` | set the kernel read-only flag (default `auto`) or only record it |
 | `--refuse-hidden-areas` | refuse when an HPA or DCO is found |
 | `--expect-serial`, `--expect-wwn`, `--expect-size` | refuse unless the device has this serial, WWN or size in bytes |
-| `--allow-holders`, `--allow-tmpfs`, `--allow-low-space` | accept device-mapper/LVM/md holders, a tmpfs destination, or an E01 destination with less free space than the source size |
+| `--allow-tmpfs`, `--allow-low-space` | accept a tmpfs destination, or an E01 destination with less free space than the source size |
 | `--auto-unmount` | unmount the source's filesystems first (audited, same as `dfdisk unmount`) |
 | `--digests md5,sha1,sha256` | digests to compute and verify (default all three; E01 always adds MD5) |
 | `--error-granularity <SECTORS>` | E01: ewfacquire error granularity (default physical / logical sector size) |
@@ -311,12 +314,17 @@ dfdisk convert <image.raw|image.E01> --to e01|raw -o <dir> [case fields]
 `dfdisk list --json` prints one object (`schema_version` 1): the registry state,
 active swap areas, scan notes and every disk with its partitions and stacked
 devices nested in `children`, each with its identity, mounts, holders, system
-reasons and badges.
+reasons and badges. `check`, `verify` and `unmount` with `--json`, and the error
+object of any command, are versioned the same way (`schema_version` 1) and
+described in [docs/report-format.md](docs/report-format.md#other-json-output---json).
 
 `dfdisk verify` recognises EWF segment families (`.E01`, `.Ex01`, `.E02`, …),
 RAW images and split RAW images (`.001`, `.002`, …). A requested digest that was
 not computed is a failure, never a pass. `dfdisk convert` takes the case fields
-from `<source>.info.json` when it exists and requires them otherwise; it refuses
+from `<source>.info.json` when it exists and lists the source image (a report
+that does not list it, such as the rescue report next to a `--rescue-to-e01`
+E01, is ignored with a note; only a report given with `--report` must list the
+image) and requires them otherwise; it refuses
 RAW images whose size is not a multiple of 512 bytes (as an E01 of a source
 without whole 512-byte sectors is refused) and never overwrites an existing
 output. Its report is `<base>.conversion.info` / `.conversion.info.json`.
@@ -386,12 +394,14 @@ identify-class queries that the report records.
   one that changes or disappears during the run makes the verdict INCOMPLETE.
   External tools read through `/dev/disk/by-diskseq/<N>` when that link points
   at the pinned device.
-- **Refusals.** dfdisk refuses (exit 3) a device listed in the dfnix
+- **Refusals.** dfdisk refuses (exit 3) an empty device (size 0: no medium,
+  or the size is unknown), a device listed in the dfnix
   protected-device registry (and fails closed when the registry exists but cannot
   be read), a system disk, a device with mounted filesystems (in dfdisk's mount
   namespace; a mount in another namespace makes the exclusive open below fail)
-  or active swap, and a device with holders (dm-crypt, LVM, md) unless
-  `--allow-holders` is given. Unmounting is a separate, explicit, audited
+  or active swap, and a device with holders (dm-crypt, LVM, md): a holder
+  claims the device, so it has to be closed first (there is no override).
+  Unmounting is a separate, explicit, audited
   action (`dfdisk unmount`, `--auto-unmount`) that refuses system mounts and
   protected devices and never forces or lazily unmounts.
 - **Exclusive open.** The source is opened with `O_EXCL` and held for the whole
@@ -424,7 +434,11 @@ identify-class queries that the report records.
   conversions are recorded in the hash-chained dfnix audit log (dfcore); usage
   errors and conversions refused before they started are not. The
   "acquisition_finished" record is written on every path, including errors,
-  aborts and signals, and carries the SHA-256 of both reports.
+  aborts and signals, and carries the SHA-256 of both reports; when the report
+  itself cannot be written, the record still carries the verdict, the digests,
+  the read errors and the files, and the error message printed by dfdisk names
+  the digests. Records of a MISMATCH, INCOMPLETE, ABORTED or VERIFICATION
+  FAILED run have the outcome `error`.
 
 ## Screenshots
 

@@ -117,6 +117,11 @@ struct Fake {
     engine: Option<EngineFn>,
     verify: Option<VerifyFn>,
     reread: Option<Result<HashResults, AcquisitionError>>,
+    /// Step 10 fails to fsync (or to evict) files whose name ends with this
+    fsync_fail: Option<&'static str>,
+    evict_fail: Option<&'static str>,
+    /// External programs this host does not have (every other one is found)
+    missing_tools: Vec<&'static str>,
     calls: Mutex<Vec<&'static str>>,
 }
 
@@ -156,6 +161,9 @@ impl Fake {
             engine: None,
             verify: None,
             reread: None,
+            fsync_fail: None,
+            evict_fail: None,
+            missing_tools: Vec::new(),
             calls: Mutex::new(Vec::new()),
             data,
             tmp,
@@ -208,6 +216,10 @@ impl Fake {
 }
 
 impl SessionHost for Fake {
+    fn find_tool(&self, program: &str) -> Option<PathBuf> {
+        (!self.missing_tools.contains(&program)).then(|| PathBuf::from("/fake/bin").join(program))
+    }
+
     fn probe_identity(&self, _path: &str) -> Result<SourceIdentity, String> {
         let n = self.probes.fetch_add(1, Ordering::SeqCst);
         if let Some(e) = &self.probe_error {
@@ -378,6 +390,28 @@ impl SessionHost for Fake {
             Some(f) => Box::pin(async move { f(ctx, out) }),
             None => Box::pin(super::verify(ctx, out)),
         }
+    }
+
+    fn flush(&self, files: &[PathBuf], dir: &Path) -> FlushReport {
+        let mut report = flush_files(files, dir);
+        let ends = |f: &FileFlush, suffix: Option<&str>| {
+            suffix.is_some_and(|s| f.path.to_string_lossy().ends_with(s))
+        };
+        for f in &mut report.files {
+            if ends(f, self.fsync_fail) {
+                f.not_durable = Some(format!(
+                    "fsync of {} failed: Input/output error (os error 5)",
+                    f.path.display()
+                ));
+            }
+            if ends(f, self.evict_fail) {
+                f.not_evicted = Some(format!(
+                    "{} could not be evicted from the page cache: Invalid argument (os error 22)",
+                    f.path.display()
+                ));
+            }
+        }
+        report
     }
 
     fn reread_source<'a>(
@@ -656,6 +690,31 @@ async fn usage_errors_write_and_record_nothing() {
     };
     assert_refused_before_writing(&fake, config, ErrorKind::Usage, "between 0 and 255").await;
 
+    // I2: --rescue-to-e01 of a source without whole 512-byte sectors is a
+    // usage error before the rescue writes anything
+    let mut fake = Fake::new();
+    fake.identity = disk_identity(SIZE + 100);
+    let config = AcquisitionConfig {
+        rescue_to_e01: true,
+        ..AcquisitionConfig::rescue(fake.out())
+    };
+    assert_refused_before_writing(
+        &fake,
+        config,
+        ErrorKind::Usage,
+        "--rescue-to-e01: the source is",
+    )
+    .await;
+    // ... while the rescue alone accepts it
+    let mut fake = Fake::new();
+    fake.identity = disk_identity(SIZE + 100);
+    let check = check_with(&fake, fake.request(AcquisitionConfig::rescue(fake.out()))).await;
+    assert!(
+        check.problems.iter().all(|p| p.kind != ErrorKind::Usage),
+        "{:?}",
+        check.problems
+    );
+
     // Missing required case fields
     let fake = Fake::new();
     let (tx, _rx) = mpsc::channel(100);
@@ -675,6 +734,68 @@ async fn usage_errors_write_and_record_nothing() {
         .await
         .unwrap_err();
     assert_eq!(e.kind, ErrorKind::Usage);
+}
+
+#[tokio::test]
+async fn a_missing_tool_fails_before_anything_is_written_sent_or_started() {
+    // I3: ewfacquire missing: FAILED (exit 4), nothing written, nothing sent
+    // to the source, no audit record at all (it never started)
+    let mut fake = Fake::new();
+    fake.missing_tools = vec!["ewfacquire"];
+    let config = AcquisitionConfig::for_engine(EngineKind::Ewf, fake.out());
+    let (r, progress) = run_fake(&fake, config.clone()).await;
+    let e = r.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Failed, "{e}");
+    assert_eq!(e.exit_code(), 4);
+    assert!(
+        e.message
+            .contains("runs ewfacquire, ewfinfo, ewfverify, but ewfacquire is not installed"),
+        "{e}"
+    );
+    assert!(e.message.contains("Nothing was written"), "{e}");
+    assert!(!fake.out().exists());
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    assert!(fake.records().is_empty());
+    assert!(matches!(progress.status, AcquisitionStatus::Failed(_)));
+    // check says the same, with exit 4
+    let check = check_with(&fake, fake.request(config)).await;
+    assert!(!check.ready);
+    assert_eq!(check.problems[0].step, "tools");
+    assert_eq!(check.exit_code(), 4);
+    assert!(check.render_text().contains("would not start"));
+
+    // ddrescue for a rescue; the libewf tools too with --rescue-to-e01
+    let mut fake = Fake::new();
+    fake.missing_tools = vec!["ddrescue", "ewfverify"];
+    let e = run_fake(&fake, AcquisitionConfig::rescue(fake.out()))
+        .await
+        .0
+        .unwrap_err();
+    assert!(
+        e.message
+            .contains("runs ddrescue, but ddrescue is not installed"),
+        "{e}"
+    );
+    let config = AcquisitionConfig {
+        rescue_to_e01: true,
+        ..AcquisitionConfig::rescue(fake.out())
+    };
+    let e = run_fake(&fake, config).await.0.unwrap_err();
+    assert!(
+        e.message
+            .contains("but ddrescue, ewfverify are not installed"),
+        "{e}"
+    );
+    assert!(
+        e.message
+            .contains("--rescue-to-e01 runs ddrescue, ewfacquire"),
+        "{e}"
+    );
+    // RAW needs no external tool
+    assert!(required_tools(&AcquisitionConfig::raw("/x")).is_empty());
+    let mut fake = Fake::new();
+    fake.missing_tools = vec!["ewfacquire", "ddrescue"];
+    assert!(run_fake(&fake, fake.raw()).await.0.is_ok());
 }
 
 #[tokio::test]
@@ -705,6 +826,26 @@ async fn identity_refusals() {
     config.expect.serial = Some("SOMETHING-ELSE".into());
     assert_refused_before_writing(&fake, config, ErrorKind::Refused, "not the expected device")
         .await;
+
+    // An empty source (no medium, unknown size) is refused for every engine,
+    // and the dry run says so too
+    for config in [
+        AcquisitionConfig::raw(Fake::new().out()),
+        AcquisitionConfig::rescue(Fake::new().out()),
+        AcquisitionConfig::for_engine(EngineKind::Ewf, Fake::new().out()),
+    ] {
+        let mut fake = Fake::new();
+        fake.identity = disk_identity(0);
+        let config = AcquisitionConfig {
+            output_dir: fake.out(),
+            ..config
+        };
+        assert_refused_before_writing(&fake, config.clone(), ErrorKind::Refused, "size of 0 bytes")
+            .await;
+        let check = check_with(&fake, fake.request(config)).await;
+        assert_eq!(check.exit_code(), 3);
+        assert!(check.problems[0].message.contains("size of 0 bytes"));
+    }
 }
 
 fn protecting_registry() -> Registry {
@@ -798,21 +939,15 @@ async fn swap_mount_holder_and_busy_refusals() {
     let config = fake.raw();
     assert_refused_before_writing(&fake, config, ErrorKind::Refused, "/mnt/evidence").await;
 
-    // Holders (dm on the source) refuse unless allowed
+    // Holders (dm on the source) refuse; there is no override (a holder
+    // claims the source exclusively): they have to be closed first
     let fake = Fake::new();
     fake.sys.add_virtual("dm-0", (254, 0), SIZE / 512);
     fake.sys.stack("dm-0", "sdx1");
     let config = fake.raw();
-    assert_refused_before_writing(&fake, config, ErrorKind::Refused, "--allow-holders").await;
-    let fake = Fake::new();
-    fake.sys.add_virtual("dm-0", (254, 0), SIZE / 512);
-    fake.sys.stack("dm-0", "sdx1");
-    let config = AcquisitionConfig {
-        allow_holders: true,
-        ..fake.raw()
-    };
-    let report = run_fake(&fake, config).await.0.unwrap();
-    assert!(report.notes.iter().any(|n| n.contains("--allow-holders")));
+    assert_refused_before_writing(&fake, config, ErrorKind::Refused, "Close them first").await;
+    let e = run_fake(&fake, fake.raw()).await.0.unwrap_err();
+    assert!(!e.message.contains("--allow-holders"), "{e}");
 
     // In use (O_EXCL: EBUSY)
     let mut fake = Fake::new();
@@ -1011,6 +1146,174 @@ async fn short_source_is_incomplete_with_the_real_engine() {
 }
 
 #[tokio::test]
+async fn an_image_that_cannot_be_flushed_is_never_verified() {
+    // fsync of the image fails: VERIFICATION FAILED (exit 4), and the method
+    // does not claim an fsync or eviction that did not happen
+    let mut fake = Fake::new();
+    fake.fsync_fail = Some(".raw");
+    let report = run_fake(&fake, fake.raw()).await.0.unwrap();
+    assert_eq!(report.outcome, Outcome::VerificationFailed, "{report:?}");
+    assert_eq!(report.exit_code, 4);
+    assert!(
+        report
+            .outcome_reason
+            .contains("the image could not be flushed durably to the destination: fsync of"),
+        "{}",
+        report.outcome_reason
+    );
+    let method = &report.verification.method;
+    assert!(!method.contains("page-cache eviction"), "{method}");
+    assert!(method.contains("could not be fsynced"), "{method}");
+    let (text, _) = read_report(&fake);
+    assert!(!text.contains("ALL HASHES MATCH"), "{text}");
+    // The finished record carries the verdict
+    let finished = fake.records().pop().unwrap();
+    assert_eq!(finished["details"]["exit_code"], 4);
+
+    // Eviction fails: still verified (the data is durable), but the method
+    // says the re-read may have come from memory
+    let mut fake = Fake::new();
+    fake.evict_fail = Some(".raw");
+    let report = run_fake(&fake, fake.raw()).await.0.unwrap();
+    assert_eq!(
+        report.outcome,
+        Outcome::Verified,
+        "{}",
+        report.outcome_reason
+    );
+    let method = &report.verification.method;
+    assert!(method.contains("may have come from memory"), "{method}");
+    assert!(
+        !method.contains("page-cache eviction of the image"),
+        "{method}"
+    );
+
+    // An auxiliary file that cannot be fsynced is a note, not a verdict
+    let mut fake = Fake::new();
+    fake.fsync_fail = Some(".smart-before.json");
+    let report = run_fake(&fake, fake.raw()).await.0.unwrap();
+    assert_eq!(
+        report.outcome,
+        Outcome::Verified,
+        "{}",
+        report.outcome_reason
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("fsync of") && n.contains("smart-before.json")),
+        "{:?}",
+        report.notes
+    );
+    assert!(report
+        .verification
+        .method
+        .ends_with("after fsync and page-cache eviction of the image"));
+
+    // A rescue image (nothing to compare with) that cannot be fsynced is
+    // VERIFICATION FAILED, not COMPLETE, NOT VERIFIED; a matching second read
+    // of the source does not change that
+    for verify_source in [false, true] {
+        let mut fake = Fake::new();
+        fake.fsync_fail = Some(".raw");
+        fake.engine = Some(rescue_engine(fake.data.clone()));
+        let config = AcquisitionConfig {
+            verify_source,
+            smart: SmartPolicy::Off,
+            ..AcquisitionConfig::rescue(fake.out())
+        };
+        let report = run_fake(&fake, config).await.0.unwrap();
+        assert_eq!(
+            report.outcome,
+            Outcome::VerificationFailed,
+            "{}",
+            report.outcome_reason
+        );
+    }
+
+    // An aborted run never claims a verification method
+    let mut fake = Fake::new();
+    fake.fsync_fail = Some(".raw");
+    let stop = StopFlags::new();
+    let flags = stop.clone();
+    fake.engine = Some(Box::new(move |ctx| {
+        flags.abort.store(true, Ordering::SeqCst);
+        let p = ctx.output_path(".raw");
+        std::fs::write(&p, b"partial").unwrap();
+        Ok(EngineOutput {
+            bytes_acquired: 7,
+            aborted: true,
+            image_files: vec![p],
+            ..Default::default()
+        })
+    }));
+    let report = run_on(&fake, fake.raw(), stop).await.0.unwrap();
+    assert_eq!(report.outcome, Outcome::Aborted);
+    assert!(
+        report.verification.method.starts_with("none"),
+        "{}",
+        report.verification.method
+    );
+}
+
+#[tokio::test]
+async fn a_report_that_cannot_be_written_keeps_the_facts_in_the_audit_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut fake = Fake::new();
+    let data = fake.data.clone();
+    fake.engine = Some(Box::new(move |ctx| {
+        let p = ctx.output_path(".raw");
+        std::fs::write(&p, &data).unwrap();
+        // The destination turns read-only: the reports cannot be written
+        std::fs::set_permissions(&ctx.output_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        Ok(EngineOutput {
+            image_files: vec![p],
+            ..complete(&data)
+        })
+    }));
+    let config = AcquisitionConfig {
+        smart: SmartPolicy::Off,
+        piece_size: None,
+        ..fake.raw()
+    };
+    let (r, progress) = run_fake(&fake, config).await;
+    std::fs::set_permissions(fake.out(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let e = r.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Failed);
+    assert_eq!(e.exit_code(), 4);
+    // The message (printed by the CLI on stderr, shown by the TUI) names the
+    // verdict, the digests and the image
+    let sha256 = hashes(&fake.data).sha256.unwrap();
+    assert!(e.message.contains("ended VERIFIED (exit code 0)"), "{e}");
+    assert!(e.message.contains("could not be written"), "{e}");
+    assert!(e.message.contains(&format!("SHA-256 {sha256}")), "{e}");
+    assert!(e.message.contains(&format!("{BASE}.raw")), "{e}");
+    assert!(matches!(progress.status, AcquisitionStatus::Failed(_)));
+    // The finished record carries what the report would have said
+    let finished = fake.records().pop().unwrap();
+    assert_eq!(finished["action"], "acquisition_finished");
+    assert_eq!(finished["outcome"], "error");
+    let d = &finished["details"];
+    assert_eq!(d["report_written"], false);
+    assert_eq!(d["exit_code"], 4);
+    assert_eq!(d["verdict_exit_code"], 0);
+    assert_eq!(d["outcome"], "verified");
+    assert_eq!(d["acquisition_hashes"]["sha256"], sha256.as_str());
+    assert_eq!(d["image_hashes"]["sha256"], sha256.as_str());
+    assert_eq!(d["bytes_acquired"], SIZE);
+    assert!(d["read_errors"]["ranges"].is_number());
+    assert!(d["files"][0].as_str().unwrap().ends_with(".raw"));
+    assert!(d["report_sha256"].is_null());
+    assert!(d["error"]
+        .as_str()
+        .unwrap()
+        .contains("could not be written"));
+    // The image is kept
+    assert!(fake.out().join(format!("{BASE}.raw")).exists());
+}
+
+#[tokio::test]
 async fn substituted_sectors_are_completed_with_read_errors() {
     let mut fake = Fake::new();
     let mut out = complete(&fake.data);
@@ -1070,7 +1373,46 @@ async fn second_source_read_that_differs_is_source_changed() {
     let VerificationResult::Mismatched { details, .. } = &report.verification.result else {
         panic!("{:?}", report.verification.result)
     };
-    assert!(details.contains("source changed or unstable"), "{details}");
+    assert!(
+        details.starts_with("the source changed or reads unstably: MD5 acquisition "),
+        "{details}"
+    );
+    assert!(details.contains(" but second read "), "{details}");
+    let banner = report.verdict_lines().join("\n");
+    assert!(
+        banner.contains("a second read of the source differ from those computed while reading it"),
+        "{banner}"
+    );
+
+    // Rescue (no acquisition digests): the second read is compared with the
+    // image, and the labels and the explanation say so (R-4)
+    let mut fake = Fake::new();
+    fake.engine = Some(rescue_engine(fake.data.clone()));
+    fake.reread = Some(Ok(hashes(b"changed")));
+    let config = AcquisitionConfig {
+        verify_source: true,
+        smart: SmartPolicy::Off,
+        ..AcquisitionConfig::rescue(fake.out())
+    };
+    let report = run_fake(&fake, config).await.0.unwrap();
+    assert_eq!(report.outcome, Outcome::Mismatch);
+    let VerificationResult::Mismatched { details, .. } = &report.verification.result else {
+        panic!("{:?}", report.verification.result)
+    };
+    assert!(
+        details.starts_with("the image differs from the source as read a second time"),
+        "{details}"
+    );
+    assert!(details.contains("MD5 image "), "{details}");
+    assert!(!details.contains("acquisition"), "{details}");
+    let banner = report.verdict_lines().join("\n");
+    assert!(
+        banner.contains(
+            "The digests of the written image differ from those of a second read of the source"
+        ),
+        "{banner}"
+    );
+    assert!(!banner.contains("computed during acquisition"), "{banner}");
 
     // A second read that fails fails the verification
     let mut fake = Fake::new();
@@ -1121,7 +1463,12 @@ async fn rescue_is_unverified_unless_the_source_is_read_again() {
         .any(|f| f.path.ends_with(".map")));
     assert!(!fake.calls().contains(&"smart"));
 
-    // --verify-source: the second read matches the image -> verified
+    // Without --verify-source the explanation names the remedy
+    let banner = report.verdict_lines().join("\n");
+    assert!(banner.contains("acquire with --verify-source"), "{banner}");
+
+    // --verify-source: the second read matches the image -> verified, and the
+    // explanation says what was compared (no stream digest exists, T2)
     let mut fake = Fake::new();
     fake.engine = Some(rescue_engine(fake.data.clone()));
     let config = AcquisitionConfig {
@@ -1135,10 +1482,91 @@ async fn rescue_is_unverified_unless_the_source_is_read_again() {
         "{}",
         report.outcome_reason
     );
+    let banner = report.verdict_lines().join("\n");
+    assert!(
+        banner.contains("equal those of a second, independent read of the source"),
+        "{banner}"
+    );
+    assert!(
+        !banner.contains("computed while reading the source"),
+        "{banner}"
+    );
     // SMART before and after a rescue
     assert_eq!(fake.calls().iter().filter(|c| **c == "smart").count(), 2);
     assert!(report.smart_after.is_some());
     assert!(fake.out().join(format!("{BASE}.smart-after.json")).exists());
+}
+
+#[tokio::test]
+async fn a_resumed_rescue_reports_the_speed_of_this_session() {
+    // R-7: half of the source was rescued by an earlier session; this
+    // session's average speed counts only the half it added
+    let mut fake = Fake::new();
+    let out = fake.out();
+    std::fs::create_dir_all(&out).unwrap();
+    let half = SIZE / 2;
+    std::fs::write(out.join(format!("{BASE}.raw")), &fake.data[..half as usize]).unwrap();
+    std::fs::write(
+        out.join(format!("{BASE}.map")),
+        format!(
+            "# Mapfile. Created by GNU ddrescue version 1.30\n\
+             # current_pos  current_status  current_pass\n\
+             0x{half:08X}     ?               1\n\
+             #      pos        size  status\n\
+             0x00000000  0x{half:08X}  +\n\
+             0x{half:08X}  0x{half:08X}  ?\n"
+        ),
+    )
+    .unwrap();
+    let record = rescue::IdentityRecord::new(&fake.identity, BASE, "/dev/disk/by-diskseq/7", 512);
+    std::fs::write(
+        rescue::identity_record_path(&out, BASE),
+        serde_json::to_string_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        rescued_before_resume(&out, BASE, SIZE, 512),
+        Some(half),
+        "the map before the resume"
+    );
+    let data = fake.data.clone();
+    fake.engine = Some(Box::new(move |ctx| {
+        let img = ctx.output_path(".raw");
+        std::fs::write(&img, &data).unwrap();
+        Ok(EngineOutput {
+            bytes_acquired: data.len() as u64,
+            expected_bytes: data.len() as u64,
+            image_files: vec![img],
+            resume_sessions: vec![SessionInfo {
+                session: 1,
+                report_file: "earlier.info.session-1".into(),
+                report_sha256: None,
+                started_at: None,
+                ended_at: None,
+                outcome: Some(Outcome::Aborted),
+            }],
+            ..Default::default()
+        })
+    }));
+    let config = AcquisitionConfig {
+        resume: true,
+        smart: SmartPolicy::Off,
+        ..AcquisitionConfig::rescue(out.clone())
+    };
+    let report = run_fake(&fake, config).await.0.unwrap();
+    assert!(
+        report.notes.iter().any(|n| n.contains(&format!(
+            "the {half} bytes this session added to the image over this session's time; earlier sessions had rescued {half} bytes"
+        ))),
+        "{:?}",
+        report.notes
+    );
+    assert!(report
+        .render_text()
+        .contains("MiB/s (this session; see the notes)"));
+    // Without a readable map the note says what the speed counts
+    std::fs::write(out.join(format!("{BASE}.map")), b"not a map").unwrap();
+    assert_eq!(rescued_before_resume(&out, BASE, SIZE, 512), None);
 }
 
 #[tokio::test]
@@ -1227,6 +1655,120 @@ async fn engine_failures_report_what_exists() {
         .contains("exit code Some(1)"));
     assert_eq!(report.image_files.len(), 1);
     assert!(report.image_files[0].ends_with(".raw"));
+
+    // R-1: only the engine's image files are images; a map, an identity
+    // record or a tool log is an auxiliary file (with its digest)
+    let mut fake = Fake::new();
+    fake.engine = Some(Box::new(|ctx| {
+        for suffix in [".raw", ".map", ".identity.json"] {
+            std::fs::write(ctx.output_path(suffix), b"x").unwrap();
+        }
+        Err(AcquisitionError::failed("ddrescue ended abnormally"))
+    }));
+    let config = AcquisitionConfig {
+        smart: SmartPolicy::Off,
+        ..AcquisitionConfig::rescue(fake.out())
+    };
+    let report = run_fake(&fake, config).await.0.unwrap();
+    assert_eq!(
+        report.image_files,
+        [format!("{}/{BASE}.raw", fake.out().display())]
+    );
+    let aux: Vec<&str> = report
+        .auxiliary_files
+        .iter()
+        .map(|f| f.path.as_str())
+        .collect();
+    assert!(aux.iter().any(|p| p.ends_with(".map")), "{aux:?}");
+    assert!(aux.iter().any(|p| p.ends_with(".identity.json")), "{aux:?}");
+
+    // An E01 that stopped before its first segment: the log is no image
+    let mut fake = Fake::new();
+    fake.engine = Some(Box::new(|ctx| {
+        std::fs::write(ctx.output_path(".ewfacquire.log"), b"log").unwrap();
+        Err(AcquisitionError::failed(
+            "ewfacquire failed with exit code Some(1)",
+        ))
+    }));
+    fake.verify = Some(Box::new(|_, out| {
+        assert!(out.image_files.is_empty(), "{:?}", out.image_files);
+        (
+            VerificationResult::Failed {
+                reason: "ewfacquire produced no segment file".into(),
+            },
+            HashResults::default(),
+        )
+    }));
+    let config = AcquisitionConfig {
+        smart: SmartPolicy::Off,
+        ..AcquisitionConfig::for_engine(EngineKind::Ewf, fake.out())
+    };
+    let report = run_fake(&fake, config).await.0.unwrap();
+    assert!(report.image_files.is_empty(), "{:?}", report.image_files);
+    assert!(report.auxiliary_files[0].path.ends_with(".ewfacquire.log"));
+    assert_eq!(report.outcome, Outcome::Incomplete);
+
+    // A refusal from the engine stands: no report, even if files exist
+    let mut fake = Fake::new();
+    fake.engine = Some(Box::new(|ctx| {
+        std::fs::write(ctx.output_path(".info.session-1"), b"kept report").unwrap();
+        Err(AcquisitionError::refused(
+            "the map belongs to another device; refusing to resume",
+        ))
+    }));
+    let config = AcquisitionConfig {
+        smart: SmartPolicy::Off,
+        ..AcquisitionConfig::rescue(fake.out())
+    };
+    let e = run_fake(&fake, config).await.0.unwrap_err();
+    assert_eq!(e.kind, ErrorKind::Refused, "{e}");
+    assert!(!fake.out().join(format!("{BASE}.info")).exists());
+}
+
+#[test]
+fn engine_files_are_classified_by_engine() {
+    let base = "c_ea01_e1_S";
+    let p = |n: &str| PathBuf::from(format!("/out/{n}"));
+    for (engine, image, not_image) in [
+        (
+            EngineKind::Raw,
+            vec![format!("{base}.raw")],
+            vec![format!("{base}.pieces.tsv"), format!("{base}.info")],
+        ),
+        (
+            EngineKind::Rescue,
+            vec![format!("{base}.raw")],
+            vec![
+                format!("{base}.map"),
+                format!("{base}.identity.json"),
+                format!("{base}.info.session-1"),
+                format!("{base}.info.session-1.json"),
+                format!("{base}.smart-after.json"),
+            ],
+        ),
+        (
+            EngineKind::Ewf,
+            vec![
+                format!("{base}.E01"),
+                format!("{base}.E99"),
+                format!("{base}.EAA"),
+                format!("{base}.FAA"),
+            ],
+            vec![
+                format!("{base}.ewfacquire.log"),
+                format!("{base}.info.json"),
+                format!("{base}.001"),
+                format!("{base}.raw"),
+            ],
+        ),
+    ] {
+        for n in image {
+            assert!(is_image_file(engine, base, &p(&n)), "{engine:?} {n}");
+        }
+        for n in not_image {
+            assert!(!is_image_file(engine, base, &p(&n)), "{engine:?} {n}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1416,12 +1958,30 @@ fn verification_and_second_read_combine() {
         combine_verification(matched("img"), Some(&failed)),
         VerificationResult::Failed { .. }
     ));
+    // The second read's mismatch is passed on as compare_second_read
+    // labelled it
+    assert_eq!(
+        combine_verification(matched("img"), Some(&mismatched)),
+        mismatched
+    );
+    let sel = HashSelection::for_engine(&AcquisitionConfig::raw("/x"));
     let VerificationResult::Mismatched { details, .. } =
-        combine_verification(matched("img"), Some(&mismatched))
+        compare_second_read(sel, &hashes(b"a"), &hashes(b"a"), &hashes(b"b"))
     else {
         panic!()
     };
-    assert!(details.starts_with("source changed or unstable"));
+    assert!(details.starts_with("the source changed or reads unstably: MD5 acquisition"));
+    let VerificationResult::Mismatched { details, .. } =
+        compare_second_read(sel, &HashResults::default(), &hashes(b"a"), &hashes(b"b"))
+    else {
+        panic!()
+    };
+    assert!(details.starts_with("the image differs from the source"));
+    assert!(details.contains("MD5 image "), "{details}");
+    assert!(
+        compare_second_read(sel, &HashResults::default(), &hashes(b"a"), &hashes(b"a"))
+            .is_matched()
+    );
     // An image mismatch stays a mismatch when the second read failed
     assert!(matches!(
         combine_verification(mismatched.clone(), Some(&failed)),
@@ -1437,6 +1997,27 @@ fn flush_reports_problems_and_smart_names_never_collide() {
     assert!(flush_and_evict(std::slice::from_ref(&f), tmp.path()).is_empty());
     let problems = flush_and_evict(&[tmp.path().join("missing")], tmp.path());
     assert_eq!(problems.len(), 1);
+    // Per file: an image that cannot be opened is not durable; a problem of
+    // another file is only a note
+    let report = flush_files(&[f.clone(), tmp.path().join("missing")], tmp.path());
+    assert_eq!(
+        report.files[0],
+        FileFlush {
+            path: f.clone(),
+            ..Default::default()
+        }
+    );
+    assert!(report.files[1].not_durable.is_some());
+    let as_image = ImageFlush::of(&report, &[tmp.path().join("missing")]);
+    assert_eq!(as_image.not_durable.len(), 1);
+    assert!(as_image.notes.is_empty());
+    assert!(matches!(
+        as_image.apply(VerificationResult::Matched { method: "m".into() }),
+        VerificationResult::Failed { .. }
+    ));
+    let as_aux = ImageFlush::of(&report, std::slice::from_ref(&f));
+    assert!(as_aux.not_durable.is_empty());
+    assert_eq!(as_aux.notes.len(), 1);
 
     let p = smart_json_path(tmp.path(), "b", "before");
     assert!(p.ends_with("b.smart-before.json"));

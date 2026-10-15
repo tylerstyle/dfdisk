@@ -34,7 +34,8 @@ verdict and exit code state what was acquired and verified, including every \
 unreadable range. Interactive terminal UI and scriptable CLI."""
 # $auto: the packages of the shared libraries the binary links (libc, libgcc_s),
 # resolved by cargo-deb on the build host; the rest are the tools dfdisk runs
-depends = "$auto, ewf-tools, gddrescue, smartmontools, util-linux, udev, hdparm, nvme-cli"
+# (lsblk is in util-linux, umount in mount)
+depends = "$auto, ewf-tools, gddrescue, smartmontools, util-linux, mount, udev, hdparm, nvme-cli"
 section = "utils"
 priority = "optional"
 assets = [

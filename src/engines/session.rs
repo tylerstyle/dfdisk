@@ -5,16 +5,18 @@
 //!
 //! Order of [`run`] (R7; numbers are the steps of §4):
 //! - 1 validate the request (case fields, digests, options, file name length)
-//! - 2 identify the source (sysfs/udev probe) and compare it with the device
-//!   the examiner selected and with `--expect-*`
+//! - 2 identify the source (sysfs/udev probe), refuse an empty one (size 0
+//!   or unknown), and compare it with the device the examiner selected and
+//!   with `--expect-*`
 //! - 3 source safety: dfnix registry by pinned major:minor, system disk,
 //!   active swap (R8) and mounts in the source tree, holders, O_EXCL open
 //!   held for the whole run (R1)
-//! - 4 destination checks, then the first write: output directory and report
-//!   reservation (R11)
+//! - 4 destination checks, the engine's external tools can be run (I3), then
+//!   the first write: output directory and report reservation (R11)
 //! - 7 audit "started" (refuses on dfnix if it cannot be written)
 //! - 5 write protection, 6 capacity probe (R6) and SMART before (§8)
-//! - 8 engine acquire, 9 identity re-check, 10 fsync + cache eviction
+//! - 8 engine acquire, 9 identity re-check, 10 fsync + cache eviction (an
+//!   image file that cannot be fsynced fails the verification)
 //! - 11 engine verify and optional second source read, 12 classify
 //! - 13 SMART after (rescue), 14 reports, 15 audit "finished" (on every path
 //!   after "started"), 16 per-boot audit export
@@ -24,7 +26,9 @@
 //!
 //! `run` returns `Ok(report)` for every outcome once anything was written
 //! (Aborted, Incomplete, ... included); `Err` only for refusals and usage
-//! errors before the first write, or failures that left no output.
+//! errors before the first write, failures that left no output, or a verdict
+//! whose report could not be written (the error carries its digests, the
+//! audit "finished" record everything the report would have said).
 
 mod check;
 mod host;
@@ -32,7 +36,7 @@ mod host;
 mod tests;
 
 pub use self::check::{CheckProblem, CheckReport};
-pub use self::host::{parse_proc_swaps, HostSystem, SessionHost, SwapEntry};
+pub use self::host::{find_on_path, parse_proc_swaps, HostSystem, SessionHost, SwapEntry};
 pub use crate::engines::progress::ProgressSink;
 pub use crate::models::config::EngineKind;
 pub use crate::signals::StopFlags;
@@ -43,7 +47,7 @@ use crate::engines::audit::{self, FinishedGuard, StartedRecord};
 use crate::engines::error::{AcquisitionError, ErrorKind};
 use crate::engines::preflight::{self, DestinationFacts, DestinationRules, OutputGuard};
 use crate::engines::process::StopControl;
-use crate::engines::{ewf, raw, rescue};
+use crate::engines::{ddrescue_map, ewf, raw, rescue};
 use crate::models::capacity::CapacityInfo;
 use crate::models::case::CaseMetadata;
 use crate::models::config::{
@@ -52,8 +56,9 @@ use crate::models::config::{
 use crate::models::device::{BlockDevice, SmartSnapshot};
 use crate::models::identity::{SerialSource, SourceIdentity};
 use crate::models::info_report::{
-    compare_digests, sync_dir, AuditInfo, AuditStatus, FileDigest, ForensicInfoReport, HashResults,
-    IdentityCheck, PiecewiseInfo, ReportFiles, SessionInfo, VerificationInfo, RESERVE_SUFFIX,
+    compare_digest_sets, sync_dir, AuditInfo, AuditStatus, FileDigest, ForensicInfoReport,
+    HashResults, IdentityCheck, PiecewiseInfo, ReportFiles, SessionInfo, VerificationInfo,
+    INFO_JSON_SUFFIX, INFO_SUFFIX, RESERVE_SUFFIX,
 };
 use crate::models::outcome::{AcquisitionFacts, ReadErrorTable, VerificationResult};
 use crate::models::protection::{RegistryPresence, WriteProtection};
@@ -363,9 +368,18 @@ fn validate(request: &AcquisitionRequest) -> Result<Validated, AcquisitionError>
         return Err(AcquisitionError::usage("no output directory was given"));
     }
     request.config.validate().map_err(AcquisitionError::usage)?;
-    // E01 holds whole 512-byte sectors only (the identity check pins this size)
-    if request.engine() == EngineKind::Ewf {
-        ewf::check_source_size(request.device.size_bytes).map_err(AcquisitionError::usage)?;
+    // E01 holds whole 512-byte sectors only (the identity check pins this
+    // size); so does the E01 that --rescue-to-e01 makes of a rescue, and its
+    // refusal must come before anything is written (I2)
+    match request.engine() {
+        EngineKind::Ewf => {
+            ewf::check_source_size(request.device.size_bytes).map_err(AcquisitionError::usage)?
+        }
+        EngineKind::Rescue if request.config.rescue_to_e01 => {
+            ewf::check_source_size(request.device.size_bytes)
+                .map_err(|e| AcquisitionError::usage(format!("--rescue-to-e01: {e}")))?
+        }
+        _ => {}
     }
     let base_name = request
         .case
@@ -378,6 +392,47 @@ fn validate(request: &AcquisitionRequest) -> Result<Validated, AcquisitionError>
     })
 }
 
+/// The external programs a run of `config` starts: E01 ewfacquire, ewfinfo
+/// and ewfverify; rescue ddrescue (and, with --rescue-to-e01, the libewf
+/// programs of the conversion); RAW none.
+pub fn required_tools(config: &AcquisitionConfig) -> Vec<&'static str> {
+    const LIBEWF: [&str; 3] = ["ewfacquire", "ewfinfo", "ewfverify"];
+    match config.engine() {
+        EngineKind::Ewf => LIBEWF.to_vec(),
+        EngineKind::Rescue if config.rescue_to_e01 => {
+            std::iter::once(rescue::DDRESCUE).chain(LIBEWF).collect()
+        }
+        EngineKind::Rescue => vec![rescue::DDRESCUE],
+        EngineKind::Raw => Vec::new(),
+    }
+}
+
+/// Step 4 (I3): every external program of the engine can be run, so a
+/// missing tool fails the run before anything is written, sent to the
+/// source or recorded as started (FAILED, exit 4; `check` lists it too).
+fn check_tools(host: &dyn SessionHost, config: &AcquisitionConfig) -> Result<(), AcquisitionError> {
+    let required = required_tools(config);
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|t| host.find_tool(t).is_none())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(AcquisitionError::failed(format!(
+        "{} runs {}, but {} {} not installed (not found as an executable on PATH); install ewf-tools and gddrescue (Debian/Ubuntu) or libewf and ddrescue (Nix). Nothing was written and nothing was sent to the source",
+        if config.engine() == EngineKind::Rescue && config.rescue_to_e01 {
+            "the rescue with --rescue-to-e01".to_string()
+        } else {
+            format!("the {} engine", config.engine().label())
+        },
+        required.join(", "),
+        missing.join(", "),
+        if missing.len() == 1 { "is" } else { "are" }
+    )))
+}
+
 /// Step 2: probe the source and require it to be the selected device (and
 /// the expected one). Returns the identity and the statements for the report.
 fn identify(
@@ -388,6 +443,14 @@ fn identify(
     let identity = host.probe_identity(path).map_err(|e| {
         AcquisitionError::refused(format!("the source {path} cannot be identified: {e}"))
     })?;
+    // An empty source (no medium in a card reader, a size the kernel could
+    // not read) would be "acquired" as an empty, verified image
+    if identity.size_bytes == 0 {
+        return Err(AcquisitionError::refused(format!(
+            "the source {} reports a size of 0 bytes: no medium is present or its size is unknown, so there is nothing to acquire",
+            identity.path
+        )));
+    }
     identity
         .same_attachment(&request.device.device_identity())
         .map_err(AcquisitionError::refused)?;
@@ -434,7 +497,6 @@ fn source_safety(
 ) -> Safety {
     let config = &request.config;
     let mut errors = Vec::new();
-    let mut notes = Vec::new();
 
     let registry = host.registry();
     let presence = match &registry {
@@ -525,23 +587,18 @@ fn source_safety(
             write_protection.mounts_before.join(", ")
         )));
     }
+    // A holder (dm, LVM, md, bcache, LUKS) claims the source exclusively,
+    // so the exclusive open would refuse it anyway; there is no override
     if !write_protection.holders.is_empty() {
-        if config.allow_holders {
-            notes.push(format!(
-                "devices stacked on the source were allowed by --allow-holders: {}",
-                write_protection.holders.join(", ")
-            ));
-        } else {
-            errors.push(AcquisitionError::refused(format!(
-                "devices are stacked on the source ({}): device-mapper, LVM, md or LUKS keep it open and may write to it. Close them first, or pass --allow-holders",
-                write_protection.holders.join(", ")
-            )));
-        }
+        errors.push(AcquisitionError::refused(format!(
+            "devices are stacked on the source ({}): device-mapper, LVM, md or LUKS keep it open and may write to it. Close them first (for example cryptsetup close, vgchange -an, mdadm --stop), then acquire again",
+            write_protection.holders.join(", ")
+        )));
     }
     Safety {
         registry: presence,
         write_protection,
-        notes,
+        notes: Vec::new(),
         errors,
     }
 }
@@ -712,7 +769,15 @@ async fn run_inner(
         t0,
     };
     match acquire_phase(host, request, prepared, source_fd, sink, stop, &mut output).await {
-        Ok((report, files)) => {
+        Ok((report, Err(e))) => {
+            // A verdict without a report: the finished record keeps what the
+            // report would have said (digests, read errors, files), and the
+            // error message carries the digests to the examiner (T3)
+            output.keep();
+            let _ = guard.report_not_written(&report, &e);
+            Err(e)
+        }
+        Ok((report, Ok(files))) => {
             output.keep();
             let _ = guard.report(&report, &files);
             // 16: the case directory's copy now includes the finished record
@@ -778,6 +843,9 @@ fn pre_start(
     let source_fd = host.open_source(&identity).map_err(as_probed)?;
     let destination =
         destination_checks(host, request, &identity, v.engine, &v.base_name).map_err(as_probed)?;
+    // I3: a missing tool fails before the first write and before "started"
+    // (after the refusals, which are the more important answer)
+    check_tools(host, &request.config).map_err(as_probed)?;
     let effective = EffectiveConfig::build(&request.config, Some(&identity));
     let tool_source_path = host.tool_source_path(&identity);
     if stop.is_aborted() {
@@ -819,29 +887,66 @@ fn new_outputs(dir: &Path, base: &str, except: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The engine failed (`Err`). When it wrote anything, the run still gets a
-/// report (stop reason = the error, or aborted); otherwise the error stands.
+/// Whether `path` is an image file `engine` writes (R-1): `<base>.raw` for
+/// RAW and rescue, EWF segments (`.E01`, ..., `.EAA`, ..., `.FAA`, ...) for
+/// E01. Reports, kept session reports, maps, identity records, tool logs,
+/// pieces and SMART files are never images.
+fn is_image_file(engine: EngineKind, base: &str, path: &Path) -> bool {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return false;
+    };
+    match engine {
+        EngineKind::Raw | EngineKind::Rescue => name == format!("{base}{}", rescue::IMAGE_SUFFIX),
+        EngineKind::Ewf => {
+            ewf::is_ewf_segment(base, &name)
+                && name
+                    .get(base.len() + 1..)
+                    .and_then(|ext| ext.bytes().next())
+                    .is_some_and(|b| b.is_ascii_alphabetic())
+        }
+    }
+}
+
+/// The engine failed (`Err`). A refusal stands as it is (the engine decided
+/// the run must not happen; nothing it kept is a result). Otherwise, when it
+/// wrote anything, the run still gets a report (stop reason = the error, or
+/// aborted) that lists the image files of this engine as images and every
+/// other file it left (map, identity record, tool log, kept reports) as
+/// auxiliary files; when it wrote nothing, the error stands.
 fn engine_error_output(
     ctx: &EngineContext,
     err: AcquisitionError,
     preexisting: &[PathBuf],
     session_files: &[PathBuf],
 ) -> Result<EngineOutput, AcquisitionError> {
+    if err.kind == ErrorKind::Refused {
+        return Err(err);
+    }
     let written = new_outputs(&ctx.output_dir, &ctx.base_name, preexisting);
     if written.is_empty() {
         return Err(err);
     }
     let aborted = err.kind == ErrorKind::Aborted || ctx.is_aborted();
-    let image_files: Vec<PathBuf> = written
+    // The reports about to be written are not files of the engine
+    let reports = [
+        format!("{}{INFO_SUFFIX}", ctx.base_name),
+        format!("{}{INFO_JSON_SUFFIX}", ctx.base_name),
+    ];
+    let (image_files, auxiliary_files): (Vec<PathBuf>, Vec<PathBuf>) = written
         .into_iter()
         .filter(|p| !session_files.contains(p))
         .chain(preexisting.iter().cloned())
-        .collect();
+        .filter(|p| {
+            p.file_name()
+                .is_none_or(|n| !reports.iter().any(|r| n.to_string_lossy() == r.as_str()))
+        })
+        .partition(|p| is_image_file(ctx.engine, &ctx.base_name, p));
     let mut out = EngineOutput {
         expected_bytes: ctx.expected_bytes(),
         read_errors: ReadErrorTable::new(ctx.sector_size(), "engine stopped with an error"),
         aborted,
         image_files,
+        auxiliary_files,
         ..Default::default()
     };
     if !aborted {
@@ -856,7 +961,22 @@ fn engine_error_output(
         err.kind.label(),
         err.message
     ));
+    if out.image_files.is_empty() {
+        out.notes
+            .push("the engine left no image file; only its other files are listed".into());
+    }
     Ok(out)
+}
+
+/// Bytes of the source a resumed rescue had already rescued before this
+/// session (from the map and image it continues; read or bad sectors that
+/// are in the image), `None` when the map cannot be read.
+fn rescued_before_resume(dir: &Path, base: &str, expected: u64, sector_size: u32) -> Option<u64> {
+    let map = ddrescue_map::read(&dir.join(format!("{base}{}", rescue::MAP_SUFFIX))).ok()?;
+    let image_len = std::fs::metadata(dir.join(format!("{base}{}", rescue::IMAGE_SUFFIX)))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    Some(map.assess(expected, image_len, sector_size).bytes_acquired)
 }
 
 /// Step 9: the source is still the device probed at the start.
@@ -881,54 +1001,194 @@ fn recheck_identity(
     }
 }
 
+/// What step 10 did to one file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileFlush {
+    pub path: PathBuf,
+    /// The file could not be opened or fsynced: what it holds may not be on
+    /// the destination medium
+    pub not_durable: Option<String>,
+    /// The page-cache eviction failed: a re-read may be served from memory
+    pub not_evicted: Option<String>,
+}
+
+/// What step 10 did: per file, and the directory fsync.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FlushReport {
+    pub files: Vec<FileFlush>,
+    /// The directory could not be fsynced: new entries may not be durable
+    pub directory: Option<String>,
+}
+
+impl FlushReport {
+    /// Every problem, one sentence each, in file order.
+    pub fn problems(&self) -> Vec<String> {
+        self.files
+            .iter()
+            .flat_map(|f| f.not_durable.iter().chain(f.not_evicted.iter()))
+            .chain(self.directory.iter())
+            .cloned()
+            .collect()
+    }
+}
+
 /// Step 10: fsync every file, evict it from the page cache (so verification
-/// reads the medium), fsync the directory. Returns the problems.
-pub fn flush_and_evict(files: &[PathBuf], dir: &Path) -> Vec<String> {
+/// reads the medium), fsync the directory; what happened to each file.
+pub fn flush_files(files: &[PathBuf], dir: &Path) -> FlushReport {
     use std::os::unix::io::AsRawFd;
-    let mut problems = Vec::new();
+    let mut report = FlushReport::default();
     for f in files {
+        let mut result = FileFlush {
+            path: f.clone(),
+            ..Default::default()
+        };
         match File::open(f) {
             Ok(file) => {
                 if let Err(e) = file.sync_all() {
-                    problems.push(format!("fsync of {} failed: {e}", f.display()));
+                    result.not_durable = Some(format!("fsync of {} failed: {e}", f.display()));
                 }
                 // SAFETY: advisory call on a descriptor we own
                 let rc = unsafe {
                     libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
                 };
                 if rc != 0 {
-                    problems.push(format!(
+                    result.not_evicted = Some(format!(
                         "{} could not be evicted from the page cache: {}",
                         f.display(),
                         io::Error::from_raw_os_error(rc)
                     ));
                 }
             }
-            Err(e) => problems.push(format!("{} cannot be opened to flush it: {e}", f.display())),
+            Err(e) => {
+                result.not_durable =
+                    Some(format!("{} cannot be opened to flush it: {e}", f.display()))
+            }
         }
+        report.files.push(result);
     }
     if let Err(e) = sync_dir(dir) {
-        problems.push(e.to_string());
+        report.directory = Some(e.to_string());
     }
-    problems
+    report
+}
+
+/// [`flush_files`] as a list of problems (for callers that only note them).
+pub fn flush_and_evict(files: &[PathBuf], dir: &Path) -> Vec<String> {
+    flush_files(files, dir).problems()
+}
+
+/// What step 10 means for the image files (T1): a file that could not be
+/// opened or fsynced, or a directory that could not be fsynced, makes the
+/// image not durable (verification fails); an eviction failure means the
+/// re-read may have come from memory. Problems of other files are notes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ImageFlush {
+    not_durable: Vec<String>,
+    not_evicted: Vec<String>,
+    notes: Vec<String>,
+}
+
+impl ImageFlush {
+    fn of(flush: &FlushReport, image_files: &[PathBuf]) -> Self {
+        let mut r = ImageFlush::default();
+        for f in &flush.files {
+            let image = image_files.contains(&f.path);
+            if let Some(p) = &f.not_durable {
+                if image {
+                    r.not_durable.push(p.clone());
+                } else {
+                    r.notes.push(p.clone());
+                }
+            }
+            if let Some(p) = &f.not_evicted {
+                if image {
+                    r.not_evicted.push(p.clone());
+                } else {
+                    r.notes.push(p.clone());
+                }
+            }
+        }
+        if let Some(p) = &flush.directory {
+            if image_files.is_empty() {
+                r.notes.push(p.clone());
+            } else {
+                r.not_durable
+                    .push(format!("{p} (the directory entries of the image)"));
+            }
+        }
+        r
+    }
+
+    /// The image verification once the flush is taken into account (only
+    /// for a verification that ran; an aborted run stays not verified): an
+    /// image that is not durable fails verification, also a rescue image
+    /// that had nothing to be compared with; a mismatch stays a mismatch.
+    fn apply(&self, image: VerificationResult) -> VerificationResult {
+        if self.not_durable.is_empty() {
+            return image;
+        }
+        match image {
+            VerificationResult::Mismatched { .. } => image,
+            _ => VerificationResult::Failed {
+                reason: format!(
+                    "the image could not be flushed durably to the destination: {}",
+                    self.not_durable.join("; ")
+                ),
+            },
+        }
+    }
+}
+
+/// The second read of the source compared with what the acquisition
+/// measured, labelled by what was compared (R-4): with acquisition digests,
+/// a difference means the source changed or reads unstably; without them
+/// (ddrescue), the second read is compared with the image, and a difference
+/// means the image differs from the source as read again (a damaged image,
+/// or a changed or unstable source).
+pub fn compare_second_read(
+    selection: HashSelection,
+    acquisition: &HashResults,
+    image: &HashResults,
+    reread: &HashResults,
+) -> VerificationResult {
+    const METHOD: &str = "second read of the source";
+    let (result, cause) = if acquisition.is_empty() {
+        (
+            compare_digest_sets(selection, ("image", image), ("second read", reread), METHOD),
+            "the image differs from the source as read a second time (a damaged image, or a source that changed or reads unstably)",
+        )
+    } else {
+        (
+            compare_digest_sets(
+                selection,
+                ("acquisition", acquisition),
+                ("second read", reread),
+                METHOD,
+            ),
+            "the source changed or reads unstably",
+        )
+    };
+    match result {
+        VerificationResult::Mismatched { method, details } => VerificationResult::Mismatched {
+            method,
+            details: format!("{cause}: {details}"),
+        },
+        other => other,
+    }
 }
 
 /// The image verification combined with the second source read: a
-/// differing second read is a mismatch ("source changed or unstable"); a
-/// requested second read that failed fails the verification; a matching
-/// second read verifies an acquisition whose engine had no stream digest.
+/// differing second read is a mismatch (as [`compare_second_read`] labelled
+/// it); a requested second read that failed fails the verification; a
+/// matching second read verifies an acquisition whose engine had no stream
+/// digest.
 pub fn combine_verification(
     image: VerificationResult,
     source_reread: Option<&VerificationResult>,
 ) -> VerificationResult {
     match source_reread {
         None | Some(VerificationResult::NotPossible { .. }) => image,
-        Some(VerificationResult::Mismatched { method, details }) => {
-            VerificationResult::Mismatched {
-                method: method.clone(),
-                details: format!("source changed or unstable: {details}"),
-            }
-        }
+        Some(mismatch @ VerificationResult::Mismatched { .. }) => mismatch.clone(),
         Some(VerificationResult::Failed { reason }) => match image {
             VerificationResult::Mismatched { .. } => image,
             _ => VerificationResult::Failed {
@@ -944,7 +1204,18 @@ pub fn combine_verification(
     }
 }
 
-fn verification_method(engine: EngineKind, result: &VerificationResult) -> String {
+/// How the image was verified, stating only what happened: the reader, and
+/// whether the image was fsynced and evicted from the page cache first.
+fn verification_method(
+    engine: EngineKind,
+    result: &VerificationResult,
+    ran: bool,
+    has_image: bool,
+    flush: &ImageFlush,
+) -> String {
+    if !ran {
+        return "none: the acquisition was aborted before the verification".to_string();
+    }
     let base = match result {
         VerificationResult::Matched { method } | VerificationResult::Mismatched { method, .. } => {
             method.clone()
@@ -955,7 +1226,15 @@ fn verification_method(engine: EngineKind, result: &VerificationResult) -> Strin
             EngineKind::Rescue => "image digests computed by dfdisk".to_string(),
         },
     };
-    format!("{base}, after fsync and page-cache eviction of the image")
+    if !has_image {
+        base
+    } else if !flush.not_durable.is_empty() {
+        format!("{base}; the image could not be fsynced to the destination, so the re-read may not show what the destination holds")
+    } else if !flush.not_evicted.is_empty() {
+        format!("{base}, after fsync of the image; the image could not be evicted from the page cache, so the re-read may have come from memory")
+    } else {
+        format!("{base}, after fsync and page-cache eviction of the image")
+    }
 }
 
 /// `<base>.smart-<when>.json`, or `-2`, `-3`, ... when a resumed rescue
@@ -1001,7 +1280,7 @@ async fn acquire_phase(
     sink: &ProgressSink,
     stop: &StopFlags,
     output: &mut OutputGuard,
-) -> Result<(ForensicInfoReport, ReportFiles), AcquisitionError> {
+) -> Result<(ForensicInfoReport, Result<ReportFiles, AcquisitionError>), AcquisitionError> {
     let Prepared {
         v,
         identity,
@@ -1078,6 +1357,17 @@ async fn acquire_phase(
         }
     }
 
+    // R-7: what earlier sessions of a resumed rescue had rescued, so the
+    // average speed counts only this session's bytes
+    let resumed_from = (v.engine == EngineKind::Rescue && config.resume).then(|| {
+        rescued_before_resume(
+            &dir,
+            &v.base_name,
+            identity.size_bytes,
+            identity.logical_sector_size.max(512),
+        )
+    });
+
     // 8: the engine
     let ctx = EngineContext {
         request: request.clone(),
@@ -1126,12 +1416,17 @@ async fn acquire_phase(
     let mut written: Vec<PathBuf> = out.image_files.clone();
     written.extend(out.auxiliary_files.iter().cloned());
     written.extend(session_files.iter().cloned());
-    for problem in flush_and_evict(&written, &dir) {
+    let flush = ImageFlush::of(&host.flush(&written, &dir), &out.image_files);
+    for problem in flush.not_durable.iter().chain(&flush.not_evicted) {
         sink.warn(problem.clone());
-        notes.push(problem);
+    }
+    for problem in &flush.notes {
+        sink.warn(problem.clone());
+        notes.push(problem.clone());
     }
 
     // 11: verification and the optional second source read
+    let verify_ran = !out.aborted;
     let (image_result, image_hashes) = if out.aborted {
         (
             VerificationResult::NotPossible {
@@ -1142,6 +1437,11 @@ async fn acquire_phase(
     } else {
         sink.phase(AcquisitionStatus::Verifying, "Verifying the written image");
         host.verify(&ctx, &out).await
+    };
+    let image_result = if verify_ran {
+        flush.apply(image_result)
+    } else {
+        image_result
     };
     if stop.is_aborted() {
         out.aborted = true;
@@ -1166,19 +1466,12 @@ async fn acquire_phase(
             "Reading the source a second time (--verify-source)",
         );
         match host.reread_source(&ctx, out.bytes_acquired).await {
-            Ok(reread) => {
-                let reference = if out.acquisition_hashes.is_empty() {
-                    &image_hashes
-                } else {
-                    &out.acquisition_hashes
-                };
-                Some(compare_digests(
-                    v.selection,
-                    reference,
-                    &reread,
-                    "second read of the source",
-                ))
-            }
+            Ok(reread) => Some(compare_second_read(
+                v.selection,
+                &out.acquisition_hashes,
+                &image_hashes,
+                &reread,
+            )),
             Err(e) if e.kind == ErrorKind::Aborted || stop.is_aborted() => {
                 out.aborted = true;
                 Some(VerificationResult::NotPossible {
@@ -1188,7 +1481,13 @@ async fn acquire_phase(
             Err(e) => Some(VerificationResult::Failed { reason: e.message }),
         }
     };
-    let method = verification_method(v.engine, &image_result);
+    let method = verification_method(
+        v.engine,
+        &image_result,
+        verify_ran,
+        !out.image_files.is_empty(),
+        &flush,
+    );
     let verification = combine_verification(image_result, source_reread.as_ref());
 
     // 13: SMART after a rescue
@@ -1228,8 +1527,25 @@ async fn acquire_phase(
     clock.finish(elapsed);
     report.ended_at = clock.end_utc.unwrap_or_else(chrono::Utc::now);
     report.elapsed_seconds = elapsed.as_secs();
+    let session_bytes = match resumed_from {
+        None => out.bytes_acquired,
+        Some(Some(before)) => {
+            let added = out.bytes_acquired.saturating_sub(before);
+            notes.push(format!(
+                "resumed rescue: the average speed counts the {added} bytes this session added to the image over this session's time; earlier sessions had rescued {before} bytes"
+            ));
+            added
+        }
+        Some(None) => {
+            notes.push(
+                "resumed rescue: the bytes earlier sessions rescued are not known (the map could not be read at the start), so the average speed counts every byte in the image over this session's time"
+                    .into(),
+            );
+            out.bytes_acquired
+        }
+    };
     report.average_speed_bytes_sec = if elapsed.as_secs_f64() > 0.0 {
-        out.bytes_acquired as f64 / elapsed.as_secs_f64()
+        session_bytes as f64 / elapsed.as_secs_f64()
     } else {
         0.0
     };
@@ -1316,12 +1632,20 @@ async fn acquire_phase(
     output.keep();
     let files = report.write_reports(&dir, &v.base_name).map_err(|e| {
         AcquisitionError::failed(format!(
-            "the acquisition ended {} (exit code {}), but its report could not be written to {}: {e}",
+            "the acquisition ended {} (exit code {}), but its report could not be written to {}: {e}. {} Image files: {}.",
             report.outcome.label(),
             report.exit_code,
-            dir.display()
+            dir.display(),
+            report.digest_summary(),
+            if report.image_files.is_empty() {
+                "(none)".to_string()
+            } else {
+                report.image_files.join(", ")
+            }
         ))
-    })?;
-    sink.log(format!("Report written: {}", files.text.display()));
+    });
+    if let Ok(files) = &files {
+        sink.log(format!("Report written: {}", files.text.display()));
+    }
     Ok((report, files))
 }

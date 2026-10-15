@@ -200,7 +200,6 @@ fn acquire_help_documents_every_flag_and_the_required_fields() {
         "--verify-source",
         "--smart",
         "--write-protect",
-        "--allow-holders",
         "--allow-tmpfs",
         "--allow-low-space",
         "--refuse-hidden-areas",
@@ -214,6 +213,8 @@ fn acquire_help_documents_every_flag_and_the_required_fields() {
         "SIGHUP",
         "second SIGINT",
         "1, 2, 8, 5, 4, 3, 6, 7, 9, 0",
+        // 4 is a verdict too (VERIFICATION FAILED)
+        "verdict of the report (0, 4-9;",
     ] {
         assert!(stdout.contains(flag), "{flag}\n{stdout}");
     }
@@ -221,6 +222,8 @@ fn acquire_help_documents_every_flag_and_the_required_fields() {
     for placeholder in ["CASE001", "cf01]", "Forensic Examiner", "Law Enforcement"] {
         assert!(!stdout.contains(placeholder), "{placeholder}");
     }
+    // No override for holders: a holder claims the source exclusively
+    assert!(!stdout.contains("--allow-holders"), "{stdout}");
 }
 
 #[test]
@@ -281,6 +284,16 @@ fn every_command_help_documents_its_flags_and_exit_codes() {
 // ---------------------------------------------------------------------------
 // Argument validation (exit 2)
 // ---------------------------------------------------------------------------
+
+#[test]
+fn convert_help_names_the_tool_that_writes_raw() {
+    let (stdout, _) = text(&run(&["convert", "--help"]));
+    assert!(
+        stdout.contains("convert --to raw writes it with ewfexport"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("native engine"), "{stdout}");
+}
 
 #[test]
 fn missing_or_invalid_arguments_are_usage_errors() {
@@ -570,6 +583,7 @@ fn json_output_is_the_report_and_nothing_else() {
     assert_eq!(output.status.code(), Some(2));
     let (stdout, stderr) = text(&output);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["schema_version"], 1, "{v}");
     assert_eq!(v["error"]["kind"], "usage");
     assert_eq!(v["error"]["exit_code"], 2);
     assert!(stderr.contains("Error (USAGE ERROR)"), "{stderr}");
@@ -608,6 +622,7 @@ fn check_writes_nothing_and_reports_readiness() {
     let (stdout, stderr) = text(&output);
     assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["schema_version"], 1, "{v}");
     assert_eq!(v["ready"], true, "{v}");
     assert_eq!(v["problems"], serde_json::json!([]));
     assert_eq!(v["base_name"], "k_ea01_e1_NOSERIAL");
@@ -626,6 +641,60 @@ fn check_writes_nothing_and_reports_readiness() {
     let output = check(&["--resume"]);
     assert_eq!(output.status.code(), Some(2), "{:?}", text(&output));
     assert!(!tmp.path().join("case").exists());
+
+    // I3: without ewfacquire on PATH an E01 is not READY (exit 4), and
+    // acquire fails before anything is written or recorded
+    let only_mocks = sandbox().join("bin");
+    let mut args: Vec<String> = [
+        "check",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "-C",
+        "K",
+        "-E",
+        "E1",
+        "-e",
+        "X",
+        "--format",
+        "e01",
+        "--allow-tmpfs",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let output = dfdisk()
+        .env("PATH", &only_mocks)
+        .args(&args)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(4), "{stdout}\n{stderr}");
+    assert!(stdout.contains("ewfacquire"), "{stdout}");
+    args[0] = "acquire".into();
+    let log_before = std::fs::read_to_string(sandbox().join("audit.jsonl")).unwrap_or_default();
+    let output = dfdisk()
+        .env("PATH", &only_mocks)
+        .args(&args)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&output);
+    assert_eq!(output.status.code(), Some(4), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("Error (FAILED)") && stderr.contains("ewfacquire"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Starting"),
+        "nothing claims a start: {stderr}"
+    );
+    assert!(!stderr.contains("ACQUIRING"), "nothing started: {stderr}");
+    assert!(!tmp.path().join("case").exists());
+    let log_after = std::fs::read_to_string(sandbox().join("audit.jsonl")).unwrap_or_default();
+    assert!(
+        !log_after[log_before.len()..].contains(&src.to_string_lossy().into_owned()),
+        "no audit record for this run"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +734,7 @@ fn verify_exit_codes() {
     let json = run(&["verify", img, "--sha256", &sha256, "--json"]);
     assert_eq!(json.status.code(), Some(0));
     let v: serde_json::Value = serde_json::from_str(&text(&json).0).unwrap();
+    assert_eq!(v["schema_version"], 1, "{v}");
     assert_eq!(v["exit_code"], 0);
     assert_eq!(v["verification"]["result"]["status"], "matched");
     assert!(v["verification"]["pieces"].is_null());
@@ -672,6 +742,32 @@ fn verify_exit_codes() {
     // Missing image: usage
     let missing = run(&["verify", "/nonexistent/image.raw", "--md5", &md5]);
     assert_eq!(missing.status.code(), Some(2));
+
+    // A malformed digest is a usage error (exit 2), never a mismatch, and
+    // writes no addendum (T5)
+    let addenda = || {
+        std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".verify-"))
+            .count()
+    };
+    let before = addenda();
+    for (flag, bad) in [
+        ("--md5", "xyz"),
+        ("--md5", &md5[..31]),
+        ("--sha1", md5.as_str()),
+        ("--sha256", "zz"),
+    ] {
+        let o = run(&["verify", img, flag, bad]);
+        let (_, stderr) = text(&o);
+        assert_eq!(o.status.code(), Some(2), "{flag} {bad}: {stderr}");
+        assert!(stderr.contains("hexadecimal digits"), "{stderr}");
+    }
+    assert_eq!(addenda(), before, "no addendum for a usage error");
+    // Upper case and surrounding blanks are fine
+    let upper = run(&["verify", img, "--md5", &format!(" {} ", md5.to_uppercase())]);
+    assert_eq!(upper.status.code(), Some(0), "{:?}", text(&upper));
 
     // --pieces does not apply to EWF images
     std::fs::write(
@@ -699,6 +795,38 @@ fn verify_exit_codes() {
     assert!(addenda >= 1, "no verification addendum written");
     let log = std::fs::read_to_string(sandbox().join("audit.jsonl")).unwrap();
     assert!(log.contains("\"image_verification\""));
+}
+
+#[test]
+fn verify_records_absolute_paths_for_a_relative_image() {
+    // I6: the addendum, the JSON result and the audit record never carry
+    // the relative path that was typed
+    let tmp = scratch();
+    std::fs::create_dir(tmp.path().join("case")).unwrap();
+    std::fs::write(tmp.path().join("case/rel.raw"), b"relative").unwrap();
+    let o = dfdisk()
+        .current_dir(tmp.path())
+        .args(["verify", "case/rel.raw", "--json"])
+        .output()
+        .unwrap();
+    let (stdout, stderr) = text(&o);
+    assert_eq!(o.status.code(), Some(9), "{stderr}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let image = v["verification"]["image"].as_str().unwrap();
+    assert!(Path::new(image).is_absolute(), "{image}");
+    assert!(image.ends_with("case/rel.raw"), "{image}");
+    let log = std::fs::read_to_string(sandbox().join("audit.jsonl")).unwrap();
+    let record: serde_json::Value = log
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|r| r["action"] == "image_verification")
+        .find(|r| {
+            r["details"]["image"]
+                .as_str()
+                .is_some_and(|i| i.ends_with("case/rel.raw"))
+        })
+        .expect("a record of this verification");
+    assert!(Path::new(record["details"]["image"].as_str().unwrap()).is_absolute());
 }
 
 #[test]
@@ -951,6 +1079,7 @@ fn rescue_to_e01_converts_next_to_the_rescue() {
     let (stdout, stderr) = text(&o);
     assert_eq!(o.status.code(), Some(0), "{stderr}\n{stdout}");
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["schema_version"], 1, "{v}");
     assert_eq!(v["acquisition"]["outcome"], "verified", "{v}");
     assert_eq!(v["conversion"]["outcome"], "verified", "{v}");
     assert_eq!(v["exit_code"], 0);
@@ -1020,4 +1149,38 @@ fn rescue_to_e01_converts_next_to_the_rescue() {
     let o = rescue(&["--resume"]);
     assert_eq!(o.status.code(), Some(3), "{:?}", text(&o));
     assert!(text(&o).1.contains(".E01"), "{:?}", text(&o));
+
+    // C-5: the E01 back to RAW. The rescue report next to it lists
+    // <base>.raw, not <base>.E01: found automatically it is ignored with a
+    // note (not a usage error); given with --report it is refused
+    let e01 = out.join(format!("{base}.E01"));
+    let back = tmp.path().join("back");
+    let convert = |extra: &[&str]| {
+        let mut args = vec![
+            "convert",
+            e01.to_str().unwrap(),
+            "--to",
+            "raw",
+            "-o",
+            back.to_str().unwrap(),
+            "--allow-tmpfs",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        dfdisk().args(&args).output().unwrap()
+    };
+    let o = convert(&["--report", rescue_json.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(2), "{:?}", text(&o));
+    assert!(text(&o).1.contains("does not list"), "{:?}", text(&o));
+    let o = convert(&[]);
+    let (stdout, stderr) = text(&o);
+    assert_ne!(o.status.code(), Some(2), "{stderr}\n{stdout}");
+    let conv: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        conv["notes"].as_array().unwrap().iter().any(|n| n
+            .as_str()
+            .unwrap()
+            .contains("was not used: it does not list")),
+        "{conv}"
+    );
 }

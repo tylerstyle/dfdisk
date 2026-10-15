@@ -2,6 +2,8 @@
 //! of every command that can end with a verdict lists its exit codes (§2).
 
 use crate::cli::size::{parse_piece_size, parse_size, PieceSize};
+use crate::engines::verify::parse_digest;
+use crate::models::config::HashAlgorithm;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -10,6 +12,7 @@ macro_rules! exit_code_table {
     () => {
         "Exit codes:
   0  verified: complete, and the re-read image matches the acquisition digests
+     (a rescue: matches a second read of the source)
   1  internal error
   2  usage error: missing, invalid or inconsistent arguments
   3  refused: a safety, identity or destination check failed; nothing was read
@@ -39,9 +42,13 @@ the outputs are kept and the report says ABORTED (exit 8). A second SIGINT kills
 external tools at once; the report is still written. SIGHUP (terminal closed)
 keeps the acquisition running without terminal output until its report is written.
 
-The exit code is the verdict of the report (0, 5-9), or 2, 3 or 4 when no
-acquisition ran. With --rescue-to-e01 it is the more severe of the rescue and the
-conversion, from most to least severe: 1, 2, 8, 5, 4, 3, 6, 7, 9, 0.
+The exit code is the verdict of the report (0, 4-9; 4 when the verification
+could not run or complete), or 2, 3 or 4 when no acquisition ran. With
+--rescue-to-e01 it is the more severe of the rescue and the conversion, from
+most to least severe: 1, 2, 8, 5, 4, 3, 6, 7, 9, 0; a conversion that could not
+start after the rescue (usage error, refusal) counts as 4, and a source that is
+not a whole number of 512-byte sectors is a usage error (2) before the rescue
+starts.
 
 ",
     exit_code_table!()
@@ -50,14 +57,15 @@ conversion, from most to least severe: 1, 2, 8, 5, 4, 3, 6, 7, 9, 0.
 const CHECK_AFTER_HELP: &str = "\
 check runs every step an acquisition runs before it reads the source (request,
 identity, registry, system disk, swap, mounts, holders, exclusive open,
-destination, capacity and SMART as configured) and writes nothing: no directory,
-no file, no audit record, no read-only flag.
+destination, the engine's external tools, capacity and SMART as configured) and
+writes nothing: no directory, no file, no audit record, no read-only flag.
 
 Exit codes:
   0  ready: the acquisition would start
   2  usage error: missing, invalid or inconsistent arguments
   3  refused: the acquisition would be refused (every reason is listed)
-  4  a check could not run
+  4  a check could not run, or a tool the engine runs (ewfacquire, ewfinfo,
+     ewfverify, ddrescue) is not installed
   8  interrupted (SIGINT, SIGTERM)";
 
 const VERIFY_AFTER_HELP: &str = "\
@@ -71,7 +79,7 @@ image (<base>: the image file name without its extension) and an audit record.
 
 Exit codes:
   0  every digest compared (expected, stored in the E01, every piece) matches
-  2  usage error
+  2  usage error (for example a digest that is not 32/40/64 hex digits)
   4  verification failed: the image could not be read completely, or an expected
      digest was not computed
   5  hash mismatch (a digest or a piece differs)
@@ -100,6 +108,21 @@ Exit codes:
   2  usage error
   3  refused (protected device, system mount, swap, unidentifiable device)
   4  an unmount failed or a mount remained";
+
+/// `--md5`: 32 hex digits (a malformed digest is a usage error, exit 2).
+fn parse_md5(s: &str) -> Result<String, String> {
+    parse_digest(HashAlgorithm::MD5, s)
+}
+
+/// `--sha1`: 40 hex digits.
+fn parse_sha1(s: &str) -> Result<String, String> {
+    parse_digest(HashAlgorithm::SHA1, s)
+}
+
+/// `--sha256`: 64 hex digits.
+fn parse_sha256(s: &str) -> Result<String, String> {
+    parse_digest(HashAlgorithm::SHA256, s)
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -180,7 +203,8 @@ pub struct ListArgs {
 pub enum CliImageFormat {
     /// Expert Witness Format through ewfacquire (segments, compression, MD5 always)
     E01,
-    /// One RAW file written by dfdisk's native engine
+    /// One RAW file: acquire reads and writes it with dfdisk's own engine;
+    /// convert --to raw writes it with ewfexport (libewf)
     Raw,
 }
 
@@ -397,10 +421,6 @@ pub struct AcquisitionOptions {
     )]
     pub write_protect: CliWriteProtect,
 
-    /// Acquire a source with device-mapper/LVM/md/LUKS devices stacked on it
-    #[arg(long, help_heading = "Safety")]
-    pub allow_holders: bool,
-
     /// Accept a destination on tmpfs/ramfs (lost at power-off)
     #[arg(long, help_heading = "Safety")]
     pub allow_tmpfs: bool,
@@ -488,16 +508,16 @@ pub struct VerifyArgs {
     /// segment (.E01/.Ex01)
     pub image: PathBuf,
 
-    /// Expected MD5
-    #[arg(long, value_name = "HEX")]
+    /// Expected MD5 (32 hex digits)
+    #[arg(long, value_name = "HEX", value_parser = parse_md5)]
     pub md5: Option<String>,
 
-    /// Expected SHA-1
-    #[arg(long, value_name = "HEX")]
+    /// Expected SHA-1 (40 hex digits)
+    #[arg(long, value_name = "HEX", value_parser = parse_sha1)]
     pub sha1: Option<String>,
 
-    /// Expected SHA-256
-    #[arg(long, value_name = "HEX")]
+    /// Expected SHA-256 (64 hex digits)
+    #[arg(long, value_name = "HEX", value_parser = parse_sha256)]
     pub sha256: Option<String>,
 
     /// Take the expected digests from this dfdisk report (<base>.info.json)
@@ -629,8 +649,9 @@ pub struct ConvertArgs {
     pub split: Option<CliSplitSize>,
 
     /// The dfdisk report of the acquisition the source came from; referenced in
-    /// the conversion report and its digests compared [default: <base>.info.json
-    /// next to the source, when it exists]
+    /// the conversion report and its digests compared; it must list the source
+    /// image [default: <base>.info.json next to the source, used when it lists
+    /// the image, else ignored with a note]
     #[arg(long, value_name = "INFO_JSON")]
     pub report: Option<PathBuf>,
 

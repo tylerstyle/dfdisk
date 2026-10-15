@@ -14,6 +14,15 @@ and when something was not done the report says so.
 
 ### Breaking changes
 
+- **Required output directory.** `acquire` and `convert` require
+  `-o/--output-dir`; 0.1.10 wrote to the current directory (`.`) when it was
+  missing.
+- **Options for another engine are usage errors.** An option given explicitly
+  for an engine it does not apply to (for example `--compression`, `--split` or
+  `--retries` with `--format raw`, which 0.1.10 accepted and ignored; likewise
+  the new RAW-only and rescue-only options with another engine, and
+  `--compression`/`--split` with `convert --to raw`) exits 2, so a report never
+  shows a setting that was not applied.
 - **Required case fields.** `acquire` (and the TUI) require `--case`,
   `--evidence` and `--examiner`. The 0.1 placeholder defaults (`CASE001`, `cf01`,
   `Forensic Examiner`, `Law Enforcement / DFIR Unit`, `Physical Storage Media`)
@@ -39,10 +48,11 @@ and when something was not done the report says so.
 - **dfcore 0.2.0** is required (registry matching by device number, typed
   refusals, per-boot audit export, `DeviceIdentity::same_attachment`).
 - **Stricter refusals.** Mounted sources are refused (unmounting is the explicit
-  `dfdisk unmount` / `--auto-unmount`), as are sources with holders (unless
-  `--allow-holders`), sources with active swap, sources in use (`O_EXCL`), tmpfs
-  destinations (unless `--allow-tmpfs`) and E01 destinations with less free space
-  than the source (unless `--allow-low-space`).
+  `dfdisk unmount` / `--auto-unmount`), as are sources with holders (they have
+  to be closed first), sources with active swap, sources in use (`O_EXCL`), tmpfs
+  destinations (unless `--allow-tmpfs`), E01 destinations with less free space
+  than the source (unless `--allow-low-space`) and empty sources (size 0: no
+  medium, or the size is unknown).
 - **Write protection on by default.** `--write-protect auto` sets the kernel
   read-only flag (BLKROSET) on the source and leaves it set; `off` only records.
 - **SMART** is no longer queried during device scans; `list --smart` asks for it
@@ -56,7 +66,7 @@ and when something was not done the report says so.
 - **TUI keys.** Esc never aborts; aborting needs a y/N confirmation; Tab and
   Shift-Tab always move between fields and path completion has its own key.
 - **Packaging.** The .deb depends on `$auto, ewf-tools, gddrescue, smartmontools,
-  util-linux, udev, hdparm, nvme-cli`; the Arch and nixpkgs files under
+  util-linux, mount, udev, hdparm, nvme-cli`; the Arch and nixpkgs files under
   `packaging/` are gone (there is no AUR package). Minimum Rust version 1.88
   (`rust-version`).
 
@@ -93,14 +103,22 @@ and when something was not done the report says so.
   from the ddrescue mapfile, untried areas make the run INCOMPLETE, the map is
   hashed and listed, a resume requires the same device (identity sidecar) and
   passes `-I`, the earlier report is kept as `<base>.info.session-N`, and the TUI
-  offers to resume.
+  offers to resume. The verdict explanation follows what happened: a rescue is
+  INCOMPLETE "because the map lists unfinished areas" only when it does and
+  nothing else stopped it, a VERIFIED rescue names the second read of the
+  source it was compared with, and a second read that differs is labelled by
+  what was compared (acquisition digests or the image).
 - **H5** Write protection was not checked or recorded: the read-only state of
   the source and its partitions, holders, mounts and the exclusive open are
   recorded; BLKROSET is set by default.
 - **H6** Audit trail gaps: (a) the export is per boot and never replaces another
   boot's chain; (b) refusals are recognised by type, not by message text;
   (c) the "finished" record always carries the outcome, the digests known and
-  the SHA-256 of both reports; (d) an unwritable audit log refuses on dfnix and
+  the SHA-256 of both reports, and when the report cannot be written it still
+  carries the verdict, digests, read errors and files (`report_written: false`);
+  records of MISMATCH, INCOMPLETE, ABORTED and VERIFICATION FAILED runs,
+  verifications and conversions have the outcome `error` and the verdict as
+  message; (d) an unwritable audit log refuses on dfnix and
   is stated in the report and the UI elsewhere; (e) tests no longer mirror
   records into the host journal (dfcore 0.2.0).
 - **H7** Unmount: `dfdisk unmount` and `--auto-unmount` collect the mounts of
@@ -113,7 +131,8 @@ and when something was not done the report says so.
   (last four characters of the serial, the whole serial when shorter, the
   evidence number without a serial), source identity on every screen, a
   scrolling device table that keeps the serial visible, abort with confirmation.
-- **H9** Exit codes: see Breaking changes; errors are printed once.
+- **H9** Exit codes: see Breaking changes; errors are printed once; a panic
+  exits 1 (internal error) with a message instead of Rust's 101.
 - **H10** Release and packaging: releases are built only after the test job
   passed; tag, Cargo.toml, Cargo.lock and package.nix versions must agree;
   pinned Rust toolchain; `cargo install --locked --version` for cross and
@@ -130,7 +149,11 @@ and when something was not done the report says so.
   `hdparm --dco-identify` and `nvme id-ns` (read-only, on the physical disk,
   with timeouts) are recorded; `--refuse-hidden-areas` refuses.
 - **M3** Verification read the page cache: images, auxiliary files and the
-  directory are fsynced and evicted from the page cache before verification.
+  directory are fsynced and evicted from the page cache before verification. An
+  image that cannot be fsynced fails the verification (exit 4); one that cannot
+  be evicted is noted in the verification method ("the re-read may have come
+  from memory"); the method states the fsync and eviction only when they
+  happened.
 - **M4** Metadata: control characters are sanitised (no shifted E01 header
   fields), placeholders are never recorded, file names are capped at 255 bytes
   (refused, never truncated), tokens are NFC-normalised, existing outputs are
@@ -158,7 +181,9 @@ and when something was not done the report says so.
   sector is located exactly, interrupted reads are retried, and
   `--on-read-error zero-fill` continues over unreadable sectors.
 - **M12** `dfdisk verify`: a requested digest that was not computed is a failure,
-  never a pass; `.Ex01` and `.E02` segment families are recognised as EWF.
+  never a pass; `.Ex01` and `.E02` segment families are recognised as EWF; an
+  expected digest that is not 32/40/64 hex digits is a usage error (exit 2)
+  instead of a HASH MISMATCH with an addendum.
 - Low: `-r` above 255 is a usage error instead of silently becoming 2; `-m` and
   `-M` (media type and flags) are set from the source; firmware and other device
   strings are sanitised; false README claims removed; runtime tools are no longer
@@ -178,7 +203,9 @@ and when something was not done the report says so.
 - **F5** `<base>.info.json`, tool versions and command lines, kernel, host and
   dfnix revision, dfdisk and dfcore git revisions (`dfdisk --version`), clock and
   NTP state with the RTC offset, documented exit codes, `dfdisk check` (dry run),
-  `acquire --json`, `list --json`.
+  `acquire --json`, `list --json`; `check`, `verify` and `unmount` with
+  `--json` and the error object carry `schema_version` 1 and are documented in
+  docs/report-format.md.
 - **F6** Re-verification as an audited addendum (`dfdisk verify`, TUI re-verify
   screen, `--report`, `--pieces`) and an optional second read of the source
   (`--verify-source`).
@@ -196,7 +223,7 @@ and when something was not done the report says so.
   (`$XDG_CONFIG_HOME/dfdisk/profile.toml`) with an evidence-number suggestion.
 - **F12** SMART policy `--smart off|basic|full`, before and (rescue) after the
   acquisition.
-- `--expect-serial`, `--expect-wwn`, `--expect-size`, `--allow-holders`,
+- `--expect-serial`, `--expect-wwn`, `--expect-size`,
   `--allow-tmpfs`, `--allow-low-space` (also for `convert`),
   `--write-protect auto|off`, `--on-read-error stop|zero-fill`.
 - Sources are selected from the device scan by device number: partitions,

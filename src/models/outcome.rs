@@ -124,6 +124,11 @@ impl Outcome {
 
     /// [`explanation`](Self::explanation) in the terms of the engine that ran
     /// (R12): rescue verdicts name the ddrescue map areas and the remedy.
+    /// Reports use
+    /// [`ForensicInfoReport::explanation`](crate::models::info_report::ForensicInfoReport::explanation),
+    /// which picks the sentence by what actually happened (a rescue that
+    /// stopped for another reason, a second read that was compared, no
+    /// digest at all) and falls back to this one.
     pub fn explanation_for(&self, engine: EngineKind) -> &'static str {
         match (self, engine) {
             (Outcome::Incomplete, EngineKind::Rescue) => {

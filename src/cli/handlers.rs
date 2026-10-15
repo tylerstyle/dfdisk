@@ -197,6 +197,20 @@ pub fn device_table(devices: &[BlockDevice], with_smart: bool) -> String {
 // unmount
 // ---------------------------------------------------------------------------
 
+/// The `unmount --json` document (schema 1, docs/report-format.md).
+pub fn unmount_json(device: &str, result: &safety::UnmountResult) -> serde_json::Value {
+    json!({
+        "schema_version": crate::cli::CLI_JSON_SCHEMA_VERSION,
+        "device": device,
+        "mounts_before": result.mounts_before,
+        "unmounted": result.unmounted,
+        "holders": result.holders,
+        "audit_record": result.audit_hash,
+        "audit_error": result.audit_error,
+        "notes": result.notes,
+    })
+}
+
 /// `dfdisk unmount <device>`: the audited unmount of the source tree (§10).
 pub async fn handle_unmount(args: UnmountArgs, console: &Console) -> Result<i32, AcquisitionError> {
     let source = resolve_argument(&args.device)?;
@@ -222,16 +236,7 @@ pub async fn handle_unmount(args: UnmountArgs, console: &Console) -> Result<i32,
         .map_err(|e| AcquisitionError::failed(format!("the unmount stopped: {e}")))??;
     if console.json() {
         console.data(
-            &serde_json::to_string_pretty(&json!({
-                "device": device,
-                "mounts_before": result.mounts_before,
-                "unmounted": result.unmounted,
-                "holders": result.holders,
-                "audit_record": result.audit_hash,
-                "audit_error": result.audit_error,
-                "notes": result.notes,
-            }))
-            .unwrap_or_default(),
+            &serde_json::to_string_pretty(&unmount_json(&device, &result)).unwrap_or_default(),
         );
         for n in &result.notes {
             console.note(&format!("[!] {}", sanitize_line(n)));
@@ -310,11 +315,23 @@ pub fn verify_verdict(v: &ImageVerification) -> String {
 /// pieces file: both are in its verdict, its exit code, the addendum and the
 /// audit record.
 pub async fn handle_verify(
-    args: VerifyArgs,
+    mut args: VerifyArgs,
     controller: &AbortController,
     listener: &mut Option<SignalListener>,
     console: &Console,
 ) -> Result<i32, AcquisitionError> {
+    // The addendum, the result and the audit record name absolute paths (I6)
+    args.image = absolute(&args.image, "image")?;
+    args.report = args
+        .report
+        .as_deref()
+        .map(|r| absolute(r, "report"))
+        .transpose()?;
+    args.pieces = args
+        .pieces
+        .as_deref()
+        .map(|p| absolute(p, "pieces file"))
+        .transpose()?;
     let expected = match &args.report {
         Some(report) => ExpectedHashes::from_report_json(report)?,
         None => ExpectedHashes::given(args.md5.clone(), args.sha1.clone(), args.sha256.clone()),
@@ -376,6 +393,7 @@ pub async fn handle_verify(
     if console.json() {
         console.data(
             &serde_json::to_string_pretty(&json!({
+                "schema_version": crate::cli::CLI_JSON_SCHEMA_VERSION,
                 "verification": v,
                 "exit_code": code,
             }))
@@ -419,6 +437,15 @@ pub async fn handle_verify(
 // convert
 // ---------------------------------------------------------------------------
 
+/// `path` made absolute against the current directory, keeping the name the
+/// examiner typed (no symlink resolution): court-facing records (reports,
+/// addenda, audit records) never carry a relative path (I6).
+pub fn absolute(path: &Path, what: &str) -> Result<PathBuf, AcquisitionError> {
+    std::path::absolute(path).map_err(|e| {
+        AcquisitionError::usage(format!("invalid {what} path {}: {e}", path.display()))
+    })
+}
+
 /// `<base>.info.json` next to an image `<base>.<ext>` (`.raw`, `.001`,
 /// `.E01`), if it exists.
 pub fn report_next_to(image: &Path) -> Option<PathBuf> {
@@ -427,7 +454,12 @@ pub fn report_next_to(image: &Path) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// The conversion the flags describe.
+/// The conversion the flags describe. Only an explicit `--report` becomes
+/// the request's `source_report` (and must list the source image); a report
+/// next to the source is found by the converter itself, which uses it when
+/// it lists the image and otherwise ignores it with a note (C-5: the
+/// `<base>.info.json` of a rescue lists `<base>.raw`, not the `<base>.E01`
+/// made from it).
 pub fn conversion_request(args: &ConvertArgs) -> Result<ConversionRequest, AcquisitionError> {
     let target = match args.to {
         CliImageFormat::E01 => ConversionTarget::E01,
@@ -454,13 +486,14 @@ pub fn conversion_request(args: &ConvertArgs) -> Result<ConversionRequest, Acqui
             seizure_location: opt(&c.seized_location),
         }
     });
-    let output_dir = std::path::absolute(&args.output_dir).map_err(|e| {
-        AcquisitionError::usage(format!(
-            "invalid output directory {}: {e}",
-            args.output_dir.display()
-        ))
-    })?;
-    if let Some(r) = &args.report {
+    let output_dir = absolute(&args.output_dir, "output directory")?;
+    let source = absolute(&args.source, "source")?;
+    let report = args
+        .report
+        .as_deref()
+        .map(|r| absolute(r, "report"))
+        .transpose()?;
+    if let Some(r) = &report {
         if !r.is_file() {
             return Err(AcquisitionError::usage(format!(
                 "report not found: {}",
@@ -477,10 +510,10 @@ pub fn conversion_request(args: &ConvertArgs) -> Result<ConversionRequest, Acqui
         case,
         compression: compression_of(args.compression),
         split_size: split_of(args.split),
-        source_report: args.report.clone().or_else(|| report_next_to(&args.source)),
+        source_report: report,
         allow_tmpfs: args.allow_tmpfs,
         allow_low_space: args.allow_low_space,
-        ..ConversionRequest::new(args.source.clone(), target, output_dir)
+        ..ConversionRequest::new(source, target, output_dir)
     })
 }
 
@@ -501,8 +534,16 @@ pub async fn handle_convert(
         },
         req.output_dir.display()
     ));
-    if let Some(r) = &req.source_report {
-        console.say(&format!("    source report: {}", r.display()));
+    match &req.source_report {
+        Some(r) => console.say(&format!("    source report: {}", r.display())),
+        None => {
+            if let Some(r) = report_next_to(&req.source) {
+                console.say(&format!(
+                    "    source report: {} (used if it lists the source image)",
+                    r.display()
+                ));
+            }
+        }
     }
     let (tx, rx) = mpsc::channel(256);
     let mut printer = ProgressPrinter::new(console, false);
@@ -599,6 +640,25 @@ mod tests {
     }
 
     #[test]
+    fn json_documents_carry_their_schema_version() {
+        // I7: every JSON document of the CLI is versioned
+        let v = unmount_json(
+            "/dev/sdx",
+            &safety::UnmountResult {
+                unmounted: vec!["/mnt/x".into()],
+                mounts_before: vec!["/mnt/x".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["device"], "/dev/sdx");
+        assert_eq!(v["unmounted"][0], "/mnt/x");
+        let e = crate::cli::acquire::error_json(&AcquisitionError::refused("x"));
+        assert_eq!(e["schema_version"], 1);
+        assert_eq!(e["error"]["exit_code"], 3);
+    }
+
+    #[test]
     fn conversion_requests_from_flags() {
         use crate::cli::args::{Cli, Commands};
         use clap::Parser;
@@ -627,10 +687,23 @@ mod tests {
             "case fields come from the source report"
         );
         assert!(req.output_dir.is_absolute());
+        // C-5: a report next to the source is not "given": the converter
+        // finds it and ignores it with a note when it does not list the
+        // image; only --report is strict
+        assert!(req.source_report.is_none(), "{:?}", req.source_report);
         assert_eq!(
-            req.source_report.as_deref(),
+            report_next_to(&src).as_deref(),
             Some(tmp.path().join("c_ea01_e1_SER.info.json").as_path())
         );
+        let given = tmp.path().join("c_ea01_e1_SER.info.json");
+        let req = conversion_request(&parse(&[
+            "--to",
+            "e01",
+            "--report",
+            given.to_str().unwrap(),
+        ]))
+        .unwrap();
+        assert_eq!(req.source_report.as_deref(), Some(given.as_path()));
         let req = conversion_request(&parse(&[
             "--to", "e01", "-C", "K1", "-E", "E2", "-e", "Exa", "--split", "none",
         ]))
@@ -651,6 +724,25 @@ mod tests {
         let e = conversion_request(&parse(&["--to", "e01", "--report", "/nonexistent.json"]))
             .unwrap_err();
         assert_eq!(e.exit_code(), 2);
+        // I6: a relative source and report become absolute (as typed, not
+        // resolved), so the records never carry a relative path
+        let mut rel = parse(&["--to", "e01", "--report", "rel/r.info.json"]);
+        rel.source = PathBuf::from("rel/img.raw");
+        let e = conversion_request(&rel).unwrap_err();
+        assert!(
+            e.message.contains(&format!(
+                "{}",
+                std::env::current_dir()
+                    .unwrap()
+                    .join("rel/r.info.json")
+                    .display()
+            )),
+            "{e}"
+        );
+        rel.report = None;
+        let req = conversion_request(&rel).unwrap();
+        assert!(req.source.is_absolute());
+        assert!(req.source.ends_with("rel/img.raw"));
         // The destination allowances reach the converter
         let req = conversion_request(&parse(&[
             "--to",

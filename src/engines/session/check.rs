@@ -3,7 +3,7 @@
 //! directory, no reservation, no audit record, no read-only flag (the plan is
 //! described), no SMART JSON file. The exclusive open is tried and released.
 
-use super::{destination_checks, identify, source_safety, validate, SessionHost};
+use super::{check_tools, destination_checks, identify, source_safety, validate, SessionHost};
 use crate::discovery::writeprotect::{self, WriteProtectDecision};
 use crate::engines::error::{AcquisitionError, ErrorKind};
 use crate::engines::preflight::DestinationFacts;
@@ -22,7 +22,8 @@ use std::path::PathBuf;
 /// One reason the acquisition would not start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CheckProblem {
-    /// "request", "identity", "source safety", "exclusive open", "destination", "capacity"
+    /// "request", "tools", "identity", "source safety", "exclusive open",
+    /// "destination", "capacity"
     pub step: String,
     pub kind: ErrorKind,
     pub message: String,
@@ -87,7 +88,7 @@ impl CheckReport {
             if self.ready {
                 "READY: every check passed (nothing was written or changed)"
             } else {
-                "NOT READY: the acquisition would be refused"
+                "NOT READY: the acquisition would not start (see below)"
             },
         );
         row("Source", &self.device);
@@ -224,6 +225,9 @@ pub(super) async fn run_check(
             report.destination = Some(d.facts);
         }
         Err(e) => report.problem("destination", e),
+    }
+    if let Err(e) = check_tools(host, &request.config) {
+        report.problem("tools", e);
     }
 
     // Identify-class queries only when nothing refused the source (P4)
