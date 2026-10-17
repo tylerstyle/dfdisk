@@ -156,6 +156,13 @@ pub fn panic_route(ui_thread: ThreadId, current: ThreadId) -> PanicRoute {
     }
 }
 
+/// A line on stderr, also when the terminal is gone (`eprintln!` panics on
+/// a dead tty)
+fn say(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(io::stderr(), "{line}");
+}
+
 /// Await the UI; a panic of the UI itself becomes an error (exit 1, not the
 /// runtime's 101).
 async fn guard_ui<F, T>(ui: F) -> Result<T, Box<dyn std::error::Error>>
@@ -209,7 +216,7 @@ pub async fn run_tui_with(
         for line in
             finish_background_work(&controller, &work, PANIC_ABORT_WAIT, PANIC_FORCE_WAIT).await
         {
-            eprintln!("{line}");
+            say(&line);
         }
     }
     let _ = std::panic::take_hook();
@@ -221,13 +228,13 @@ pub async fn run_tui_with(
         .map(|mut k| std::mem::take(&mut *k))
         .unwrap_or_default();
     for p in kept {
-        eprintln!("dfdisk: internal error in background work: {p}");
+        say(&format!("dfdisk: internal error in background work: {p}"));
     }
 
     // The terminal is ours again: say what was not acknowledged on screen
     let (line, code) = res?;
     if let Some(line) = line {
-        eprintln!("{line}");
+        say(&line);
     }
     Ok(code)
 }
@@ -259,6 +266,9 @@ async fn run_tui_inner(
             // running acquisition: its report is written first
             if let Err(e) = terminal.draw(|frame| ui::render(frame, &mut app)) {
                 if !app.busy() {
+                    // Most likely the terminal is gone: dropping `terminal`
+                    // would make ratatui `eprintln!`, which panics on a dead tty
+                    std::mem::forget(terminal);
                     return Err(e.into());
                 }
                 app.headless = true;
@@ -299,6 +309,8 @@ async fn run_tui_inner(
     }
     let code = app.exit_code();
     if app.headless {
+        // Nothing more goes to the terminal, not even ratatui's cursor reset
+        std::mem::forget(terminal);
         return Ok((None, code));
     }
     let _ = terminal.show_cursor();

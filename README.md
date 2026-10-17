@@ -70,7 +70,7 @@ Every release has an amd64 package with a checksum next to it. It is built on
 Ubuntu 22.04, so it needs Ubuntu 22.04 or Debian 12 or newer.
 
 ```bash
-VERSION=0.2.0
+VERSION=0.2.1
 wget "https://github.com/tylerstyle/dfdisk/releases/download/v${VERSION}/dfdisk_${VERSION}-1_amd64.deb"{,.sha256}
 sha256sum -c "dfdisk_${VERSION}-1_amd64.deb.sha256"
 sudo apt install "./dfdisk_${VERSION}-1_amd64.deb"
@@ -118,7 +118,7 @@ licenses and `docs/`, each with a checksum:
 - `aarch64-unknown-linux-gnu`: 64-bit ARM
 
 ```bash
-VERSION=0.2.0
+VERSION=0.2.1
 TARGET=x86_64-unknown-linux-musl
 wget "https://github.com/tylerstyle/dfdisk/releases/download/v${VERSION}/dfdisk-v${VERSION}-${TARGET}.tar.gz"{,.sha256}
 sha256sum -c "dfdisk-v${VERSION}-${TARGET}.tar.gz.sha256"

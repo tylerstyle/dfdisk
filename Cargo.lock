@@ -341,7 +341,6 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
- "futures-core",
  "mio",
  "parking_lot",
  "rustix",
@@ -469,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "dfdisk"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",

@@ -1,6 +1,6 @@
 [package]
 name = "dfdisk"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 # Minimum supported Rust version, checked by the CI "MSRV" job with the locked
 # dependencies (ratatui 0.30 and time 0.3.55 need 1.88)
@@ -52,7 +52,7 @@ assets = [
 [dependencies]
 dfcore = { path = "../dfcore" }
 ratatui = "0.30"
-crossterm = { version = "0.29", features = ["event-stream"] }
+crossterm = "0.29"
 tokio = { version = "1.53", features = ["full"] }
 clap = { version = "4.6", features = ["derive", "cargo"] }
 serde = { version = "1.0", features = ["derive"] }

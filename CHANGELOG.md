@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-17
+
+### Fixed
+
+- **A closed terminal no longer costs a CPU core.** When the TUI's terminal
+  goes away (the window is closed, SSH drops), a running job continues headless
+  to its report, as before. But crossterm's event stream then spun at full CPU
+  on the dead terminal for the rest of the job: one core lost to an acquisition
+  that is bound by hashing. The TUI now reads the terminal on a thread of its
+  own that checks for the hang-up before it asks crossterm for input; that
+  thread ends at once and the job has the machine to itself.
+- **Exit code after a headless job.** When a job finished headless, dropping
+  the terminal made ratatui write to the dead terminal, which panicked, and
+  dfdisk exited 1 (internal error) instead of with the job's code. Nothing is
+  written to a terminal that is gone any more; the exit code is the job's (0
+  for a verified image).
+- An idle TUI whose terminal goes away without a SIGHUP reaching it exits 0
+  instead of 1.
+
 ## [0.2.0] - 2026-10-15
 
 dfdisk 0.2.0 is a rework driven by a review of 0.1.10 (items C1-C2,
