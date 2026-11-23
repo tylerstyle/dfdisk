@@ -22,7 +22,7 @@ env:
 jobs:
   check-version:
     name: Version check
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -56,16 +56,38 @@ jobs:
   test:
     name: Test & Lint
     needs: check-version
-    runs-on: ubuntu-22.04
+    # Ubuntu 22.04 in a container, so the job does not depend on a hosted
+    # runner image of that release: the distribution of the .deb build, so the
+    # tool tests run against the ewf-tools and gddrescue packages it depends on
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    env:
+      # Outside root's home, so the unprivileged user can use the toolchain
+      CARGO_HOME: /opt/rust/cargo
+      RUSTUP_HOME: /opt/rust/rustup
+    defaults:
+      run:
+        # Every step but the two that set the container up runs unprivileged
+        shell: runuser -u ci -- bash -e {0}
     steps:
+      # A bare ubuntu:22.04: git has to be there before the checkout (without
+      # it the checkout is a download with no .git, and build.rs embeds
+      # "unknown" revisions), and the tests run as an unprivileged user as on
+      # a hosted runner (root would pass permission checks the tests rely on)
+      - name: Install git, the build tools and the external tools the tests run
+        shell: bash
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git jq gcc libc6-dev util-linux ewf-tools gddrescue
+          # The user gets the uid that owns the workspace, so that what it
+          # writes there belongs to the runner's user outside the container
+          uid=$(stat -c %u "$GITHUB_WORKSPACE")
+          [ "$uid" -ne 0 ] || uid=1001
+          useradd --create-home --uid "$uid" ci
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Checkout sibling dfcore at the locked revision
-        run: |
-          rev=$(jq -r '.nodes.dfcore.locked.rev' flake.lock)
-          git clone https://github.com/tylerstyle/dfcore.git ../dfcore
-          git -C ../dfcore checkout --detach "$rev"
 
       - name: Set up Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -73,10 +95,19 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
 
-      - name: Install the external tools the tests run
+      - name: Hand the sources and the toolchain to the unprivileged user
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ewf-tools gddrescue
+          mkdir -p "$GITHUB_WORKSPACE/target/tmp"
+          chown -R ci: "$GITHUB_WORKSPACE" "$CARGO_HOME" "$RUSTUP_HOME"
+          # ../dfcore is cloned by that user
+          chown ci: "$GITHUB_WORKSPACE/.."
+
+      - name: Checkout sibling dfcore at the locked revision
+        run: |
+          rev=$(jq -r '.nodes.dfcore.locked.rev' flake.lock)
+          git clone https://github.com/tylerstyle/dfcore.git ../dfcore
+          git -C ../dfcore checkout --detach "$rev"
 
       - name: Check formatting
         run: cargo fmt --check
@@ -87,30 +118,58 @@ jobs:
       - name: Run the tests (tool tests must run, not skip)
         env:
           DFDISK_REQUIRE_TOOLS: "1"
-        run: cargo test --locked
+        run: |
+          export TMPDIR="$GITHUB_WORKSPACE/target/tmp"
+          cargo test --locked
 
   build-binaries:
     name: Build Binary (${{ matrix.target }})
     needs: [check-version, test]
-    # ubuntu-22.04 (glibc 2.35), the oldest runner image: the native x86_64 gnu
-    # binary needs no newer glibc (the cross targets use the cross images)
-    runs-on: ubuntu-22.04
+    # The native x86_64 gnu binary is built in an Ubuntu 22.04 container
+    # (glibc 2.35), so it needs no newer glibc. The cross targets run on the
+    # runner itself (no container, so cross can start its own) and take
+    # their C library from the cross images.
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.container }}
+    defaults:
+      run:
+        # The same shell with and without a container (a container's default is sh)
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             use_cross: false
+            container: ubuntu:22.04
           - target: x86_64-unknown-linux-musl
             use_cross: true
+            container: ''
           - target: aarch64-unknown-linux-gnu
             use_cross: true
+            container: ''
     env:
       VERSION: ${{ needs.check-version.outputs.version }}
       TARGET: ${{ matrix.target }}
     steps:
+      # git before the checkout: without it the checkout is a download with
+      # no .git, and build.rs embeds "unknown" revisions
+      - name: Install git and the build tools (container)
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git jq gcc libc6-dev file
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The job runs as root in a workspace that belongs to the runner's
+      # user. The checkout marks it safe for its own git calls only; without
+      # this, git refuses the repository in build.rs ("dubious ownership") and
+      # the binary's revision is "unknown".
+      - name: Let git read the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Checkout sibling dfcore at the locked revision
         run: |
@@ -142,6 +201,28 @@ jobs:
           "target/$TARGET/release/dfdisk" --version
           file "target/$TARGET/release/dfdisk"
 
+      # build.rs embeds "unknown" when git cannot read a checkout, and
+      # "<rev>-dirty" when a tracked file differs: neither is a release
+      - name: The binary names the commit it was built from and the locked dfcore
+        env:
+          BINARY: target/${{ matrix.target }}/release/dfdisk
+        run: |
+          dfcore_rev=$(jq -r '.nodes.dfcore.locked.rev' flake.lock)
+          for rev in "$GITHUB_SHA" "$dfcore_rev"; do
+            if ! printf '%s' "$rev" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::'$rev' is not a commit"
+              exit 1
+            fi
+            if ! grep -aqF "$rev" "$BINARY"; then
+              echo "::error::$BINARY does not contain the revision $rev"
+              exit 1
+            fi
+            if grep -aqF "$rev-dirty" "$BINARY"; then
+              echo "::error::$BINARY was built from a modified checkout of $rev"
+              exit 1
+            fi
+          done
+
       - name: Package tarball
         run: |
           PKG_NAME="dfdisk-v${VERSION}-${TARGET}"
@@ -163,13 +244,33 @@ jobs:
   build-deb:
     name: Build Debian Package (.deb)
     needs: [check-version, test]
-    # Ubuntu 22.04 (glibc 2.35): $auto then asks for no newer C library than that
-    runs-on: ubuntu-22.04
+    # An Ubuntu 22.04 container (glibc 2.35): $auto then asks for no newer C
+    # library than that, and the package is installed on a bare Ubuntu 22.04
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
     env:
       VERSION: ${{ needs.check-version.outputs.version }}
     steps:
+      # git before the checkout (see build-binaries); dpkg-dev has the
+      # dpkg-shlibdeps that resolves $auto
+      - name: Install git and the build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git jq gcc libc6-dev dpkg-dev
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The job runs as root in a workspace that belongs to the runner's
+      # user. The checkout marks it safe for its own git calls only; without
+      # this, git refuses the repository in build.rs ("dubious ownership") and
+      # the binary's revision is "unknown".
+      - name: Let git read the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Checkout sibling dfcore at the locked revision
         run: |
@@ -201,10 +302,32 @@ jobs:
             fi
           done
 
+      # build.rs embeds "unknown" when git cannot read a checkout, and
+      # "<rev>-dirty" when a tracked file differs: neither is a release
+      - name: The binary names the commit it was built from and the locked dfcore
+        env:
+          BINARY: target/release/dfdisk
+        run: |
+          dfcore_rev=$(jq -r '.nodes.dfcore.locked.rev' flake.lock)
+          for rev in "$GITHUB_SHA" "$dfcore_rev"; do
+            if ! printf '%s' "$rev" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::'$rev' is not a commit"
+              exit 1
+            fi
+            if ! grep -aqF "$rev" "$BINARY"; then
+              echo "::error::$BINARY does not contain the revision $rev"
+              exit 1
+            fi
+            if grep -aqF "$rev-dirty" "$BINARY"; then
+              echo "::error::$BINARY was built from a modified checkout of $rev"
+              exit 1
+            fi
+          done
+
       - name: Install the package and run it
         run: |
-          sudo apt-get update
-          sudo apt-get install -y "./target/debian/dfdisk_${VERSION}-1_amd64.deb"
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y "./target/debian/dfdisk_${VERSION}-1_amd64.deb"
           dfdisk --version
           dpkg -L dfdisk
 

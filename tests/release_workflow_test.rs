@@ -351,3 +351,226 @@ exit 0
     let calls = std::fs::read_to_string(&calls).unwrap();
     assert!(calls.contains("git push origin main"), "{calls}");
 }
+
+fn ci_workflow() -> Option<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/ci.yml");
+    std::fs::read_to_string(&path).ok()
+}
+
+/// The lines of job `id` (two spaces of indent under `jobs:`), up to the next job.
+fn job<'a>(workflow: &'a str, id: &str) -> Vec<&'a str> {
+    let lines: Vec<&str> = workflow.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| *l == format!("  {id}:"))
+        .unwrap_or_else(|| panic!("no job {id:?}"));
+    let end = (start + 1..lines.len())
+        .find(|&i| {
+            let l = lines[i];
+            l.starts_with("  ") && !l.starts_with("   ") && l.trim_end().ends_with(':')
+        })
+        .unwrap_or(lines.len());
+    lines[start..end].to_vec()
+}
+
+/// Nothing runs on the hosted Ubuntu 22.04 image any more; what needs that
+/// distribution (its ewf-tools and gddrescue for the tests, its glibc for the
+/// native binary and the .deb) runs in an ubuntu:22.04 container, and the
+/// cross builds run outside one.
+#[test]
+fn jobs_that_need_ubuntu_22_04_run_in_its_container() {
+    let (Some(release), Some(ci)) = (workflow(), ci_workflow()) else {
+        return;
+    };
+    for (name, wf) in [("release.yml", &release), ("ci.yml", &ci)] {
+        for line in wf.lines() {
+            let l = line.trim();
+            assert!(
+                !(l.starts_with("runs-on:") && l.contains("22.04")),
+                "{name}: {l}"
+            );
+        }
+    }
+    for (name, wf, id) in [
+        ("ci.yml", &ci, "test"),
+        ("release.yml", &release, "test"),
+        ("release.yml", &release, "build-deb"),
+    ] {
+        let lines = job(wf, id);
+        assert!(
+            lines.iter().any(|l| l.trim() == "container: ubuntu:22.04"),
+            "{name} {id}: {lines:#?}"
+        );
+    }
+    // The tests run as an unprivileged user in both workflows
+    for (name, wf) in [("ci.yml", &ci), ("release.yml", &release)] {
+        let lines = job(wf, "test");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.trim() == "shell: runuser -u ci -- bash -e {0}"),
+            "{name} test: {lines:#?}"
+        );
+    }
+    // The matrix: a container for the native target only
+    let lines = job(&release, "build-binaries");
+    let entries: Vec<(String, String)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim().starts_with("- target: "))
+        .map(|(i, l)| {
+            let target = l.trim().trim_start_matches("- target: ").to_string();
+            let container = lines[i + 1..]
+                .iter()
+                .take_while(|l| !l.trim().starts_with("- "))
+                .find_map(|l| l.trim().strip_prefix("container: "))
+                .unwrap_or_else(|| panic!("{target} names no container"))
+                .to_string();
+            (target, container)
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            (
+                "x86_64-unknown-linux-gnu".to_string(),
+                "ubuntu:22.04".to_string()
+            ),
+            ("x86_64-unknown-linux-musl".to_string(), "''".to_string()),
+            ("aarch64-unknown-linux-gnu".to_string(), "''".to_string()),
+        ]
+    );
+}
+
+/// git must be installed before the checkout in every container job: without
+/// it the checkout has no .git and the binary's revisions are "unknown".
+#[test]
+fn container_jobs_install_git_before_the_checkout() {
+    let (Some(release), Some(ci)) = (workflow(), ci_workflow()) else {
+        return;
+    };
+    for (name, wf, id) in [
+        ("ci.yml", &ci, "test"),
+        ("release.yml", &release, "test"),
+        ("release.yml", &release, "build-binaries"),
+        ("release.yml", &release, "build-deb"),
+    ] {
+        let lines = job(wf, id);
+        let checkout = lines
+            .iter()
+            .position(|l| l.trim().starts_with("uses: actions/checkout@"))
+            .unwrap_or_else(|| panic!("{name} {id}: no checkout"));
+        let installs_git = lines[..checkout].iter().any(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            words.contains(&"git") && words.contains(&"ca-certificates")
+        });
+        assert!(
+            installs_git,
+            "{name} {id}: git is not installed before the checkout"
+        );
+    }
+}
+
+#[test]
+fn a_release_binary_must_name_its_commit_and_the_locked_dfcore() {
+    let Some(wf) = workflow() else {
+        return;
+    };
+    if Command::new("jq").arg("--version").output().is_err() {
+        eprintln!("skipping: jq is not installed");
+        return;
+    }
+    let name = "The binary names the commit it was built from and the locked dfcore";
+    assert_eq!(
+        wf.matches(&format!("- name: {name}")).count(),
+        2,
+        "the tarballs' binaries and the .deb's binary are both checked"
+    );
+    let script = step_script(&wf, name);
+    let commit = "abcdef0123456789abcdef0123456789abcdef01";
+    let dfcore = "2222222222222222222222222222222222222222";
+    let run = |binary: &str, sha: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("flake.lock"),
+            format!(r#"{{"nodes":{{"dfcore":{{"locked":{{"rev":"{dfcore}"}}}}}}}}"#),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("dfdisk"), binary).unwrap();
+        bash(
+            &script,
+            dir.path(),
+            &[("GITHUB_SHA", sha), ("BINARY", "dfdisk")],
+            None,
+        )
+    };
+    let good = format!("\0ELF\0dfdisk git revision: {commit}\0dfcore {dfcore}\0");
+    let r = run(&good, commit);
+    assert!(r.ok, "{}{}", r.stdout, r.stderr);
+
+    for (what, binary, expected) in [
+        (
+            "no dfdisk revision",
+            format!("\0unknown\0{dfcore}\0"),
+            "does not contain the revision abcdef",
+        ),
+        (
+            "no dfcore revision",
+            format!("\0{commit}\0unknown\0"),
+            "does not contain the revision 2222",
+        ),
+        (
+            "another commit",
+            format!("\0{}\0{dfcore}\0", commit.replace('a', "b")),
+            "does not contain the revision abcdef",
+        ),
+        (
+            "modified dfdisk checkout",
+            format!("\0{commit}-dirty\0{dfcore}\0"),
+            "modified checkout of abcdef",
+        ),
+        (
+            "modified dfcore checkout",
+            format!("\0{commit}\0{dfcore}-dirty\0"),
+            "modified checkout of 2222",
+        ),
+    ] {
+        let r = run(&binary, commit);
+        assert!(!r.ok, "{what} must fail: {}", r.stdout);
+        assert!(r.stdout.contains(expected), "{what}: {}", r.stdout);
+    }
+    // No commit to compare with: an empty needle would match anything
+    let r = run(&good, "");
+    assert!(
+        !r.ok && r.stdout.contains("is not a commit"),
+        "{}",
+        r.stdout
+    );
+}
+
+/// The release builds run as root in a workspace owned by the runner's user.
+/// The checkout action marks it safe for its own git calls only, so each
+/// build marks it safe before cargo runs build.rs (a dry run of 0.2.2 built
+/// binaries with an "unknown" revision without this).
+#[test]
+fn root_builds_mark_the_checkout_safe_for_git() {
+    let Some(wf) = workflow() else {
+        return;
+    };
+    for id in ["build-binaries", "build-deb"] {
+        let lines = job(&wf, id);
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.trim().starts_with(needle))
+                .unwrap_or_else(|| panic!("{id}: no line starting with {needle:?}"))
+        };
+        let checkout = at("uses: actions/checkout@");
+        let safe = at("run: git config --global --add safe.directory \"$GITHUB_WORKSPACE\"");
+        let build = at("- name: Build ");
+        assert!(
+            checkout < safe && safe < build,
+            "{id}: {checkout} {safe} {build}"
+        );
+    }
+}

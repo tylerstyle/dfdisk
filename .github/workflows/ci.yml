@@ -24,18 +24,38 @@ jobs:
   test:
     name: Test & Lint
     if: github.event_name != 'schedule'
-    # Same distribution as the .deb build: the tool tests run against the
-    # ewf-tools and gddrescue packages the .deb depends on
-    runs-on: ubuntu-22.04
+    # Ubuntu 22.04 in a container, so the job does not depend on a hosted
+    # runner image of that release: the distribution of the .deb build, so the
+    # tool tests run against the ewf-tools and gddrescue packages it depends on
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    env:
+      # Outside root's home, so the unprivileged user can use the toolchain
+      CARGO_HOME: /opt/rust/cargo
+      RUSTUP_HOME: /opt/rust/rustup
+    defaults:
+      run:
+        # Every step but the two that set the container up runs unprivileged
+        shell: runuser -u ci -- bash -e {0}
     steps:
+      # A bare ubuntu:22.04: git has to be there before the checkout (without
+      # it the checkout is a download with no .git, and build.rs embeds
+      # "unknown" revisions), and the tests run as an unprivileged user as on
+      # a hosted runner (root would pass permission checks the tests rely on)
+      - name: Install git, the build tools and the external tools the tests run
+        shell: bash
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git jq gcc libc6-dev util-linux ewf-tools gddrescue
+          # The user gets the uid that owns the workspace, so that what it
+          # writes there belongs to the runner's user outside the container
+          uid=$(stat -c %u "$GITHUB_WORKSPACE")
+          [ "$uid" -ne 0 ] || uid=1001
+          useradd --create-home --uid "$uid" ci
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Checkout sibling dfcore at the locked revision
-        run: |
-          rev=$(jq -r '.nodes.dfcore.locked.rev' flake.lock)
-          git clone https://github.com/tylerstyle/dfcore.git ../dfcore
-          git -C ../dfcore checkout --detach "$rev"
 
       - name: Set up Rust ${{ env.RUST_TOOLCHAIN }}
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -43,13 +63,23 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
 
-      - name: Install the external tools the tests run
+      - name: Hand the sources and the toolchain to the unprivileged user
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ewf-tools gddrescue
+          mkdir -p "$GITHUB_WORKSPACE/target/tmp"
+          chown -R ci: "$GITHUB_WORKSPACE" "$CARGO_HOME" "$RUSTUP_HOME"
+          # ../dfcore is cloned by that user
+          chown ci: "$GITHUB_WORKSPACE/.."
+
+      - name: Checkout sibling dfcore at the locked revision
+        run: |
+          rev=$(jq -r '.nodes.dfcore.locked.rev' flake.lock)
+          git clone https://github.com/tylerstyle/dfcore.git ../dfcore
+          git -C ../dfcore checkout --detach "$rev"
 
       - name: Tool versions
         run: |
+          id
           ewfacquire -V | head -n 1
           ddrescue --version | head -n 1
           cc --version | head -n 1
@@ -60,15 +90,19 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # The tests' scratch space is in the workspace, on the runner's disk as
+      # before (dfdisk refuses destinations in memory and reads with O_DIRECT)
       - name: Run the tests (tool tests must run, not skip)
         env:
           DFDISK_REQUIRE_TOOLS: "1"
-        run: cargo test --locked
+        run: |
+          export TMPDIR="$GITHUB_WORKSPACE/target/tmp"
+          cargo test --locked
 
   msrv:
     name: MSRV (rust-version)
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

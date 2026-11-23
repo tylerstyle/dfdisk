@@ -48,22 +48,29 @@ git push origin v0.2.0
 
 | Asset | Built by |
 |-------|----------|
-| `dfdisk-v<version>-x86_64-unknown-linux-gnu.tar.gz` (+ `.sha256`) | cargo on ubuntu-22.04 |
+| `dfdisk-v<version>-x86_64-unknown-linux-gnu.tar.gz` (+ `.sha256`) | cargo in an `ubuntu:22.04` container |
 | `dfdisk-v<version>-x86_64-unknown-linux-musl.tar.gz` (+ `.sha256`) | cross (static binary) |
 | `dfdisk-v<version>-aarch64-unknown-linux-gnu.tar.gz` (+ `.sha256`) | cross |
-| `dfdisk_<version>-1_amd64.deb` (+ `.deb.sha256`) | cargo-deb on ubuntu-22.04 |
+| `dfdisk_<version>-1_amd64.deb` (+ `.deb.sha256`) | cargo-deb in an `ubuntu:22.04` container |
 
 Each tarball holds the binary, README.md, CHANGELOG.md, the license files and
 `docs/`. The .deb job checks that `Depends` names libc6 and every external tool,
 installs the package with apt on Ubuntu 22.04 and runs `dfdisk --version`.
+
+The jobs that need Ubuntu 22.04 (the tests, the native x86_64 build and the
+.deb) run in an `ubuntu:22.04` container on an `ubuntu-24.04` runner; the
+tests run there as an unprivileged user. The cross builds run on the runner
+itself. Both the native build and the .deb build fail unless the binary
+contains the commit it was built from and the dfcore revision of `flake.lock`
+(a checkout git cannot read would embed `unknown`).
 
 ## libewf releases the E01 engine runs with
 
 The tests run against three libewf releases, and a release needs all three
 green: 20231119 (`nix build .#default`), 20140816
 (`.#checks.x86_64-linux.libewf-legacy`) and 20140807, Ubuntu 22.04's
-`ewf-tools`, which the .deb depends on (the CI and release test jobs on
-`ubuntu-22.04`, `scripts/test-ubuntu.sh`). 20140807 is not 20140816:
+`ewf-tools`, which the .deb depends on (the CI and release test jobs in
+an `ubuntu:22.04` container, `scripts/test-ubuntu.sh`). 20140807 is not 20140816:
 
 - ewfacquire 20140807 crashes (SIGSEGV) on any `-r`: its option parser hands
   the `-b` value to the retry setting. The same holds for every libewf from
