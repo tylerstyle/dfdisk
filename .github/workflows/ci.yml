@@ -5,6 +5,9 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  schedule:
+    # Weekly RustSec check even when no PRs are opened
+    - cron: "0 6 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -14,11 +17,13 @@ env:
   # Toolchain for fmt, clippy and the tests; the release workflow uses the same
   # version. Bump both together (docs/RELEASING.md).
   RUST_TOOLCHAIN: "1.100.0"
+  CARGO_AUDIT_VERSION: "0.23.0"
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
     name: Test & Lint
+    if: github.event_name != 'schedule'
     # Same distribution as the .deb build: the tool tests run against the
     # ewf-tools and gddrescue packages the .deb depends on
     runs-on: ubuntu-22.04
@@ -62,6 +67,7 @@ jobs:
 
   msrv:
     name: MSRV (rust-version)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
@@ -93,6 +99,7 @@ jobs:
 
   nix:
     name: Nix Build
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -110,3 +117,24 @@ jobs:
 
       - name: The same against libewf-legacy (20140816, the Debian/Ubuntu ewf-tools line)
         run: nix build -L .#checks.x86_64-linux.libewf-legacy
+
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Install cargo-audit ${{ env.CARGO_AUDIT_VERSION }}
+        run: cargo install --locked --version "$CARGO_AUDIT_VERSION" cargo-audit
+
+      # Vulnerabilities always fail; --deny unsound also fails on soundness
+      # advisories while leaving unmaintained/yanked notices as warnings so a
+      # new unmaintained notice does not unexpectedly break main.
+      - name: Audit Cargo.lock
+        run: cargo audit --deny unsound

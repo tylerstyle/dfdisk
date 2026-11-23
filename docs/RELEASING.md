@@ -91,6 +91,7 @@ pass `scripts/test-ubuntu.sh` before it is merged, not only the Nix builds.
 | Rust toolchain for fmt, clippy, tests and release builds | `RUST_TOOLCHAIN` in `ci.yml` and `release.yml` | keep both equal |
 | cross | `CROSS_VERSION` in `release.yml` | `cargo install --locked --version` |
 | cargo-deb | `CARGO_DEB_VERSION` in `release.yml` | `cargo install --locked --version` |
+| cargo-audit | `CARGO_AUDIT_VERSION` in `ci.yml` | `cargo install --locked --version` |
 | Minimum supported Rust | `rust-version` in `Cargo.toml` | checked by the CI job "MSRV" |
 
 To move to a newer toolchain, run `cargo clippy --all-targets -- -D warnings`

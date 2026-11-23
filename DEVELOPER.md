@@ -96,7 +96,8 @@ that way in new tests.
   pinned toolchain;
 - a build with the minimum supported Rust version (`rust-version` in
   Cargo.toml);
-- the Nix builds (default and libewf-legacy).
+- the Nix builds (default and libewf-legacy);
+- `cargo audit --deny unsound` against `Cargo.lock` (also on a weekly schedule).
 
 The CI checks out dfcore next to dfdisk at the revision locked in `flake.lock`.
 
