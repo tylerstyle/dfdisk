@@ -19,7 +19,7 @@
 
 use crate::models::provenance::{CommandRecord, ProvenanceRecorder};
 use crate::models::text::sanitize_line;
-use chrono::Utc;
+use crate::models::timestamp::UtcTime;
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
@@ -489,7 +489,7 @@ fn exit_parts(status: Option<std::process::ExitStatus>) -> (Option<i32>, Option<
 fn spawn_failure(
     spec: &ProcessSpec,
     err: io::Error,
-    started: chrono::DateTime<Utc>,
+    started: UtcTime,
     recorder: Option<&ProvenanceRecorder>,
 ) -> io::Error {
     let message = format!("cannot run {}: {}", spec.program_name(), err);
@@ -497,7 +497,7 @@ fn spawn_failure(
         r.record_command(CommandRecord {
             argv: spec.argv(),
             started,
-            ended: Utc::now(),
+            ended: UtcTime::now(),
             exit_code: None,
             signal: None,
             stop: None,
@@ -512,7 +512,7 @@ fn spawn_failure(
 #[allow(clippy::too_many_arguments)]
 fn finish_record(
     spec: &ProcessSpec,
-    started: chrono::DateTime<Utc>,
+    started: UtcTime,
     t0: Instant,
     status: Option<std::process::ExitStatus>,
     stopper: Stopper,
@@ -523,7 +523,7 @@ fn finish_record(
     let record = CommandRecord {
         argv: spec.argv(),
         started,
-        ended: Utc::now(),
+        ended: UtcTime::now(),
         exit_code,
         signal,
         stop: stopper.description(),
@@ -611,7 +611,7 @@ pub async fn run<F>(
 where
     F: FnMut(ProcessEvent<'_>),
 {
-    let started = Utc::now();
+    let started = UtcTime::now();
     let t0 = Instant::now();
     let mut cmd = tokio::process::Command::new(&spec.program);
     cmd.args(&spec.args)
@@ -758,7 +758,7 @@ pub fn run_blocking(
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc;
 
-    let started = Utc::now();
+    let started = UtcTime::now();
     let t0 = Instant::now();
     let mut cmd = std::process::Command::new(&spec.program);
     cmd.args(&spec.args)

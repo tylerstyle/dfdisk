@@ -31,7 +31,7 @@ use crate::models::device::{BlockDevice, DeviceSafety, Partition, SmartSnapshot}
 use crate::models::identity::{SerialCandidate, SerialSource, SourceIdentity, SourceKind};
 use crate::models::protection::RegistryPresence;
 use crate::models::text::sanitize_opt;
-use chrono::{DateTime, Utc};
+use crate::models::timestamp::UtcTime;
 use dfcore::lsblk::FlatDevice;
 use dfcore::protected::Registry;
 use dfcore::sysfs::{parse_dev_num, DevNum};
@@ -144,7 +144,7 @@ pub struct Scan {
     pub swaps: Vec<SwapEntry>,
     /// What could not be read (mount table, swap list)
     pub notes: Vec<String>,
-    pub scanned_at: DateTime<Utc>,
+    pub scanned_at: UtcTime,
 }
 
 pub struct DeviceScanner;
@@ -667,7 +667,7 @@ pub fn scan(input: &ScanInput) -> Result<Scan, String> {
         registry: registry_presence_of(&input.registry),
         swaps: input.swaps.clone().unwrap_or_default(),
         notes,
-        scanned_at: Utc::now(),
+        scanned_at: UtcTime::now(),
     })
 }
 
@@ -872,7 +872,7 @@ pub fn find_source<'a>(sources: &'a [BlockDevice], path: &str) -> Option<&'a Blo
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceList {
     pub schema_version: u32,
-    pub generated_at: DateTime<Utc>,
+    pub generated_at: UtcTime,
     /// dfnix protected-device registry: present / absent / unreadable
     pub registry: RegistryPresence,
     /// Active swap areas of the host (/proc/swaps)

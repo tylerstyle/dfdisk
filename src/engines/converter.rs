@@ -3384,7 +3384,10 @@ async fn build_report(
 
     let elapsed = t0.elapsed();
     report.clock.finish(elapsed);
-    report.ended_at = report.clock.end_utc.unwrap_or_else(chrono::Utc::now);
+    report.ended_at = report
+        .clock
+        .end_utc
+        .unwrap_or_else(crate::models::timestamp::UtcTime::now);
     report.elapsed_seconds = elapsed.as_secs();
     report.average_speed_bytes_sec = if elapsed.as_secs_f64() > 0.0 {
         report.bytes_converted as f64 / elapsed.as_secs_f64()

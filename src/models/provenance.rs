@@ -3,7 +3,7 @@
 //! timestamps were read from.
 
 use crate::models::text::sanitize_line;
-use chrono::{DateTime, Utc};
+use crate::models::timestamp::UtcTime;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -35,8 +35,8 @@ pub const LONG_VERSION: &str = concat!(
 pub struct CommandRecord {
     /// Program and arguments exactly as passed (non-UTF-8 bytes replaced)
     pub argv: Vec<String>,
-    pub started: DateTime<Utc>,
-    pub ended: DateTime<Utc>,
+    pub started: UtcTime,
+    pub ended: UtcTime,
     /// Exit status; `None` when killed by a signal or never started
     pub exit_code: Option<i32>,
     /// Signal that ended the process, if any
@@ -305,9 +305,9 @@ pub const LABEL_NOT_SYNCHRONIZED: &str = "host system time, NOT synchronized";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClockInfo {
     /// Start of the run, host system clock, UTC
-    pub start_utc: DateTime<Utc>,
+    pub start_utc: UtcTime,
     /// End of the run, host system clock, UTC
-    pub end_utc: Option<DateTime<Utc>>,
+    pub end_utc: Option<UtcTime>,
     /// IANA zone of the host, e.g. "Europe/Berlin"
     pub timezone: Option<String>,
     /// Offset of local time from UTC at the start, e.g. "+02:00"
@@ -329,14 +329,20 @@ pub struct ClockInfo {
 
 impl Default for ClockInfo {
     fn default() -> Self {
-        Self::from_parts(Utc::now(), &TimedatectlInfo::default(), None, None, None)
+        Self::from_parts(
+            UtcTime::now(),
+            &TimedatectlInfo::default(),
+            None,
+            None,
+            None,
+        )
     }
 }
 
 impl ClockInfo {
     /// Pure constructor from probe results (tests and [`ClockInfo::capture_start`]).
     pub fn from_parts(
-        start_utc: DateTime<Utc>,
+        start_utc: UtcTime,
         timedatectl: &TimedatectlInfo,
         timezone_fallback: Option<String>,
         rtc_offset_seconds: Option<i64>,
@@ -363,7 +369,7 @@ impl ClockInfo {
     /// timeout), the kernel's NTP state otherwise, /etc/localtime (or $TZ),
     /// and the RTC offset from /sys/class/rtc/rtc0/since_epoch.
     pub fn capture_start() -> Self {
-        let start = Utc::now();
+        let start = UtcTime::now();
         let mut td = crate::engines::process::run_blocking(
             &crate::engines::process::ProcessSpec::new("timedatectl")
                 .arg("show")
@@ -389,8 +395,8 @@ impl ClockInfo {
         }
         let rtc = std::fs::read_to_string(Path::new("/sys/class/rtc/rtc0/since_epoch"))
             .ok()
-            .and_then(|s| rtc_offset_seconds(&s, start.timestamp()));
-        let offset = chrono::Local::now().offset().local_minus_utc();
+            .and_then(|s| rtc_offset_seconds(&s, start.unix_seconds()));
+        let offset = crate::models::timestamp::local_utc_offset_seconds(start);
         Self::from_parts(
             start,
             &td,
@@ -403,7 +409,7 @@ impl ClockInfo {
     /// Record the end of the run; `elapsed` comes from an `Instant` taken at
     /// the start.
     pub fn finish(&mut self, elapsed: Duration) {
-        self.end_utc = Some(Utc::now());
+        self.end_utc = Some(UtcTime::now());
         self.monotonic_elapsed_secs = elapsed.as_secs_f64();
         self.refresh_basis();
     }
@@ -514,7 +520,7 @@ mod tests {
             ntp_synchronized: Some(true),
             ..Default::default()
         };
-        let c = ClockInfo::from_parts(Utc::now(), &synced, None, Some(30), None);
+        let c = ClockInfo::from_parts(UtcTime::now(), &synced, None, Some(30), None);
         assert_eq!(c.label(), LABEL_SYNCHRONIZED);
         assert_eq!(c.timestamp_basis, LABEL_SYNCHRONIZED);
         assert_eq!(c.note, None);
@@ -525,7 +531,7 @@ mod tests {
             ..Default::default()
         };
         let mut c = ClockInfo::from_parts(
-            Utc::now(),
+            UtcTime::now(),
             &unsynced,
             Some("UTC".into()),
             Some(-4),
@@ -556,8 +562,8 @@ mod tests {
                 "-t".into(),
                 "/cases/o'brien".into(),
             ],
-            started: Utc::now(),
-            ended: Utc::now(),
+            started: UtcTime::now(),
+            ended: UtcTime::now(),
             exit_code: Some(0),
             signal: None,
             stop: None,
@@ -581,8 +587,8 @@ mod tests {
         other.set_tool_version("ewfacquire", "ewfacquire 20231119");
         other.record_command(CommandRecord {
             argv: vec!["true".into()],
-            started: Utc::now(),
-            ended: Utc::now(),
+            started: UtcTime::now(),
+            ended: UtcTime::now(),
             exit_code: Some(0),
             signal: None,
             stop: None,

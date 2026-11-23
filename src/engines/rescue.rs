@@ -62,7 +62,7 @@ use crate::models::outcome::{RangeKind, ReadErrorTable, VerificationResult};
 use crate::models::provenance::{DFDISK_GIT_REV, DFDISK_VERSION};
 use crate::models::telemetry::ProgressTelemetry;
 use crate::models::text::{plural, sanitize_line};
-use chrono::{DateTime, Utc};
+use crate::models::timestamp::UtcTime;
 use digest::Digest;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1009,7 +1009,7 @@ pub const IDENTITY_RECORD_SCHEMA: u32 = 1;
 pub struct IdentityRecord {
     pub schema_version: u32,
     pub purpose: String,
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: UtcTime,
     pub dfdisk_version: String,
     pub dfdisk_git_rev: String,
     pub base_name: String,
@@ -1029,7 +1029,7 @@ impl IdentityRecord {
         Self {
             schema_version: IDENTITY_RECORD_SCHEMA,
             purpose: "identity of the source of this rescue at its first start; a resumed rescue must be the same device of the same size".into(),
-            recorded_at: Utc::now(),
+            recorded_at: UtcTime::now(),
             dfdisk_version: DFDISK_VERSION.into(),
             dfdisk_git_rev: DFDISK_GIT_REV.into(),
             base_name: base_name.into(),
@@ -1660,8 +1660,7 @@ fn prepare_resume(ctx: &EngineContext, map: &Path) -> Result<PreparedResume, Acq
     };
     let sessions = list_sessions(dir, base);
     for s in &sessions {
-        let when =
-            |t: Option<DateTime<Utc>>| t.map(|t| t.to_rfc3339()).unwrap_or_else(|| "?".into());
+        let when = |t: Option<UtcTime>| t.map(|t| t.to_rfc3339()).unwrap_or_else(|| "?".into());
         notes.push(format!(
             "earlier session {}: {}, {} to {}, report {}{}",
             s.session,
@@ -2189,6 +2188,36 @@ mod tests {
                 });
         }
         r.to_json()
+    }
+
+    /// A resumed rescue reads the identity record an earlier dfdisk wrote:
+    /// `recorded_at` in each form chrono gave it (no, three, six or nine
+    /// fractional digits) is read, and written back unchanged.
+    #[test]
+    fn an_identity_record_of_an_earlier_version_is_read_and_kept() {
+        let record = IdentityRecord::new(&disk(), "case_ea01_hd01", "/dev/sdx", 512);
+        let current = serde_json::to_string_pretty(&record).unwrap();
+        let written = serde_json::to_string(&record.recorded_at).unwrap();
+        assert_eq!(current.matches(&written).count(), 1, "{current}");
+        for (earlier, seconds, nanoseconds) in [
+            ("2026-10-19T08:15:30Z", 1_792_397_730, 0),
+            ("2026-10-19T08:15:30.120Z", 1_792_397_730, 120_000_000),
+            ("2026-10-19T08:15:30.123400Z", 1_792_397_730, 123_400_000),
+            ("2026-10-19T08:15:30.123456780Z", 1_792_397_730, 123_456_780),
+        ] {
+            let old = current.replace(&written, &format!("\"{earlier}\""));
+            let read: IdentityRecord = serde_json::from_str(&old).unwrap();
+            assert_eq!(
+                read.recorded_at,
+                UtcTime::from_unix(seconds, nanoseconds).unwrap(),
+                "{earlier}"
+            );
+            assert_eq!(
+                serde_json::to_string_pretty(&read).unwrap(),
+                old,
+                "{earlier}"
+            );
+        }
     }
 
     #[test]

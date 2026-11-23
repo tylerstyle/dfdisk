@@ -10,3 +10,4 @@ pub mod protection;
 pub mod provenance;
 pub mod telemetry;
 pub mod text;
+pub mod timestamp;

@@ -39,8 +39,8 @@ use crate::models::provenance::{
     ClockInfo, ProvenanceRecorder, DFCORE_GIT_REV, DFDISK_GIT_REV, DFDISK_VERSION,
 };
 use crate::models::text::{format_iec, plural, sanitize_line};
+use crate::models::timestamp::UtcTime;
 use crate::signals::StopFlags;
-use chrono::{DateTime, Utc};
 use digest::Digest;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map};
@@ -379,8 +379,8 @@ pub struct ImageVerification {
     pub pieces: Option<PiecesReport>,
     pub result: VerificationResult,
     pub exit_code: i32,
-    pub started_at: DateTime<Utc>,
-    pub ended_at: DateTime<Utc>,
+    pub started_at: UtcTime,
+    pub ended_at: UtcTime,
     pub elapsed_seconds: f64,
     pub clock: ClockInfo,
     /// The addendum written, `<base>.verify-<UTC>.txt`
@@ -447,17 +447,11 @@ impl ImageVerification {
         };
         row(
             "Started",
-            &format!(
-                "{} UTC ({basis})",
-                self.started_at.format("%Y-%m-%d %H:%M:%S")
-            ),
+            &format!("{} UTC ({basis})", self.started_at.date_time()),
         );
         row(
             "Ended",
-            &format!(
-                "{} UTC ({basis})",
-                self.ended_at.format("%Y-%m-%d %H:%M:%S")
-            ),
+            &format!("{} UTC ({basis})", self.ended_at.date_time()),
         );
         row(
             "Elapsed",
@@ -803,16 +797,13 @@ pub fn raw_family(image: &Path) -> Result<Vec<PathBuf>, AcquisitionError> {
 }
 
 /// `<dir>/<base>.verify-<UTC>.txt` for an image `<dir>/<base>.<ext>`.
-pub fn addendum_path(image: &Path, when: DateTime<Utc>) -> PathBuf {
+pub fn addendum_path(image: &Path, when: UtcTime) -> PathBuf {
     let dir = image.parent().unwrap_or_else(|| Path::new("."));
     let base = image
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "image".into());
-    dir.join(format!(
-        "{base}.verify-{}.txt",
-        when.format("%Y%m%dT%H%M%SZ")
-    ))
+    dir.join(format!("{base}.verify-{}.txt", when.compact()))
 }
 
 /// Write `text` to a new file (never overwriting), fsync it and its directory.
@@ -1265,7 +1256,7 @@ pub async fn verify_image(
         exit_code: verification_exit_code(&result),
         result,
         started_at,
-        ended_at: clock.end_utc.unwrap_or_else(Utc::now),
+        ended_at: clock.end_utc.unwrap_or_else(UtcTime::now),
         elapsed_seconds: elapsed.as_secs_f64(),
         clock,
         addendum: None,
@@ -1287,7 +1278,7 @@ pub async fn verify_image(
             match &result {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-                    when = Utc::now();
+                    when = UtcTime::now();
                 }
                 _ => break,
             }

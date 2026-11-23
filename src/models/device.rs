@@ -1,6 +1,6 @@
 use crate::models::config::SmartPolicy;
 use crate::models::identity::{SerialCandidate, SourceKind};
-use chrono::{DateTime, Utc};
+use crate::models::timestamp::UtcTime;
 use dfcore::lsblk::DeviceIdentity;
 use serde::{Deserialize, Serialize};
 
@@ -112,7 +112,7 @@ pub struct SmartSnapshot {
     pub smartctl_version: Option<String>,
     /// smartctl exit status (a bit mask)
     pub exit_status: Option<i32>,
-    pub taken_at: DateTime<Utc>,
+    pub taken_at: UtcTime,
     pub summary: SmartInfo,
     /// `<base>.smart-before.json` / `-after.json` holding smartctl's raw output
     pub json_file: Option<String>,

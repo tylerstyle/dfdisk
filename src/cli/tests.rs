@@ -275,7 +275,7 @@ impl SessionHost for FakeHost {
     fn clock(&self) -> BoxFuture<'static, ClockInfo> {
         Box::pin(async {
             ClockInfo::from_parts(
-                chrono::Utc::now(),
+                crate::models::timestamp::UtcTime::now(),
                 &TimedatectlInfo {
                     ntp_synchronized: Some(true),
                     ..Default::default()

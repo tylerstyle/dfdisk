@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Timestamps come from jiff, no longer from chrono.** chrono is no longer
+  maintained (RUSTSEC-2026-0543). The reports, the audit records and the
+  rescue records are unchanged: every timestamp is written exactly as before
+  (RFC 3339 in UTC with no, three, six or nine fractional digits), and records
+  written by earlier versions are read as before. One module,
+  `src/models/timestamp.rs`, now holds everything that depends on the date
+  library, with tests that pin the text forms to what chrono wrote.
+
 ## [0.2.1] - 2026-10-17
 
 ### Fixed

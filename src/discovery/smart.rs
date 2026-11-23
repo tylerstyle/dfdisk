@@ -32,7 +32,7 @@ use crate::models::identity::{SourceIdentity, SourceKind};
 use crate::models::info_report::{sha256_hex, sync_dir};
 use crate::models::provenance::ProvenanceRecorder;
 use crate::models::text::{sanitize_line, sanitize_opt};
-use chrono::Utc;
+use crate::models::timestamp::UtcTime;
 use serde_json::Value;
 use std::io::Write;
 use std::path::Path;
@@ -181,7 +181,7 @@ pub async fn snapshot_with(
         snap.note = Some("SMART was not queried: the run was aborted".into());
         return Some(snap);
     }
-    let taken_at = Utc::now();
+    let taken_at = UtcTime::now();
     let run = env
         .runner
         .run("smartctl", &args, SMART_TIMEOUT, control, recorder)
@@ -217,7 +217,7 @@ fn unknown_snapshot(policy: SmartPolicy, assessment: String) -> SmartSnapshot {
         command: Vec::new(),
         smartctl_version: None,
         exit_status: None,
-        taken_at: Utc::now(),
+        taken_at: UtcTime::now(),
         summary: SmartInfo {
             health: SmartHealth::Unknown,
             passed: false,
@@ -269,11 +269,7 @@ fn exit_status_notes(status: i32) -> Vec<&'static str> {
 }
 
 /// The snapshot a smartctl run describes (pure; tests feed captured runs).
-pub fn snapshot_from_run(
-    policy: SmartPolicy,
-    run: &ToolRun,
-    taken_at: chrono::DateTime<Utc>,
-) -> SmartSnapshot {
+pub fn snapshot_from_run(policy: SmartPolicy, run: &ToolRun, taken_at: UtcTime) -> SmartSnapshot {
     let mut snap = SmartSnapshot {
         policy,
         command: run.argv.clone(),

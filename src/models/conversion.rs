@@ -29,7 +29,7 @@ use crate::models::outcome::{
 };
 use crate::models::provenance::{ClockInfo, ToolProvenance, LABEL_NOT_SYNCHRONIZED};
 use crate::models::text::{format_iec, sanitize_line};
-use chrono::{DateTime, Utc};
+use crate::models::timestamp::UtcTime;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -298,8 +298,8 @@ pub struct ConversionReport {
     /// `<base_name>.conversion.info(.json)`
     pub base_name: String,
     pub settings: ConversionSettings,
-    pub started_at: DateTime<Utc>,
-    pub ended_at: DateTime<Utc>,
+    pub started_at: UtcTime,
+    pub ended_at: UtcTime,
     pub elapsed_seconds: u64,
     pub average_speed_bytes_sec: f64,
     /// Bytes of the source image (media data)
@@ -663,18 +663,12 @@ impl ConversionReport {
         row(
             out,
             "Started",
-            format!(
-                "{} UTC ({basis})",
-                self.started_at.format("%Y-%m-%d %H:%M:%S")
-            ),
+            format!("{} UTC ({basis})", self.started_at.date_time()),
         );
         row(
             out,
             "Ended",
-            format!(
-                "{} UTC ({basis})",
-                self.ended_at.format("%Y-%m-%d %H:%M:%S")
-            ),
+            format!("{} UTC ({basis})", self.ended_at.date_time()),
         );
         row(
             out,
@@ -903,8 +897,8 @@ impl ConversionReport {
                 out.push_str(&format!("  $ {}\n", sanitize_line(&c.command_line())));
                 out.push_str(&format!(
                     "    {} .. {}  {}\n",
-                    c.started.format("%H:%M:%S"),
-                    c.ended.format("%H:%M:%S"),
+                    c.started.time_of_day(),
+                    c.ended.time_of_day(),
                     sanitize_line(&c.status_text())
                 ));
             }

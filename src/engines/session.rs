@@ -1612,7 +1612,9 @@ async fn acquire_phase(
     report.started_at = clock.start_utc;
     let elapsed = t0.elapsed();
     clock.finish(elapsed);
-    report.ended_at = clock.end_utc.unwrap_or_else(chrono::Utc::now);
+    report.ended_at = clock
+        .end_utc
+        .unwrap_or_else(crate::models::timestamp::UtcTime::now);
     report.elapsed_seconds = elapsed.as_secs();
     let session_bytes = match resumed_from {
         None => out.bytes_acquired,

@@ -303,7 +303,7 @@ fn snapshot(name: &str) -> dfdisk::models::device::SmartSnapshot {
     snapshot_from_run(
         SmartPolicy::Basic,
         &captured(&argv, name),
-        chrono::Utc::now(),
+        dfdisk::models::timestamp::UtcTime::now(),
     )
 }
 

@@ -332,7 +332,7 @@ impl SessionHost for Fake {
                 command: vec!["smartctl".into(), "-j".into()],
                 smartctl_version: Some("smartctl 7.4".into()),
                 exit_status: Some(0),
-                taken_at: chrono::Utc::now(),
+                taken_at: crate::models::timestamp::UtcTime::now(),
                 summary: SmartInfo::default(),
                 json_file: json_file.map(|p| p.to_string_lossy().into_owned()),
                 json_sha256: None,
@@ -345,7 +345,7 @@ impl SessionHost for Fake {
     fn clock(&self) -> BoxFuture<'static, ClockInfo> {
         Box::pin(async {
             ClockInfo::from_parts(
-                chrono::Utc::now(),
+                crate::models::timestamp::UtcTime::now(),
                 &TimedatectlInfo {
                     ntp_synchronized: Some(false),
                     ..Default::default()
