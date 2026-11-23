@@ -13,7 +13,7 @@ permissions:
 env:
   # Toolchain for fmt, clippy and the tests; the release workflow uses the same
   # version. Bump both together (docs/RELEASING.md).
-  RUST_TOOLCHAIN: "1.98.1"
+  RUST_TOOLCHAIN: "1.100.0"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Checkout sibling dfcore at the locked revision
         run: |
@@ -33,7 +33,7 @@ jobs:
           git -C ../dfcore checkout --detach "$rev"
 
       - name: Set up Rust ${{ env.RUST_TOOLCHAIN }}
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Checkout sibling dfcore at the locked revision
         run: |
@@ -84,7 +84,7 @@ jobs:
           echo "version=$msrv" >> "$GITHUB_OUTPUT"
 
       - name: Set up Rust ${{ steps.msrv.outputs.version }}
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
 
@@ -96,13 +96,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v14
-
-      - name: Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@v8
+        uses: cachix/install-nix-action@382a9ed9481c7c1f94f68b72ef105b3417c73877 # v32.1.0
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
       - name: Build package (runs the test suite with libewf and ddrescue, DFDISK_REQUIRE_TOOLS=1)
         run: nix build -L .#default

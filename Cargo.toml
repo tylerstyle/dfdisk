@@ -9,7 +9,6 @@ authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
 description = "Modern forensic disk imaging, damaged media rescue and conversion CLI/TUI tool"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/tylerstyle/dfdisk"
-homepage = "https://github.com/tylerstyle/dfdisk"
 readme = "README.md"
 keywords = ["forensics", "dfir", "e01", "disk-imaging", "tui"]
 categories = ["command-line-utilities"]
