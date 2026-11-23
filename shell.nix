@@ -1,18 +1,18 @@
 { pkgs ? import <nixpkgs> {} }:
 
 pkgs.mkShell {
-  buildInputs = with pkgs; [
+  packages = with pkgs; [
     rustc
     cargo
     rustfmt
     clippy
-    pkg-config
+    cargo-deb
     libewf
-    smartmontools
     ddrescue
+    smartmontools
+    util-linux
+    systemd
     hdparm
     nvme-cli
-    dcfldd
-    dc3dd
   ];
 }
