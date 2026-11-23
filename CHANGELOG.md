@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2] - 2026-11-23
 
 ### Changed
 
@@ -16,6 +16,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written by earlier versions are read as before. One module,
   `src/models/timestamp.rs`, now holds everything that depends on the date
   library, with tests that pin the text forms to what chrono wrote.
+- **Dependencies updated, RustSec advisories cleared.** Updated locked Rust
+  crates (`tokio` 1.54.1 clearing RUSTSEC-2026-0386, `rustix` 1.1.6 clearing
+  RUSTSEC-2026-0486, plus routine semver-compatible updates; `cargo audit`
+  reports zero advisories). Updated `flake.lock` inputs (`dfcore` locked to
+  `d2d9fce` matching the dfnix ISO, `nixpkgs` to
+  nixos-unstable 2026-11-21, `flake-utils` and `systems`) and aligned
+  `shell.nix` with the flake dev shell.
+- **CI and supply-chain hardening.** Bumped the CI and release Rust toolchain
+  to 1.100.0 (MSRV remains 1.88), unified Nix setup on
+  `cachix/install-nix-action`, pinned all third-party GitHub Actions to full
+  commit SHAs, added a PR and weekly `cargo audit --deny unsound` CI job, and
+  added Dependabot automation for `github-actions` and `nix` (ignoring
+  `dfcore`, with grouping and a 7-day cooldown).
+- **Release builds in an Ubuntu 22.04 container.** The binaries and the .deb
+  are built, and the tests run, in an Ubuntu 22.04 container instead of on the
+  hosted Ubuntu 22.04 runner: the same glibc 2.35 baseline, and the same
+  `ewf-tools` and `gddrescue` for the tests. A release build now fails unless
+  the binary names the commit it was built from and the locked dfcore
+  revision.
 
 ## [0.2.1] - 2026-10-17
 
